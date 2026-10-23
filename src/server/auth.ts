@@ -71,7 +71,7 @@ export async function getSessionUser(req: Request): Promise<{ user: UserProfile;
   const pool = getPool();
 
   const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    `SELECT u.id, u.username, u.full_name, u.role, u.last_login_at, s.expires_at
+    `SELECT u.id, u.username, u.full_name, u.role, u.avatar_url, u.collaboration_start_shamsi, u.phone_number, u.biometric_token_hash, u.last_login_at, s.expires_at
      FROM user_sessions s
      INNER JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ? AND u.is_active = 1
@@ -97,6 +97,12 @@ export async function getSessionUser(req: Request): Promise<{ user: UserProfile;
       username: String(row.username),
       full_name: String(row.full_name),
       role: row.role as UserRole,
+      avatar_url: row.avatar_url ? String(row.avatar_url) : null,
+      collaboration_start_shamsi: row.collaboration_start_shamsi
+        ? String(row.collaboration_start_shamsi)
+        : '1405/06/15',
+      phone_number: row.phone_number ? String(row.phone_number) : null,
+      biometric_enabled: Boolean(row.biometric_token_hash),
       last_login_at: row.last_login_at ? new Date(row.last_login_at).toISOString() : null,
     },
   };
@@ -187,9 +193,6 @@ export async function recordAuditLog(params: {
   );
 }
 
-/**
- * مدیریت امن خطاها بدون افشای اطلاعات اتصال دیتابیس، کوئری‌ها یا جزئیات داخلی سرور
- */
 export function handleServerError(res: Response, err: unknown): void {
   const errObj = err as { code?: string; message?: string };
   const dbErrorCodes = [
@@ -208,7 +211,7 @@ export function handleServerError(res: Response, err: unknown): void {
     res.status(503).json({
       ok: false,
       code: 'DB_UNAVAILABLE',
-      message: 'ارتباط با پایگاه داده MySQL برقرار نیست. هیچ اطلاعاتی ذخیره نشد؛ لطفاً اتصال سرور را بررسی کنید.',
+      message: 'ارتباط با سرور برقرار نیست. لطفاً اتصال را بررسی کنید.',
     });
     return;
   }
@@ -217,6 +220,6 @@ export function handleServerError(res: Response, err: unknown): void {
   res.status(500).json({
     ok: false,
     code: 'INTERNAL_ERROR',
-    message: 'خطایی در پردازش درخواست در سرور رخ داد. لطفاً مجدداً تلاش کنید.',
+    message: 'خطایی در پردازش درخواست رخ داد. لطفاً مجدداً تلاش کنید.',
   });
 }

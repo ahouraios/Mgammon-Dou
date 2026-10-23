@@ -2,6 +2,41 @@
 <html lang="fa" dir="rtl">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (function () {
+        if (typeof window === 'undefined' || !window.WebSocket) return;
+        var NativeWebSocket = window.WebSocket;
+        function PatchedWebSocket(url, protocols) {
+          var isViteHmr =
+            protocols === 'vite-hmr' ||
+            (Array.isArray(protocols) && protocols.indexOf('vite-hmr') !== -1) ||
+            (typeof url === 'string' && url.indexOf('token=') !== -1 && url.indexOf(':24678') !== -1);
+          if (isViteHmr) {
+            var fakeTarget = new EventTarget();
+            fakeTarget.readyState = 1;
+            fakeTarget.OPEN = 1;
+            fakeTarget.CLOSED = 3;
+            fakeTarget.send = function () {};
+            fakeTarget.close = function () {
+              fakeTarget.readyState = 3;
+            };
+            setTimeout(function () {
+              fakeTarget.dispatchEvent(new Event('open'));
+            }, 0);
+            return fakeTarget;
+          }
+          return protocols !== undefined
+            ? new NativeWebSocket(url, protocols)
+            : new NativeWebSocket(url);
+        }
+        PatchedWebSocket.prototype = NativeWebSocket.prototype;
+        PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+        PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+        PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+        PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+        window.WebSocket = PatchedWebSocket;
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MGAMMON Duo — سامانه حضور، غیاب و امور مالی</title>
     <meta name="description" content="سامانه سبک و امن مدیریت حضور و غیاب، ساعات کاری، اضافه‌کاری، گزارش روزانه و پرداخت‌های پرسنل" />

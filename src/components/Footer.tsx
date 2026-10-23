@@ -1,8 +1,16 @@
 import React from 'react';
 
-export const Footer: React.FC = () => {
+interface FooterProps {
+  hasBottomNav?: boolean;
+}
+
+export const Footer: React.FC<FooterProps> = ({ hasBottomNav = false }) => {
   return (
-    <footer className="mt-10 border-t border-[#C5A059]/30 bg-white py-5 px-4 text-center">
+    <footer
+      className={`mt-6 border-t border-[#C5A059]/30 bg-white py-4 px-4 text-center ${
+        hasBottomNav ? 'pb-24' : ''
+      }`}
+    >
       <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-600">
         <span className="font-medium text-[#0B192C]">
           Mgammon — سامانه مدیریت کارکرد و حقوق پرسنل

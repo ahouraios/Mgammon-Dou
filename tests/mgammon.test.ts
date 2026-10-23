@@ -8,6 +8,9 @@ import {
   gregorianToShamsi,
   shamsiToGregorian,
   isValidShamsiDate,
+  getShamsiMonthCalendar,
+  formatNumericInputWithCommas,
+  numberToPersianTomanWords,
 } from '../src/shared/jalali';
 import { AttendanceLog, SystemSettings } from '../src/shared/types';
 import {
@@ -22,6 +25,9 @@ const BASE_SETTINGS: SystemSettings = {
   id: 1,
   shift_start_time: '08:30',
   shift_end_time: '17:00',
+  thursday_shift_start_time: '07:00',
+  thursday_shift_end_time: '14:00',
+  thursday_overtime_start_time: '14:00',
   grace_period_minutes: 15,
   break_duration_minutes: 30,
   working_days: [6, 0, 1, 2, 3, 4], // شنبه تا پنجشنبه
@@ -31,10 +37,22 @@ const BASE_SETTINGS: SystemSettings = {
   friday_holiday_policy: 'ALL_OVERTIME',
   official_holidays: ['1405/01/01', '1405/01/13'],
   timezone: 'Asia/Tehran',
+  base_salary_toman: null,
   hourly_rate_toman: null,
+  overtime_calc_mode: 'PERCENTAGE',
+  overtime_percentage: 140,
   overtime_rate_toman: null,
+  collaboration_start_shamsi: '1405/06/15',
+  monthly_leave_quota_days: 2.5,
+  sms_enabled: false,
+  melipayamak_username: '',
+  melipayamak_password: '',
+  melipayamak_from_number: '',
+  melipayamak_is_flash: false,
+  worker_phone_number: '',
   rules_confirmed_by_manager: true,
   effective_from_shamsi: '1405/01/01',
+  banner_bg_url: null,
 };
 
 function makeLog(
@@ -70,9 +88,9 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
   beforeAll(async () => {
     await initializeDatabase();
     const pool = getPool();
-    // پاکسازی جداول عملیاتی پیش از شروع تست
     await pool.execute('DELETE FROM financial_transactions');
     await pool.execute('DELETE FROM daily_work_reports');
+    await pool.execute('DELETE FROM historical_work_records');
     await pool.execute('DELETE FROM attendance_logs');
 
     const app = await createApp();
@@ -90,34 +108,40 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
   afterAll(async () => {
     setSimulatedDatabaseDisconnect(false);
     const pool = getPool();
-    // پاکسازی کامل داده‌های تست از محیط واقعی طبق بند ۸ الزامات
     await pool.execute('DELETE FROM financial_transactions');
     await pool.execute('DELETE FROM daily_work_reports');
+    await pool.execute('DELETE FROM historical_work_records');
     await pool.execute('DELETE FROM attendance_logs');
-    await pool.execute("DELETE FROM audit_logs WHERE reason LIKE '%TEST%' OR action_type IN ('FINANCE_APPROVE', 'FINANCE_DIRECT_CREATE')");
+    await pool.execute(
+      "DELETE FROM audit_logs WHERE reason LIKE '%TEST%' OR action_type IN ('FINANCE_APPROVE', 'FINANCE_DIRECT_CREATE', 'HISTORICAL_WORK_ADD')"
+    );
+    await pool.execute('UPDATE system_settings SET banner_bg_url = NULL');
     if (server) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
-  it('سناریو ۱۳: تبدیل و نمایش صحیح تاریخ شمسی و میلادی', () => {
+  it('سناریو ۱۳ + تقویم شمسی و تبدیل مبلغ به حروف فارسی', () => {
     const shamsi = gregorianToShamsi('2026-03-21');
     expect(shamsi).toBe('1405/01/01');
     const greg = shamsiToGregorian('1405/01/01');
     expect(greg).toBe('2026-03-21');
     expect(isValidShamsiDate('1405/07/30')).toBe(true);
     expect(isValidShamsiDate('1405/13/01')).toBe(false);
+
+    const cal = getShamsiMonthCalendar(1405, 7);
+    expect(cal.monthLength).toBe(30);
+
+    expect(formatNumericInputWithCommas('15250000')).toBe('15,250,000');
+    expect(numberToPersianTomanWords(15250000)).toBe('پانزده میلیون و دویست و پنجاه هزار تومان');
   });
 
   it('سناریو ۳، ۴، ۵، ۶ و ۱۴ (واحد محاسبات): جلوگیری از تردد نامعتبر، محاسبه مدت کار، مأموریت، تأخیر، اضافه‌کاری، روز ناقص، جمعه و تعطیلات', () => {
-    // جلوگیری از پایان کار بدون شروع کار
     expect(validateAttendanceSequence([], 'WORK_END', '17:00:00').valid).toBe(false);
 
     const startLog = makeLog(1, 'WORK_START', '08:30:00');
-    // جلوگیری از شروع کار تکراری
     expect(validateAttendanceSequence([startLog], 'WORK_START', '09:00:00').valid).toBe(false);
 
-    // ثبت مأموریت و بازگشت و پایان کار در روز عادی (۰۸:۳۰ تا ۱۸:۳۰ = ۱۰ ساعت حضور، ۳۰ دقیقه کسر استراحت = ۹.۵ ساعت خالص، ۱.۵ ساعت اضافه‌کاری)
     const logsNormalWithMission: AttendanceLog[] = [
       makeLog(1, 'WORK_START', '08:30:00'),
       makeLog(2, 'MISSION_START', '11:00:00'),
@@ -125,7 +149,7 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       makeLog(4, 'WORK_END', '18:30:00'),
     ];
     const summaryNormal = calculateDailyAttendance(
-      '2026-10-24', // شنبه
+      '2026-10-24',
       '1405/08/02',
       logsNormalWithMission,
       BASE_SETTINGS
@@ -138,13 +162,11 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(summaryNormal.net_work_minutes).toBe(570);
     expect(summaryNormal.overtime_minutes).toBe(90);
 
-    // تشخیص تأخیر (ورود ۰۹:۰۰ با فرجه ۱۵ دقیقه نسبت به ۰۸:۳۰ -> ۳۰ دقیقه تأخیر)
     const lateLogs = [makeLog(1, 'WORK_START', '09:00:00'), makeLog(2, 'WORK_END', '17:00:00')];
     const summaryLate = calculateDailyAttendance('2026-10-24', '1405/08/02', lateLogs, BASE_SETTINGS);
     expect(summaryLate.is_late).toBe(true);
     expect(summaryLate.late_minutes).toBe(30);
 
-    // روز ناقص (فراموشی ثبت پایان کار در روز گذشته -> ساعات قطعی باید ۰ باشد تا تعیین تکلیف شود)
     const incompleteLogs = [makeLog(1, 'WORK_START', '08:30:00')];
     const summaryIncomplete = calculateDailyAttendance(
       '2026-10-20',
@@ -157,7 +179,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(summaryIncomplete.net_work_minutes).toBe(0);
     expect(summaryIncomplete.overtime_minutes).toBe(0);
 
-    // کار در روز جمعه (2026-10-23 جمعه است) -> تمام ساعت کاری به عنوان اضافه‌کاری محاسبه شود
     const fridayLogs = [
       makeLog(1, 'WORK_START', '10:00:00', '2026-10-23', '1405/08/01'),
       makeLog(2, 'WORK_END', '13:00:00', '2026-10-23', '1405/08/01'),
@@ -171,45 +192,48 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(summaryFriday.is_holiday_or_friday).toBe(true);
     expect(summaryFriday.overtime_minutes).toBe(180);
 
-    // بررسی نشانگر متحرک «+» اضافه‌کاری در وضعیت زنده
     const liveDuringOvertime = evaluateWorkerLiveState(
       [makeLog(1, 'WORK_START', '08:30:00')],
       BASE_SETTINGS,
-      new Date('2026-10-24T14:30:00Z') // 18:00 به وقت تهران (بعد از ساعت 17:00)
+      new Date('2026-10-24T14:30:00Z')
     );
     expect(liveDuringOvertime.is_overtime_active).toBe(true);
   });
 
-  it('سناریو ۱ و ۱۵: ورود مدیر و نیروی کاری و بررسی کنترل دسترسی APIها در سرور (RBAC)', async () => {
-    // ورود مدیر
+  it('سناریو ۱ و ۱۵: ورود مدیریت (مجید نورایی) و نیروی کار (امید میثمی) و بررسی کنترل دسترسی APIها در سرور (RBAC)', async () => {
     const mgrRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'manager', password: process.env.INITIAL_MANAGER_PASSWORD || 'Mgammon@1405' }),
+      body: JSON.stringify({
+        username: 'manager',
+        password: process.env.INITIAL_MANAGER_PASSWORD || 'Mgammon@1405',
+      }),
     });
     const mgrData = await mgrRes.json();
     expect(mgrRes.status).toBe(200);
     expect(mgrData.user.role).toBe('manager');
+    expect(mgrData.user.full_name).toBe('مجید نورایی');
     managerToken = mgrData.token;
 
-    // ورود نیروی کاری
     const wrkRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'worker', password: process.env.INITIAL_WORKER_PASSWORD || 'Worker@1405' }),
+      body: JSON.stringify({
+        username: 'worker',
+        password: process.env.INITIAL_WORKER_PASSWORD || 'Worker@1405',
+      }),
     });
     const wrkData = await wrkRes.json();
     expect(wrkRes.status).toBe(200);
     expect(wrkData.user.role).toBe('worker');
+    expect(wrkData.user.full_name).toBe('امید میثمی');
     workerToken = wrkData.token;
 
-    // تلاش نیروی کاری برای دسترسی به داشبورد مدیر -> باید 403 Forbidden برگرداند
     const forbiddenRes = await fetch(`${baseUrl}/api/manager/dashboard`, {
       headers: { Authorization: `Bearer ${workerToken}` },
     });
     expect(forbiddenRes.status).toBe(403);
 
-    // تلاش مدیر برای ثبت مستقیم دکمه تردد نیرو -> باید 403 برگرداند
     const mgrClockRes = await fetch(`${baseUrl}/api/attendance/clock`, {
       method: 'POST',
       headers: {
@@ -221,8 +245,7 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(mgrClockRes.status).toBe(403);
   });
 
-  it('سناریو ۲، ۳، ۱۰ و ۱۲: ثبت تردد توسط نیرو، جلوگیری از تکرار، نمایش یکسان در دو دستگاه و اصلاح توسط مدیر با Audit Log', async () => {
-    // ثبت شروع کار توسط نیرو
+  it('سناریو ۲، ۳، ۱۰، ۱۲ و ثبت سوابق قبلی کارکرد/اضافه‌کاری و تصویر بنر اصلی', async () => {
     const startRes = await fetch(`${baseUrl}/api/attendance/clock`, {
       method: 'POST',
       headers: {
@@ -233,7 +256,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     });
     expect(startRes.status).toBe(201);
 
-    // تلاش برای ثبت شروع کار تکراری -> باید 400 برگرداند
     const dupStartRes = await fetch(`${baseUrl}/api/attendance/clock`, {
       method: 'POST',
       headers: {
@@ -244,7 +266,36 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     });
     expect(dupStartRes.status).toBe(400);
 
-    // بررسی نمایش یکسان وضعیت نیرو در دستگاه مدیر و دستگاه نیرو
+    // ثبت سابقه کارکرد و اضافه‌کاری قبلی (مثلاً ۱۰ ساعت کارکرد و ۳ ساعت اضافه‌کاری در ۲ روز کاری)
+    const histWorkRes = await fetch(`${baseUrl}/api/historical-work`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        shamsi_date: '1405/06/31',
+        title: 'کارکرد قبلی شهریور',
+        work_days_count: 2,
+        net_work_hours: 10,
+        net_work_minutes_part: 0,
+        overtime_hours: 3,
+        overtime_minutes_part: 0,
+      }),
+    });
+    expect(histWorkRes.status).toBe(201);
+
+    // تنظیم تصویر پس‌زمینه بنر اصلی
+    const bannerRes = await fetch(`${baseUrl}/api/settings/banner`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({ banner_bg_url: '/uploads/logo.png' }),
+    });
+    expect(bannerRes.status).toBe(200);
+
     const [device1Res, device2Res] = await Promise.all([
       fetch(`${baseUrl}/api/attendance/live-status`, {
         headers: { Authorization: `Bearer ${workerToken}` },
@@ -257,8 +308,10 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     const dev2 = await device2Res.json();
     expect(dev1.liveState.status).toBe(dev2.liveState.status);
     expect(dev1.liveState.last_event.id).toBe(dev2.liveState.last_event.id);
+    expect(dev2.kpis.totalNetWorkMinutes).toBe(600);
+    expect(dev2.kpis.totalOvertimeMinutes).toBe(180);
+    expect(dev2.kpis.totalWorkDays).toBe(2);
 
-    // اصلاح ساعت تردد توسط مدیر همراه با ثبت در Audit Log
     const logId = dev1.liveState.last_event.id;
     const overrideRes = await fetch(`${baseUrl}/api/attendance/manager-override`, {
       method: 'POST',
@@ -285,8 +338,7 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     );
   });
 
-  it('سناریو ۷، ۸ و ۹: ثبت درخواست مالی توسط نیرو، تأیید توسط مدیر، جلوگیری از تأیید تکراری و ثبت مستقیم پرداخت', async () => {
-    // ۱. ثبت درخواست مساعده توسط نیرو
+  it('سناریو ۷، ۸ و ۹: ثبت درخواست مالی توسط امید میثمی، تأیید توسط مجید نورایی، جلوگیری از تأیید تکراری و ثبت مستقیم سابقه مالی', async () => {
     const reqRes = await fetch(`${baseUrl}/api/finance/worker-request`, {
       method: 'POST',
       headers: {
@@ -304,7 +356,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(reqRes.status).toBe(201);
     const txId = reqData.transactionId;
 
-    // بررسی اینکه تا قبل از تأیید مدیر در مجموع پرداخت‌های قطعی محاسبه نشده باشد
     const beforeApproveRes = await fetch(`${baseUrl}/api/finance`, {
       headers: { Authorization: `Bearer ${managerToken}` },
     });
@@ -312,7 +363,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(beforeApproveData.summary.approvedTotalToman).toBe(0);
     expect(beforeApproveData.summary.pendingTotalToman).toBe(3500000);
 
-    // ۲. تأیید درخواست توسط مدیر
     const approveRes = await fetch(`${baseUrl}/api/finance/${txId}/review`, {
       method: 'POST',
       headers: {
@@ -323,7 +373,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     });
     expect(approveRes.status).toBe(200);
 
-    // ۳. تلاش برای تأیید تکراری همان درخواست -> باید 409 Conflict برگرداند و مبلغ دوبار جمع نشود
     const dupApproveRes = await fetch(`${baseUrl}/api/finance/${txId}/review`, {
       method: 'POST',
       headers: {
@@ -334,7 +383,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     });
     expect(dupApproveRes.status).toBe(409);
 
-    // ۴. ثبت مستقیم پرداخت توسط مدیر
     const directRes = await fetch(`${baseUrl}/api/finance/manager-direct`, {
       method: 'POST',
       headers: {
@@ -350,7 +398,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     });
     expect(directRes.status).toBe(201);
 
-    // بررسی مجموع نهایی پرداخت‌های قطعی (3,500,000 + 12,000,000 = 15,500,000)
     const afterRes = await fetch(`${baseUrl}/api/finance`, {
       headers: { Authorization: `Bearer ${managerToken}` },
     });
@@ -374,7 +421,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(clockFailRes.status).toBe(503);
     expect(clockFailData.ok).toBe(false);
     expect(clockFailData.code).toBe('DB_UNAVAILABLE');
-    // اطمینان از عدم نشت رمز عبور یا اطلاعات اتصال دیتابیس در پیام خطا
     expect(JSON.stringify(clockFailData)).not.toContain('mgammon_pass');
 
     setSimulatedDatabaseDisconnect(false);

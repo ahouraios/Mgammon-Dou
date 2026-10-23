@@ -67,8 +67,8 @@ export const TX_TYPE_LABELS: Record<string, string> = {
   ADVANCE: 'مساعده',
   ON_ACCOUNT: 'علی‌الحساب',
   SALARY: 'حقوق',
-  PETTY_CASH: 'تنخواه',
-  OTHER: 'سایر موارد',
+  PETTY_CASH: 'هزینه متفرقه / تنخواه (طلب پرسنل)',
+  OTHER: 'هزینه متفرقه پرسنل (اسنپ، وسیله و...)',
 };
 
 export const EVENT_TYPE_LABELS: Record<string, string> = {

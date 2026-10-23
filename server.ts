@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'path';
+import fs from 'fs';
 import { initializeDatabase } from './src/server/db';
 import { apiRouter } from './src/server/routes';
 
@@ -9,7 +10,7 @@ export async function createApp() {
   const app = express();
 
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '25mb' }));
   app.use(cookieParser());
 
   // هدرهای امنیتی پایه
@@ -20,31 +21,46 @@ export async function createApp() {
     next();
   });
 
+  // اطمینان از وجود پوشه‌های ذخیره فایل و رسانه در assets/media
+  const mediaDirs = [
+    path.resolve(process.cwd(), 'public/assets/media'),
+    path.resolve(process.cwd(), 'public/assets/media/avatars'),
+    path.resolve(process.cwd(), 'public/assets/media/attachments'),
+    path.resolve(process.cwd(), 'public/assets/media/excel'),
+    path.resolve(process.cwd(), 'public/assets/media/audio'),
+  ];
+  for (const dir of mediaDirs) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {
+      // ignore
+    }
+  }
+
   // مسیرهای API
   app.use('/api', apiRouter);
 
-  // سرو کردن فایل‌های استاتیک پوشه public (مانند /uploads/logo.png و فونت‌ها)
+  // سرو کردن فایل‌های استاتیک پوشه public و assets/media
   const publicDir = path.resolve(process.cwd(), 'public');
   app.use(express.static(publicDir));
+  app.use('/assets/media', express.static(path.resolve(process.cwd(), 'public/assets/media')));
 
   return app;
 }
 
 async function startServer() {
-  try {
-    await initializeDatabase();
-    console.log('[MGAMMON Duo] MySQL/MariaDB database initialized and verified.');
-  } catch (err) {
-    console.error('[MGAMMON Duo] Warning: Initial MySQL connection failed:', (err as Error).message);
-  }
-
   const app = await createApp();
   const PORT = Number(process.env.PORT || 3000);
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        ws: false,
+        watch: null,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -59,9 +75,21 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${PORT}`);
   });
+
+  initializeDatabase()
+    .then(() => {
+      console.log('[MGAMMON Duo] MySQL/MariaDB database initialized and verified.');
+    })
+    .catch((err) => {
+      console.error(
+        '[MGAMMON Duo] Warning: Initial MySQL connection failed:',
+        (err as Error).message
+      );
+    });
 }
 
 // اجرا در صورتی که مستقیماً فراخوانی شده باشد (و نه در حین ایمپورت تست‌ها)
 if (process.env.VITEST !== 'true') {
   startServer();
 }
+

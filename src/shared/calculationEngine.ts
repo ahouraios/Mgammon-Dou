@@ -36,8 +36,6 @@ export function getAllowedNextEvents(todayActiveLogs: AttendanceLog[]): Attendan
     case 'MISSION_END':
       return ['MISSION_START', 'WORK_END'];
     case 'WORK_END':
-      // اگر یک نوبت کاری تمام شده باشد، تنها در صورتی که نیاز به شیفت مجدد در همان روز باشد شروع کار مجاز است
-      // اما پایان کار یا مأموریت بدون شروع کار مجاز نیست
       return ['WORK_START'];
     default:
       return ['WORK_START'];
@@ -129,7 +127,40 @@ export function validateFullDayLogSequence(logs: Pick<AttendanceLog, 'event_type
 }
 
 /**
+ * استخراج ساعات شیفت روز بر اساس اینکه روز پنجشنبه است یا سایر روزهای هفته
+ */
+export function getDayShiftSchedule(dayOfWeek: number, settings: SystemSettings): {
+  shiftStartHHMM: string;
+  shiftEndHHMM: string;
+  overtimeStartHHMM: string;
+  shiftStartMin: number;
+  shiftEndMin: number;
+  overtimeStartMin: number;
+} {
+  const isThursday = dayOfWeek === 4;
+  const shiftStartHHMM = isThursday
+    ? settings.thursday_shift_start_time || settings.shift_start_time
+    : settings.shift_start_time;
+  const shiftEndHHMM = isThursday
+    ? settings.thursday_shift_end_time || settings.shift_end_time
+    : settings.shift_end_time;
+  const overtimeStartHHMM = isThursday
+    ? settings.thursday_overtime_start_time || shiftEndHHMM
+    : settings.overtime_start_time;
+
+  return {
+    shiftStartHHMM,
+    shiftEndHHMM,
+    overtimeStartHHMM,
+    shiftStartMin: parseTimeToMinutes(shiftStartHHMM),
+    shiftEndMin: parseTimeToMinutes(shiftEndHHMM),
+    overtimeStartMin: parseTimeToMinutes(overtimeStartHHMM),
+  };
+}
+
+/**
  * محاسبه دقیق کارکرد، تأخیر، مأموریت، کسر استراحت و اضافه‌کاری برای یک روز مشخص
+ * با پشتیبانی از ساعات کاری اختصاصی روز پنجشنبه
  */
 export function calculateDailyAttendance(
   workDate: string,
@@ -155,9 +186,7 @@ export function calculateDailyAttendance(
   const isHolidayOrFriday = isFriday || isOfficialHoliday;
   const isWorkingDay = settings.working_days.includes(dayOfWeek) && !isOfficialHoliday;
 
-  const shiftStartMin = parseTimeToMinutes(settings.shift_start_time);
-  const shiftEndMin = parseTimeToMinutes(settings.shift_end_time);
-  const overtimeStartMin = parseTimeToMinutes(settings.overtime_start_time);
+  const { shiftStartMin, overtimeStartMin } = getDayShiftSchedule(dayOfWeek, settings);
   const graceMin = settings.grace_period_minutes;
 
   if (activeLogs.length === 0) {
@@ -216,7 +245,6 @@ export function calculateDailyAttendance(
       missionMinutes += duration;
     }
 
-    // اگر در روز تعطیل/جمعه کار انجام شود و سیاست ALL_OVERTIME فعال باشد
     if (isHolidayOrFriday) {
       if (settings.friday_holiday_policy === 'ALL_OVERTIME') {
         if (phase === 'WORK' || settings.mission_policy === 'PAID_AS_WORK') {
@@ -226,13 +254,12 @@ export function calculateDailyAttendance(
       return;
     }
 
-    // محاسبه اضافه‌کاری بعد از ساعت شروع اضافه‌کاری (overtime_start_time)
+    // محاسبه اضافه‌کاری بعد از ساعت شروع اضافه‌کاری (با لحاظ ساعت پنجشنبه در روز پنجشنبه)
     if (phase === 'WORK' || settings.mission_policy === 'PAID_AS_WORK') {
       if (endMin > overtimeStartMin) {
         const otStart = Math.max(startMin, overtimeStartMin);
         overtimeRawMinutes += Math.max(0, endMin - otStart);
       }
-      // محاسبه اضافه‌کاری قبل از شروع شیفت در صورت فعال بودن در تنظیمات
       if (settings.overtime_before_shift && startMin < shiftStartMin) {
         const otEnd = Math.min(endMin, shiftStartMin);
         overtimeRawMinutes += Math.max(0, otEnd - startMin);
@@ -265,7 +292,6 @@ export function calculateDailyAttendance(
     }
   }
 
-  // اگر امروز است و شیفت هنوز باز است، مقدار موقت (Provisional) تا لحظه فعلی محاسبه می‌شود
   let provisionalExtraMinutes = 0;
   let provisionalOvertimeMinutes = 0;
   if (isIncomplete && isToday && currentPhase !== 'IDLE') {
@@ -287,19 +313,16 @@ export function calculateDailyAttendance(
     }
   }
 
-  // ترکیب مأموریت بر اساس سیاست تعیین‌شده در تنظیمات
   const effectiveGrossConfirmed =
     settings.mission_policy === 'PAID_AS_WORK'
       ? workSiteMinutes + missionMinutes
       : workSiteMinutes;
 
-  // کسر زمان استراحت روزانه در صورتی که حضور روزانه بیشتر از آستانه حداقل (مثلاً ۴ ساعت = ۲۴۰ دقیقه) باشد
   const breakDeducted =
     isClosed && effectiveGrossConfirmed > 240
       ? Math.min(settings.break_duration_minutes, effectiveGrossConfirmed)
       : 0;
 
-  // طبق بند ۶ الزامات: اگر ثبت پایان کار فراموش شد، رکورد ناقص مشخص شود و تا تعیین تکلیف، ساعات نهایی آن روز به عنوان مقدار قطعی اعلام نشود.
   const netWorkMinutes = isClosed ? Math.max(0, effectiveGrossConfirmed - breakDeducted) : 0;
   const confirmedOvertimeMinutes = isClosed ? overtimeRawMinutes : 0;
 
@@ -340,13 +363,7 @@ export function calculateDailyAttendance(
 }
 
 /**
- * تعیین وضعیت لحظه‌ای نیروی کاری برای نمایش در نشانگر آدمک پنل مدیر و پنل نیرو
- * - سبز (PRESENT): حاضر در محل کار
- * - نارنجی (LATE): حضور با تأخیر بر اساس ساعت شروع شیفت
- * - بنفش (MISSION): مأموریت
- * - خاکستری (FINISHED): پایان کار
- * - قرمز (ABSENT): غیبت بر اساس قواعد تعیین‌شده
- * + نشانگر متحرک «+» برای اضافه‌کاری فقط هنگامی که قواعد زمانی اضافه‌کاری واقعاً برقرار باشند
+ * تعیین وضعیت لحظه‌ای نیروی کاری برای نمایش در کادر وضعیت امید میثمی
  */
 export function evaluateWorkerLiveState(
   todayLogs: AttendanceLog[],
@@ -355,9 +372,11 @@ export function evaluateWorkerLiveState(
 ): WorkerLiveState {
   const nowInfo = getNowInTimezone(settings.timezone, referenceDate);
   const nowMin = parseTimeToMinutes(nowInfo.timeHHMM);
-  const shiftStartMin = parseTimeToMinutes(settings.shift_start_time);
-  const shiftEndMin = parseTimeToMinutes(settings.shift_end_time);
-  const overtimeStartMin = parseTimeToMinutes(settings.overtime_start_time);
+  const dayOfWeek = getDayOfWeekFromGregorian(nowInfo.workDate);
+  const { shiftStartHHMM, shiftStartMin, shiftEndMin, overtimeStartMin } = getDayShiftSchedule(
+    dayOfWeek,
+    settings
+  );
   const graceMin = settings.grace_period_minutes;
 
   const todaySummary = calculateDailyAttendance(
@@ -381,7 +400,6 @@ export function evaluateWorkerLiveState(
   let isOvertimeActive = false;
 
   if (!lastEvent) {
-    // هنوز هیچ ترددی امروز ثبت نشده است
     if (
       todaySummary.is_working_day &&
       nowMin > shiftStartMin + graceMin &&
@@ -389,16 +407,15 @@ export function evaluateWorkerLiveState(
     ) {
       status = 'ABSENT';
       statusText = 'غیبت (عدم ثبت ورود)';
-      statusDetail = `ساعت شروع شیفت ${settings.shift_start_time} بوده و تاکنون ورودی ثبت نشده است`;
+      statusDetail = `ساعت شروع شیفت ${shiftStartHHMM} بوده و تاکنون ورودی ثبت نشده است`;
     } else {
       status = 'FINISHED';
       statusText = todaySummary.is_working_day ? 'خارج از شیفت (پیش از شروع)' : 'روز غیرکاری / تعطیل';
       statusDetail = todaySummary.is_working_day
-        ? `شروع شیفت ساعت ${settings.shift_start_time}`
+        ? `شروع شیفت امروز ساعت ${shiftStartHHMM}`
         : 'امروز در تقویم کاری سامانه تعطیل است';
     }
   } else {
-    // بررسی بر اساس آخرین رویداد ثبت‌شده
     if (lastEvent.event_type === 'WORK_END') {
       status = 'FINISHED';
       statusText = 'پایان کار';
@@ -418,11 +435,10 @@ export function evaluateWorkerLiveState(
         }
       }
     } else {
-      // WORK_START یا MISSION_END -> حاضر در محل کار
       if (todaySummary.is_late) {
         status = 'LATE';
         statusText = 'حضور با تأخیر';
-        statusDetail = `ورود ساعت ${todaySummary.first_in_time} (${todaySummary.late_minutes} دقیقه تأخیر نسبت به ${settings.shift_start_time})`;
+        statusDetail = `ورود ساعت ${todaySummary.first_in_time} (${todaySummary.late_minutes} دقیقه تأخیر نسبت به ${shiftStartHHMM})`;
       } else {
         status = 'PRESENT';
         statusText = 'حاضر در محل کار';
@@ -447,5 +463,48 @@ export function evaluateWorkerLiveState(
     last_event: lastEvent,
     allowed_next_events: allowedNext,
     today_summary: todaySummary,
+  };
+}
+
+/**
+ * محاسبه نرخ ساعتی و مبلغ اضافه‌کاری بر اساس تنظیمات مدیر (مبلغ ثابت یا درصدی از حقوق پایه)
+ */
+export function calculateSalaryAndOvertimeRates(
+  settings: SystemSettings,
+  totalOvertimeMinutes: number
+): {
+  baseSalaryToman: number;
+  effectiveHourlyRateToman: number;
+  effectiveOvertimeHourlyRateToman: number;
+  totalOvertimePayToman: number;
+} {
+  const baseSalaryToman = settings.base_salary_toman || 0;
+  // اگر نرخ ساعتی مستقیم وارد شده باشد از آن استفاده می‌شود، وگرنه از تقسیم حقوق پایه بر ۱۹۱.۴ (یا ۱۹۲ ساعت کاری ماهانه) به دست می‌آید
+  const effectiveHourlyRateToman =
+    settings.hourly_rate_toman && settings.hourly_rate_toman > 0
+      ? settings.hourly_rate_toman
+      : baseSalaryToman > 0
+        ? Math.round(baseSalaryToman / 192)
+        : 0;
+
+  let effectiveOvertimeHourlyRateToman = 0;
+  if (settings.overtime_calc_mode === 'FIXED_RATE' && settings.overtime_rate_toman) {
+    effectiveOvertimeHourlyRateToman = settings.overtime_rate_toman;
+  } else if (settings.overtime_calc_mode === 'PERCENTAGE') {
+    const pct = settings.overtime_percentage || 140;
+    effectiveOvertimeHourlyRateToman = Math.round(effectiveHourlyRateToman * (pct / 100));
+  } else if (settings.overtime_rate_toman) {
+    effectiveOvertimeHourlyRateToman = settings.overtime_rate_toman;
+  }
+
+  const totalOvertimePayToman = Math.round(
+    (totalOvertimeMinutes / 60) * effectiveOvertimeHourlyRateToman
+  );
+
+  return {
+    baseSalaryToman,
+    effectiveHourlyRateToman,
+    effectiveOvertimeHourlyRateToman,
+    totalOvertimePayToman,
   };
 }
