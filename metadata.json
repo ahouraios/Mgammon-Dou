@@ -1,0 +1,6 @@
+{
+  "name": "MGAMMON Duo — سامانه حضور، غیاب و امور مالی",
+  "description": "سامانه سبک و امن مدیریت حضور و غیاب، ساعات کاری، اضافه‌کاری، گزارش روزانه و پرداخت‌های پرسنل",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
