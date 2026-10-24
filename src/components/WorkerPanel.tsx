@@ -156,8 +156,8 @@ const TX_TYPE_LABELS: Record<FinancialTxType, string> = {
   ADVANCE: 'مساعده',
   ON_ACCOUNT: 'علی‌الحساب',
   SALARY: 'حقوق',
-  PETTY_CASH: 'هزینه متفرقه / تنخواه (طلب پرسنل)',
-  OTHER: 'هزینه متفرقه پرسنل (اسنپ، وسیله و...)',
+  PETTY_CASH: 'خرید کارگاهی / هزینه تنخواه (طلب پرسنل)',
+  OTHER: 'خرید وسیله / اسنپ / هزینه متفرقه (طلب پرسنل)',
 };
 
 const STATUS_LABELS: Record<FinancialStatus, string> = {
@@ -165,6 +165,74 @@ const STATUS_LABELS: Record<FinancialStatus, string> = {
   APPROVED: 'تأییدشده',
   REJECTED: 'ردشده',
 };
+
+async function readAndCompressImageIfNeeded(
+  file: File
+): Promise<{ base64: string; fileName: string }> {
+  const rawBase64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('خطا در خواندن فایل انتخاب‌شده'));
+    reader.readAsDataURL(file);
+  });
+
+  const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+  if (isPdf) {
+    return { base64: rawBase64, fileName: file.name.endsWith('.pdf') ? file.name : `${file.name}.pdf` };
+  }
+
+  const isStandardSmallImage =
+    /\.(jpg|jpeg|png|webp)$/i.test(file.name) && file.size <= 1.2 * 1024 * 1024;
+  if (isStandardSmallImage) {
+    return { base64: rawBase64, fileName: file.name };
+  }
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const maxDim = 1600;
+        let width = img.width || 1200;
+        let height = img.height || 1200;
+        if (width > maxDim || height > maxDim) {
+          if (width >= height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', 0.82);
+          const baseName = file.name.replace(/\.[^.]+$/, '') || 'photo';
+          resolve({ base64: compressed, fileName: `${baseName}.jpg` });
+          return;
+        }
+      } catch {
+        // fallback to raw
+      }
+      const fallbackName = /\.(jpg|jpeg|png|webp)$/i.test(file.name)
+        ? file.name
+        : `${file.name || 'photo'}.jpg`;
+      resolve({ base64: rawBase64, fileName: fallbackName });
+    };
+    img.onerror = () => {
+      const fallbackName = /\.(jpg|jpeg|png|webp)$/i.test(file.name)
+        ? file.name
+        : `${file.name || 'photo'}.jpg`;
+      resolve({ base64: rawBase64, fileName: fallbackName });
+    };
+    img.src = rawBase64;
+  });
+}
 
 export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   user,
@@ -341,6 +409,25 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     loadAllWorkerData();
   }, [loadAllWorkerData]);
 
+  // بروزرسانی خودکار وضعیت پنل پرسنل (هر ۱۲ ثانیه و هنگام بازگشت به صفحه) برای دریافت آنی تأییدیه‌ها، تسک‌ها و نامه‌های مدیر
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      loadAllWorkerData();
+    }, 12000);
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        loadAllWorkerData();
+      }
+    };
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, [loadAllWorkerData]);
+
   const pendingWorkTasks = workTasks.filter((t) => !t.is_completed);
 
   const handleOpenCorrespondences = () => {
@@ -458,14 +545,15 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const handleReportPhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const base64 = await new Promise<string>((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result || ''));
-      reader.readAsDataURL(file);
-    });
-    setReportPhotoBase64(base64);
-    setReportPhotoName(file.name);
-    if (reportPhotoInputRef.current) reportPhotoInputRef.current.value = '';
+    try {
+      const { base64, fileName } = await readAndCompressImageIfNeeded(file);
+      setReportPhotoBase64(base64);
+      setReportPhotoName(fileName);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      if (reportPhotoInputRef.current) reportPhotoInputRef.current.value = '';
+    }
   };
 
   const handleReportSubmit = async (e: React.FormEvent) => {
@@ -499,14 +587,15 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const handleFinReceiptSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const base64 = await new Promise<string>((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result || ''));
-      reader.readAsDataURL(file);
-    });
-    setFinReceiptBase64(base64);
-    setFinReceiptName(file.name);
-    if (finReceiptInputRef.current) finReceiptInputRef.current.value = '';
+    try {
+      const { base64, fileName } = await readAndCompressImageIfNeeded(file);
+      setFinReceiptBase64(base64);
+      setFinReceiptName(fileName);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      if (finReceiptInputRef.current) finReceiptInputRef.current.value = '';
+    }
   };
 
   const handleFinanceSubmit = async (e: React.FormEvent) => {
@@ -1263,6 +1352,24 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                       </button>
                     </div>
                   )}
+                  {feedback && activeTab === 'reports' && (
+                    <div
+                      className={`rounded-xl px-3 py-2 text-xs font-bold flex items-center justify-between ${
+                        feedback.type === 'success'
+                          ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
+                          : 'bg-red-50 border border-red-200 text-red-900'
+                      }`}
+                    >
+                      <span>{feedback.text}</span>
+                      <button
+                        type="button"
+                        onClick={() => setFeedback(null)}
+                        className="text-[11px] opacity-75 hover:opacity-100 cursor-pointer"
+                      >
+                        بستن
+                      </button>
+                    </div>
+                  )}
                 </div>
               </form>
 
@@ -1407,15 +1514,15 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                   </div>
                 </div>
 
-                {/* تگ‌های انتخاب سریع موضوع هزینه متفرقه (اسنپ، وسیله، ابزار و...) */}
+                {/* تگ‌های انتخاب سریع موضوع خرید کارگاهی، هزینه متفرقه (اسنپ، وسیله، ابزار و...) */}
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] text-slate-500 ml-1">انتخاب سریع موضوع:</span>
                   {[
-                    { label: 'هزینه اسنپ / ایاب‌وذهاب', type: 'PETTY_CASH' as FinancialTxType },
+                    { label: 'خرید برای کارگاه / تهیه اقلام', type: 'PETTY_CASH' as FinancialTxType },
                     { label: 'تهیه وسیله / ابزار برای کار', type: 'PETTY_CASH' as FinancialTxType },
-                    { label: 'خرید اقلام مصرفی کارگاه', type: 'PETTY_CASH' as FinancialTxType },
+                    { label: 'هزینه اسنپ / ایاب‌وذهاب', type: 'PETTY_CASH' as FinancialTxType },
                     {
-                      label: 'هزینه انجام‌شده توسط مدیریت برای پرسنل (اسنپ / وسیله)',
+                      label: 'خرید / هزینه انجام‌شده برای کار (اسنپ / وسیله)',
                       type: 'OTHER' as FinancialTxType,
                     },
                     { label: 'درخواست مساعده', type: 'ADVANCE' as FinancialTxType },
@@ -1554,6 +1661,24 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                         className="p-1 text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
                       >
                         <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                  {feedback && activeTab === 'finance' && (
+                    <div
+                      className={`rounded-xl px-3 py-2 text-xs font-bold flex items-center justify-between ${
+                        feedback.type === 'success'
+                          ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
+                          : 'bg-red-50 border border-red-200 text-red-900'
+                      }`}
+                    >
+                      <span>{feedback.text}</span>
+                      <button
+                        type="button"
+                        onClick={() => setFeedback(null)}
+                        className="text-[11px] opacity-75 hover:opacity-100 cursor-pointer"
+                      >
+                        بستن
                       </button>
                     </div>
                   )}

@@ -150,6 +150,24 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
   }, [loadCorrespondences]);
 
   useEffect(() => {
+    const interval = window.setInterval(() => {
+      loadCorrespondences();
+    }, 10000);
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        loadCorrespondences();
+      }
+    };
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, [loadCorrespondences]);
+
+  useEffect(() => {
     return () => {
       if (recordTimerRef.current) {
         window.clearInterval(recordTimerRef.current);

@@ -503,11 +503,23 @@ export async function getSystemSettingsFromDb(targetShamsiDate?: string): Promis
        ORDER BY effective_from_shamsi DESC, id DESC LIMIT 1`,
       [targetShamsiDate]
     );
-    if (snapRows.length > 0) {
+    let chosenJson: unknown = snapRows.length > 0 ? snapRows[0].settings_json : null;
+
+    if (!chosenJson) {
+      const [oldestSnapRows] = await p.execute<mysql.RowDataPacket[]>(
+        `SELECT settings_json FROM system_settings_snapshots
+         ORDER BY effective_from_shamsi ASC, id ASC LIMIT 1`
+      );
+      if (oldestSnapRows.length > 0) {
+        chosenJson = oldestSnapRows[0].settings_json;
+      }
+    }
+
+    if (chosenJson) {
       const parsed =
-        typeof snapRows[0].settings_json === 'string'
-          ? JSON.parse(snapRows[0].settings_json)
-          : snapRows[0].settings_json;
+        typeof chosenJson === 'string'
+          ? JSON.parse(chosenJson)
+          : chosenJson;
       return {
         ...currentMapped,
         ...(parsed as SystemSettings),

@@ -18,8 +18,8 @@ export function getStoredToken(): string | null {
   if (inMemorySessionToken) return inMemorySessionToken;
   try {
     const stored =
-      localStorage.getItem(SESSION_TOKEN_STORAGE_KEY) ||
-      sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
+      sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY) ||
+      localStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
     if (stored && stored.trim().length >= 32) {
       inMemorySessionToken = stored.trim();
       return inMemorySessionToken;
@@ -35,11 +35,11 @@ export function setStoredToken(token: string | null): void {
   inMemorySessionToken = normalized;
   try {
     if (normalized) {
-      localStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
       sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
+      localStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
     } else {
-      localStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
       sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
+      localStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
     }
   } catch {
     // ignore storage errors
@@ -120,8 +120,8 @@ export const TX_TYPE_LABELS: Record<string, string> = {
   ADVANCE: 'مساعده',
   ON_ACCOUNT: 'علی‌الحساب',
   SALARY: 'حقوق',
-  PETTY_CASH: 'هزینه متفرقه / تنخواه (طلب پرسنل)',
-  OTHER: 'هزینه متفرقه پرسنل (اسنپ، وسیله و...)',
+  PETTY_CASH: 'خرید کارگاهی / هزینه تنخواه (طلب پرسنل)',
+  OTHER: 'خرید وسیله / اسنپ / هزینه متفرقه (طلب پرسنل)',
 };
 
 export const EVENT_TYPE_LABELS: Record<string, string> = {

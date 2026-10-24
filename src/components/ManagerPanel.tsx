@@ -346,14 +346,27 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     return () => window.clearTimeout(timer);
   }, [loadFinanceList]);
 
-  // بروزرسانی خودکار وضعیت لحظه‌ای پرسنل در پنل مدیریت (هر ۱۵ ثانیه و هنگام بازگشت به تب مرورگر) بدون بازنویسی فرم تنظیمات
+  const refreshAllSilent = useCallback(async () => {
+    try {
+      await Promise.all([
+        loadDashboardAndSettings(false),
+        loadAttendanceList(),
+        loadReportsList(),
+        loadFinanceList(),
+      ]);
+    } catch {
+      // ignore background poll errors
+    }
+  }, [loadDashboardAndSettings, loadAttendanceList, loadReportsList, loadFinanceList]);
+
+  // بروزرسانی خودکار وضعیت لحظه‌ای پرسنل، خریدها، تنخواه، مرخصی‌ها و گزارش‌ها در پنل مدیریت (هر ۱۰ ثانیه و هنگام بازگشت به تب مرورگر)
   useEffect(() => {
     const interval = window.setInterval(() => {
-      loadDashboardAndSettings(false);
-    }, 15000);
+      refreshAllSilent();
+    }, 10000);
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
-        loadDashboardAndSettings(false);
+        refreshAllSilent();
       }
     };
     window.addEventListener('focus', onFocusOrVisible);
@@ -363,7 +376,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
       window.removeEventListener('focus', onFocusOrVisible);
       document.removeEventListener('visibilitychange', onFocusOrVisible);
     };
-  }, [loadDashboardAndSettings]);
+  }, [refreshAllSilent]);
 
   const markSectionSeen = async (section: 'reports' | 'finance' | 'historical' | 'leaves') => {
     try {
@@ -379,6 +392,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
   const handleSelectTab = (tab: ManagerTab) => {
     setActiveTab(tab);
+    refreshAllSilent();
     if (tab === 'reports' && dashboard?.unseenAlerts.reportsAlert) {
       markSectionSeen('reports');
     } else if (tab === 'finance' && dashboard?.unseenAlerts.financeAlert) {
@@ -1016,6 +1030,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         timeHHMM={dashboard?.serverTime.timeHHMM || ''}
         bannerBgUrl={bannerBgUrl}
         userAvatarUrl={user.avatar_url}
+        onRefresh={refreshAll}
+        loading={loading}
       />
 
       {/* هشدار هوشمند در صورت فراموشی ثبت خروج پرسنل */}
@@ -1419,25 +1435,29 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                 {/* لیست یکپارچه مطالبات بر اساس فیلتر انتخاب‌شده */}
                 {(() => {
-                  const filteredLeaves = leaveRequests.filter((lv) => {
-                    if (dashClaimFilter === 'pending') return lv.status === 'PENDING';
-                    if (dashClaimFilter === 'leaves' || dashClaimFilter === 'all') return true;
-                    return false;
-                  });
+                  const filteredLeaves = leaveRequests
+                    .filter((lv) => {
+                      if (dashClaimFilter === 'pending') return lv.status === 'PENDING';
+                      if (dashClaimFilter === 'leaves' || dashClaimFilter === 'all') return true;
+                      return false;
+                    })
+                    .sort((a, b) => (a.status === 'PENDING' ? 0 : 1) - (b.status === 'PENDING' ? 0 : 1));
 
-                  const filteredTxs = transactions.filter((tx) => {
-                    if (dashClaimFilter === 'pending') return tx.status === 'PENDING';
-                    if (dashClaimFilter === 'leaves') return false;
-                    if (dashClaimFilter === 'petty_cash')
-                      return tx.tx_type === 'PETTY_CASH' || tx.tx_type === 'OTHER';
-                    if (dashClaimFilter === 'advance')
-                      return (
-                        tx.tx_type === 'ADVANCE' ||
-                        tx.tx_type === 'ON_ACCOUNT' ||
-                        tx.tx_type === 'SALARY'
-                      );
-                    return true;
-                  });
+                  const filteredTxs = transactions
+                    .filter((tx) => {
+                      if (dashClaimFilter === 'pending') return tx.status === 'PENDING';
+                      if (dashClaimFilter === 'leaves') return false;
+                      if (dashClaimFilter === 'petty_cash')
+                        return tx.tx_type === 'PETTY_CASH' || tx.tx_type === 'OTHER';
+                      if (dashClaimFilter === 'advance')
+                        return (
+                          tx.tx_type === 'ADVANCE' ||
+                          tx.tx_type === 'ON_ACCOUNT' ||
+                          tx.tx_type === 'SALARY'
+                        );
+                      return true;
+                    })
+                    .sort((a, b) => (a.status === 'PENDING' ? 0 : 1) - (b.status === 'PENDING' ? 0 : 1));
 
                   const filteredHistorical = historicalRecords.filter((rec) => {
                     if (dashClaimFilter === 'pending') return rec.status === 'PENDING';

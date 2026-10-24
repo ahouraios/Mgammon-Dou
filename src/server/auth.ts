@@ -273,68 +273,79 @@ export function requireCsrfProtection(
 export async function getSessionUser(
   req: Request
 ): Promise<{ user: UserProfile; tokenHash: string; rawToken: string } | null> {
+  const bearerToken = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7).trim()
+    : null;
+  const cookieToken = req.cookies?.[SESSION_COOKIE_NAME]
+    ? String(req.cookies[SESSION_COOKIE_NAME]).trim()
+    : null;
   const queryToken =
     req.method === 'GET' && typeof req.query?.token === 'string'
       ? req.query.token.trim()
       : null;
 
-  const rawToken =
-    req.cookies?.[SESSION_COOKIE_NAME] ||
-    (req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7).trim()
-      : null) ||
-    queryToken;
-
-  if (!rawToken || typeof rawToken !== 'string' || rawToken.length < 32) {
-    return null;
-  }
-
-  const tokenHash = hashSessionToken(rawToken);
-  const pool = getPool();
-
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    `SELECT u.id, u.username, u.full_name, u.role, u.avatar_url, u.collaboration_start_shamsi, u.phone_number, u.biometric_token_hash, u.must_change_password, u.is_active, u.last_login_at, s.expires_at
-     FROM user_sessions s
-     INNER JOIN users u ON u.id = s.user_id
-     WHERE s.token_hash = ?
-     LIMIT 1`,
-    [tokenHash]
+  const candidateTokens = Array.from(
+    new Set(
+      [bearerToken, cookieToken, queryToken].filter(
+        (t): t is string => Boolean(t && typeof t === 'string' && t.length >= 32)
+      )
+    )
   );
 
-  if (rows.length === 0) {
+  if (candidateTokens.length === 0) {
     return null;
   }
 
-  const row = rows[0];
-  if (!row.is_active) {
-    await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [row.id]);
-    return null;
+  const pool = getPool();
+
+  for (const rawToken of candidateTokens) {
+    const tokenHash = hashSessionToken(rawToken);
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT u.id, u.username, u.full_name, u.role, u.avatar_url, u.collaboration_start_shamsi, u.phone_number, u.biometric_token_hash, u.must_change_password, u.is_active, u.last_login_at, s.expires_at
+       FROM user_sessions s
+       INNER JOIN users u ON u.id = s.user_id
+       WHERE s.token_hash = ?
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (rows.length === 0) {
+      continue;
+    }
+
+    const row = rows[0];
+    if (!row.is_active) {
+      await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [row.id]);
+      continue;
+    }
+
+    const expiresAt = new Date(row.expires_at);
+    if (expiresAt.getTime() < Date.now()) {
+      await pool.execute('DELETE FROM user_sessions WHERE token_hash = ?', [tokenHash]);
+      continue;
+    }
+
+    return {
+      rawToken,
+      tokenHash,
+      user: {
+        id: Number(row.id),
+        username: String(row.username),
+        full_name: String(row.full_name),
+        role: row.role as UserRole,
+        avatar_url: row.avatar_url ? String(row.avatar_url) : null,
+        collaboration_start_shamsi: row.collaboration_start_shamsi
+          ? String(row.collaboration_start_shamsi)
+          : '1405/06/15',
+        phone_number: row.phone_number ? String(row.phone_number) : null,
+        biometric_enabled: Boolean(row.biometric_token_hash),
+        must_change_password: Boolean(row.must_change_password),
+        last_login_at: row.last_login_at ? new Date(row.last_login_at).toISOString() : null,
+      },
+    };
   }
 
-  const expiresAt = new Date(row.expires_at);
-  if (expiresAt.getTime() < Date.now()) {
-    await pool.execute('DELETE FROM user_sessions WHERE token_hash = ?', [tokenHash]);
-    return null;
-  }
-
-  return {
-    rawToken,
-    tokenHash,
-    user: {
-      id: Number(row.id),
-      username: String(row.username),
-      full_name: String(row.full_name),
-      role: row.role as UserRole,
-      avatar_url: row.avatar_url ? String(row.avatar_url) : null,
-      collaboration_start_shamsi: row.collaboration_start_shamsi
-        ? String(row.collaboration_start_shamsi)
-        : '1405/06/15',
-      phone_number: row.phone_number ? String(row.phone_number) : null,
-      biometric_enabled: Boolean(row.biometric_token_hash),
-      must_change_password: Boolean(row.must_change_password),
-      last_login_at: row.last_login_at ? new Date(row.last_login_at).toISOString() : null,
-    },
-  };
+  return null;
 }
 
 export async function requireAuth(

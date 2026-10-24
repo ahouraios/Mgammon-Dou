@@ -193,6 +193,15 @@ export function formatShamsiVerbose(shamsiDate: string | null | undefined): stri
   return `${toPersianDigits(jd)} ${monthName} ${toPersianDigits(jy)}`;
 }
 
+export function isValidTimeHHMMOrHHMMSS(timeStr: string | null | undefined, allowSeconds = true): boolean {
+  if (!timeStr) return false;
+  const clean = toEnglishDigits(String(timeStr)).trim();
+  const regex = allowSeconds
+    ? /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/
+    : /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+  return regex.test(clean);
+}
+
 export function parseTimeToMinutes(timeStr: string | null | undefined): number {
   const clean = toEnglishDigits(String(timeStr || '08:00')).trim();
   const parts = clean.split(':').map(Number);
@@ -221,6 +230,37 @@ export const SHAMSI_MONTH_NAMES = PERSIAN_MONTHS;
 
 export function getShamsiMonthDays(jy: number, jm: number): number {
   return jalaali.jalaaliMonthLength(jy, jm);
+}
+
+export const getShamsiMonthLength = getShamsiMonthDays;
+
+export function isShamsiLeapYear(jy: number): boolean {
+  return jalaali.isLeapJalaaliYear(jy);
+}
+
+export function getShamsiMonthRange(jy: number, jm: number): {
+  startShamsi: string;
+  endShamsi: string;
+  fromShamsi: string;
+  toShamsi: string;
+  monthLength: number;
+  isLeapYear: boolean;
+} {
+  if (jm < 1 || jm > 12) {
+    throw new Error(`ماه شمسی نامعتبر است: ${jm}`);
+  }
+  const monthLength = jalaali.jalaaliMonthLength(jy, jm);
+  const isLeapYear = jalaali.isLeapJalaaliYear(jy);
+  const startShamsi = `${jy}/${pad2(jm)}/01`;
+  const endShamsi = `${jy}/${pad2(jm)}/${pad2(monthLength)}`;
+  return {
+    startShamsi,
+    endShamsi,
+    fromShamsi: startShamsi,
+    toShamsi: endShamsi,
+    monthLength,
+    isLeapYear,
+  };
 }
 
 export function formatMinutesToHHMM(totalMinutes: number | null | undefined): string {

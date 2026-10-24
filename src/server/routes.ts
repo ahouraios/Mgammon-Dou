@@ -55,6 +55,7 @@ import {
   getShamsiDayOfWeekName,
   gregorianToShamsi,
   isValidShamsiDate,
+  isValidTimeHHMMOrHHMMSS,
   normalizeShamsiDate,
   parseTimeToMinutes,
   shamsiToGregorian,
@@ -188,8 +189,10 @@ function saveBase64MediaFile(
   originalName: string,
   base64Data: string
 ): { publicUrl: string; sizeBytes: number } {
-  const rawName = String(originalName || '').trim();
-  if (!rawName || rawName.includes('\0') || rawName.includes('..') || rawName.includes('/') || rawName.includes('\\')) {
+  const rawName = String(originalName || 'upload.jpg')
+    .trim()
+    .replace(/[/\\]/g, '_');
+  if (!rawName || rawName.includes('\0') || rawName.includes('..')) {
     throw new ValidationError(400, 'نام فایل نامعتبر یا حاوی کاراکترهای غیرمجاز است.');
   }
 
@@ -204,30 +207,16 @@ function saveBase64MediaFile(
   }
 
   const maxBytesByFolder: Record<typeof subFolder, number> = {
-    avatars: Math.floor(2.5 * 1024 * 1024),
-    excel: 2 * 1024 * 1024,
-    reports: 5 * 1024 * 1024,
-    receipts: 5 * 1024 * 1024,
-    attachments: 5 * 1024 * 1024,
-    audio: 5 * 1024 * 1024,
+    avatars: Math.floor(5 * 1024 * 1024),
+    excel: 5 * 1024 * 1024,
+    reports: 10 * 1024 * 1024,
+    receipts: 10 * 1024 * 1024,
+    attachments: 10 * 1024 * 1024,
+    audio: 10 * 1024 * 1024,
   };
 
   if (buffer.length > maxBytesByFolder[subFolder]) {
-    throw new ValidationError(413, 'حجم فایل ارسالی بیش از سقف مجاز است.', 'FILE_TOO_LARGE');
-  }
-
-  const ext = path.extname(rawName).toLowerCase();
-  const allowedExtsByFolder: Record<typeof subFolder, string[]> = {
-    avatars: ['.png', '.jpg', '.jpeg', '.webp'],
-    reports: ['.png', '.jpg', '.jpeg', '.webp'],
-    receipts: ['.png', '.jpg', '.jpeg', '.webp', '.pdf'],
-    attachments: ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.xlsx', '.xls'],
-    excel: ['.xlsx', '.xls'],
-    audio: ['.webm', '.ogg', '.mp4', '.wav', '.mp3', '.m4a'],
-  };
-
-  if (!ext || !allowedExtsByFolder[subFolder].includes(ext)) {
-    throw new ValidationError(400, `پسوند فایل (${ext || 'بدون پسوند'}) برای این بخش مجاز نیست.`);
+    throw new ValidationError(413, 'حجم فایل ارسالی بیش از سقف مجاز (۱۰ مگابایت) است.', 'FILE_TOO_LARGE');
   }
 
   const detectedSig = detectFileSignature(buffer);
@@ -244,6 +233,36 @@ function saveBase64MediaFile(
     xls: ['.xls'],
     audio: ['.webm', '.ogg', '.mp4', '.wav', '.mp3', '.m4a'],
   };
+
+  const defaultExtForSig: Record<string, string> = {
+    png: '.png',
+    jpg: '.jpg',
+    webp: '.webp',
+    pdf: '.pdf',
+    xlsx: '.xlsx',
+    xls: '.xls',
+    audio: '.webm',
+  };
+
+  let ext = path.extname(rawName).toLowerCase();
+  if (!ext || !sigToExts[detectedSig]?.includes(ext)) {
+    if (defaultExtForSig[detectedSig]) {
+      ext = defaultExtForSig[detectedSig];
+    }
+  }
+
+  const allowedExtsByFolder: Record<typeof subFolder, string[]> = {
+    avatars: ['.png', '.jpg', '.jpeg', '.webp'],
+    reports: ['.png', '.jpg', '.jpeg', '.webp'],
+    receipts: ['.png', '.jpg', '.jpeg', '.webp', '.pdf'],
+    attachments: ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.xlsx', '.xls'],
+    excel: ['.xlsx', '.xls'],
+    audio: ['.webm', '.ogg', '.mp4', '.wav', '.mp3', '.m4a'],
+  };
+
+  if (!ext || !allowedExtsByFolder[subFolder].includes(ext)) {
+    throw new ValidationError(400, `پسوند فایل (${ext || 'بدون پسوند'}) برای این بخش مجاز نیست.`);
+  }
 
   if (!sigToExts[detectedSig]?.includes(ext)) {
     throw new ValidationError(400, 'محتوای باینری واقعی فایل با پسوند اعلام‌شده مطابقت ندارد.');
@@ -1569,34 +1588,87 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
     let totalConfirmedNetWorkMinutes = 0;
     let totalConfirmedOvertimeMinutes = 0;
     let totalRecordedWorkDays = 0;
+    let earnedRegularWorkToman = 0;
+    let earnedOvertimeToman = 0;
+    const confirmedAttendanceShamsiDates = new Set<string>();
 
     for (const [workDate, dayLogs] of byDate.entries()) {
-      const shamsiDate = dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate);
+      const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
       const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
       const summary = calculateDailyAttendance(workDate, shamsiDate, dayLogs, effectiveSettings, {
         isToday: workDate === nowInfo.workDate,
         currentTimeHHMM: nowInfo.timeHHMM,
       });
       if (!summary.is_incomplete && summary.logs.length > 0) {
+        confirmedAttendanceShamsiDates.add(shamsiDate);
         totalRecordedWorkDays += 1;
         totalConfirmedNetWorkMinutes += summary.net_work_minutes;
         totalConfirmedOvertimeMinutes += summary.overtime_minutes;
+
+        const dayRegularMinutes = Math.max(0, summary.net_work_minutes - summary.overtime_minutes);
+        const daySalaryCalc = calculateSalaryAndOvertimeRates(
+          effectiveSettings,
+          summary.overtime_minutes
+        );
+        earnedRegularWorkToman += Math.round(
+          (dayRegularMinutes / 60) * daySalaryCalc.effectiveHourlyRateToman
+        );
+        earnedOvertimeToman += daySalaryCalc.totalOvertimePayToman;
       }
     }
 
-    const [histTotals] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN work_days_count ELSE 0 END), 0) AS hist_days,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN net_work_minutes ELSE 0 END), 0) AS hist_net_minutes,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN overtime_minutes ELSE 0 END), 0) AS hist_ot_minutes
-       FROM historical_work_records
-       WHERE user_id = ?`,
+    const [approvedHistRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT * FROM historical_work_records
+       WHERE user_id = ? AND status = 'APPROVED'
+       ORDER BY work_date ASC, id ASC`,
       [workerInfo.id]
     );
+    const approvedHistoricalRecords = approvedHistRows.map(mapRowToHistoricalWork);
 
-    totalRecordedWorkDays += Number(histTotals[0]?.hist_days || 0);
-    totalConfirmedNetWorkMinutes += Number(histTotals[0]?.hist_net_minutes || 0);
-    totalConfirmedOvertimeMinutes += Number(histTotals[0]?.hist_ot_minutes || 0);
+    for (const rec of approvedHistoricalRecords) {
+      if (rec.parsed_rows && rec.parsed_rows.length > 0) {
+        for (const row of rec.parsed_rows) {
+          if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
+          const normShamsi = normalizeShamsiDate(row.shamsi_date);
+          if (confirmedAttendanceShamsiDates.has(normShamsi)) continue;
+          confirmedAttendanceShamsiDates.add(normShamsi);
+
+          const rowNetMins = Number(row.net_work_minutes || 0);
+          const rowOtMins = Number(row.overtime_minutes || 0);
+          totalRecordedWorkDays += 1;
+          totalConfirmedNetWorkMinutes += rowNetMins;
+          totalConfirmedOvertimeMinutes += rowOtMins;
+
+          const effSet = await getSystemSettingsFromDb(normShamsi);
+          const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+          earnedRegularWorkToman += Math.round(
+            (rowNetMins / 60) * rowCalc.effectiveHourlyRateToman
+          );
+          earnedOvertimeToman += rowCalc.totalOvertimePayToman;
+        }
+      } else {
+        const normShamsi = isValidShamsiDate(rec.shamsi_date)
+          ? normalizeShamsiDate(rec.shamsi_date)
+          : rec.shamsi_date;
+        if (rec.work_days_count === 1 && confirmedAttendanceShamsiDates.has(normShamsi)) {
+          continue;
+        }
+        if (rec.work_days_count === 1 && normShamsi) {
+          confirmedAttendanceShamsiDates.add(normShamsi);
+        }
+
+        totalRecordedWorkDays += rec.work_days_count;
+        totalConfirmedNetWorkMinutes += rec.net_work_minutes;
+        totalConfirmedOvertimeMinutes += rec.overtime_minutes;
+
+        const effSet = await getSystemSettingsFromDb(normShamsi);
+        const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
+        earnedRegularWorkToman += Math.round(
+          (rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman
+        );
+        earnedOvertimeToman += recCalc.totalOvertimePayToman;
+      }
+    }
 
     const [finTotals] = await pool.execute<mysql.RowDataPacket[]>(
       `SELECT
@@ -1608,18 +1680,9 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       [workerInfo.id]
     );
 
-    const salaryCalc = calculateSalaryAndOvertimeRates(
-      settings,
-      totalConfirmedOvertimeMinutes
-    );
-
     const approvedTotalToman = Number(finTotals[0]?.approved_total || 0);
     const approvedReceivedToman = Number(finTotals[0]?.approved_received_salary_advance || 0);
     const approvedPettyCashToman = Number(finTotals[0]?.approved_petty_cash || 0);
-    const earnedRegularWorkToman = Math.round(
-      (totalConfirmedNetWorkMinutes / 60) * salaryCalc.effectiveHourlyRateToman
-    );
-    const earnedOvertimeToman = salaryCalc.totalOvertimePayToman;
     const totalEntitlementToman =
       earnedRegularWorkToman + earnedOvertimeToman + approvedPettyCashToman;
     const accountBalanceToman = totalEntitlementToman - approvedReceivedToman;
@@ -1683,6 +1746,12 @@ apiRouter.post(
       conn = await pool.getConnection();
       await conn.beginTransaction();
 
+      // قفل ردیف کاربر برای جلوگیری از ثبت هم‌زمان (Race Condition) حتی زمانی که هنوز هیچ رکوردی در روز جاری ثبت نشده است
+      await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM users WHERE id = ? FOR UPDATE`,
+        [workerId]
+      );
+
       const [existingRows] = await conn.execute<mysql.RowDataPacket[]>(
         `SELECT * FROM attendance_logs
          WHERE user_id = ? AND work_date = ? AND is_deleted = 0
@@ -1704,11 +1773,12 @@ apiRouter.post(
         return;
       }
 
+      const recordedAt = `${nowInfo.workDate} ${nowInfo.timeHHMMSS}`;
       const [insertResult] = await conn.execute<mysql.ResultSetHeader>(
         `INSERT INTO attendance_logs
           (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, is_deleted)
-         VALUES (?, ?, ?, ?, NOW(), ?, ?, 0, 0)`,
-        [workerId, nowInfo.workDate, nowInfo.shamsiDate, eventType, nowInfo.timeHHMMSS, note]
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+        [workerId, nowInfo.workDate, nowInfo.shamsiDate, eventType, recordedAt, nowInfo.timeHHMMSS, note]
       );
 
       await conn.commit();
@@ -1953,8 +2023,8 @@ apiRouter.post('/leaves', requireAuth, async (req: AuthenticatedRequest, res: Re
     if (leaveType === 'HOURLY') {
       startTime = toEnglishDigits(String(req.body?.start_time || '')).trim();
       endTime = toEnglishDigits(String(req.body?.end_time || '')).trim();
-      if (!/^\d{2}:\d{2}$/.test(startTime) || !/^\d{2}:\d{2}$/.test(endTime)) {
-        res.status(400).json({ ok: false, message: 'ساعت شروع و پایان مرخصی ساعتی را انتخاب کنید.' });
+      if (!isValidTimeHHMMOrHHMMSS(startTime, false) || !isValidTimeHHMMOrHHMMSS(endTime, false)) {
+        res.status(400).json({ ok: false, message: 'ساعت شروع و پایان مرخصی ساعتی را با فرمت معتبر (۰۰:۰۰ تا ۲۳:۵۹) انتخاب کنید.' });
         return;
       }
       const sMins = parseTimeToMinutes(startTime);
@@ -2417,6 +2487,8 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
     const workDate = shamsiToGregorian(shamsiDate);
     const title = String(req.body?.title || '').trim();
     const workDaysCount = Math.max(0, Number(toEnglishDigits(String(req.body?.work_days_count ?? 1))));
+    const netWorkDirectMinutes = Math.max(0, Number(toEnglishDigits(String(req.body?.net_work_minutes ?? 0))));
+    const overtimeDirectMinutes = Math.max(0, Number(toEnglishDigits(String(req.body?.overtime_minutes ?? 0))));
     const netWorkHours = Math.max(0, Number(toEnglishDigits(String(req.body?.net_work_hours ?? 0))));
     const netWorkExtraMins = Math.max(0, Number(toEnglishDigits(String(req.body?.net_work_minutes_part ?? 0))));
     const overtimeHours = Math.max(0, Number(toEnglishDigits(String(req.body?.overtime_hours ?? 0))));
@@ -2428,8 +2500,14 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
       return;
     }
 
-    const totalNetWorkMinutes = Math.round(netWorkHours * 60 + netWorkExtraMins);
-    const totalOvertimeMinutes = Math.round(overtimeHours * 60 + overtimeExtraMins);
+    const totalNetWorkMinutes =
+      netWorkDirectMinutes > 0
+        ? Math.round(netWorkDirectMinutes)
+        : Math.round(netWorkHours * 60 + netWorkExtraMins);
+    const totalOvertimeMinutes =
+      overtimeDirectMinutes > 0
+        ? Math.round(overtimeDirectMinutes)
+        : Math.round(overtimeHours * 60 + overtimeExtraMins);
 
     if (totalNetWorkMinutes === 0 && totalOvertimeMinutes === 0) {
       res.status(400).json({
@@ -2525,6 +2603,107 @@ apiRouter.post(
   }
 );
 
+apiRouter.put(
+  '/historical-work/:id',
+  requireAuth,
+  requireRole('manager'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const pool = getPool();
+    try {
+      const recordId = Number(req.params.id);
+      if (!recordId) {
+        res.status(400).json({ ok: false, message: 'شناسه رکورد نامعتبر است.' });
+        return;
+      }
+
+      const [existingRows] = await pool.execute<mysql.RowDataPacket[]>(
+        'SELECT * FROM historical_work_records WHERE id = ?',
+        [recordId]
+      );
+      if (existingRows.length === 0) {
+        res.status(404).json({ ok: false, message: 'سابقه کارکرد یافت نشد.' });
+        return;
+      }
+      const existing = mapRowToHistoricalWork(existingRows[0]);
+
+      const shamsiDateRaw = req.body?.shamsi_date
+        ? String(req.body.shamsi_date).trim()
+        : existing.shamsi_date;
+      if (!isValidShamsiDate(shamsiDateRaw)) {
+        res.status(400).json({ ok: false, message: 'تاریخ شمسی معتبر نیست.' });
+        return;
+      }
+      const shamsiDate = normalizeShamsiDate(shamsiDateRaw);
+      const workDate = shamsiToGregorian(shamsiDate);
+      const title = req.body?.title ? String(req.body.title).trim() : existing.title;
+      const workDaysCount =
+        req.body?.work_days_count !== undefined
+          ? Math.max(0, Math.min(366, Math.round(Number(req.body.work_days_count) || 0)))
+          : existing.work_days_count;
+
+      let netWorkMinutes = existing.net_work_minutes;
+      if (req.body?.net_work_minutes !== undefined) {
+        netWorkMinutes = Math.max(0, Math.round(Number(req.body.net_work_minutes) || 0));
+      } else if (req.body?.net_work_hours !== undefined || req.body?.net_work_minutes_part !== undefined) {
+        const nh = Math.max(0, Number(req.body?.net_work_hours || 0));
+        const nm = Math.max(0, Math.min(59, Number(req.body?.net_work_minutes_part || 0)));
+        netWorkMinutes = Math.round(nh * 60 + nm);
+      }
+
+      let overtimeMinutes = existing.overtime_minutes;
+      if (req.body?.overtime_minutes !== undefined) {
+        overtimeMinutes = Math.max(0, Math.round(Number(req.body.overtime_minutes) || 0));
+      } else if (req.body?.overtime_hours !== undefined || req.body?.overtime_minutes_part !== undefined) {
+        const oh = Math.max(0, Number(req.body?.overtime_hours || 0));
+        const om = Math.max(0, Math.min(59, Number(req.body?.overtime_minutes_part || 0)));
+        overtimeMinutes = Math.round(oh * 60 + om);
+      }
+
+      const note =
+        req.body?.note !== undefined
+          ? req.body.note
+            ? String(req.body.note).trim()
+            : null
+          : existing.note;
+
+      await pool.execute(
+        `UPDATE historical_work_records
+         SET shamsi_date = ?, work_date = ?, title = ?, work_days_count = ?, net_work_minutes = ?, overtime_minutes = ?, note = ?
+         WHERE id = ?`,
+        [shamsiDate, workDate, title, workDaysCount, netWorkMinutes, overtimeMinutes, note, recordId]
+      );
+
+      await recordAuditLog({
+        actorUserId: req.user!.id,
+        actionType: 'HISTORICAL_WORK_UPDATE',
+        targetEntity: 'historical_work_records',
+        targetId: recordId,
+        beforeState: {
+          shamsi_date: existing.shamsi_date,
+          work_days_count: existing.work_days_count,
+          net_work_minutes: existing.net_work_minutes,
+          overtime_minutes: existing.overtime_minutes,
+        },
+        afterState: {
+          shamsi_date: shamsiDate,
+          work_days_count: workDaysCount,
+          net_work_minutes: netWorkMinutes,
+          overtime_minutes: overtimeMinutes,
+        },
+        reason: String(req.body?.reason || 'اصلاح سابقه کارکرد قبلی توسط مدیریت'),
+        ipAddress: req.ip || null,
+      });
+
+      res.json({
+        ok: true,
+        message: 'سابقه کارکرد قبلی با موفقیت ویرایش شد و گزارش‌ها به‌روزرسانی گردیدند.',
+      });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
 apiRouter.delete(
   '/historical-work/:id',
   requireAuth,
@@ -2562,6 +2741,11 @@ apiRouter.post(
       conn = await pool.getConnection();
       await conn.beginTransaction();
 
+      await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM users WHERE id = ? FOR UPDATE`,
+        [workerId]
+      );
+
       if (action === 'ADD') {
         const shamsiDateRaw = String(req.body?.shamsi_date || '');
         if (!isValidShamsiDate(shamsiDateRaw)) {
@@ -2575,9 +2759,9 @@ apiRouter.post(
         const recordedTimeRaw = toEnglishDigits(String(req.body?.recorded_time || '')).trim();
         const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
 
-        if (!/^\d{2}:\d{2}(:\d{2})?$/.test(recordedTimeRaw)) {
+        if (!isValidTimeHHMMOrHHMMSS(recordedTimeRaw, true)) {
           await conn.rollback();
-          res.status(400).json({ ok: false, message: 'فرمت ساعت باید HH:MM باشد.' });
+          res.status(400).json({ ok: false, message: 'فرمت ساعت باید بین 00:00 تا 23:59 باشد.' });
           return;
         }
         const recordedTime = recordedTimeRaw.length === 5 ? `${recordedTimeRaw}:00` : recordedTimeRaw;
@@ -2637,9 +2821,9 @@ apiRouter.post(
         const newTimeRaw = toEnglishDigits(String(req.body?.recorded_time || '')).trim();
         const newEventType = String(req.body?.event_type || '') as AttendanceEventType;
 
-        if (!logId || !/^\d{2}:\d{2}(:\d{2})?$/.test(newTimeRaw)) {
+        if (!logId || !isValidTimeHHMMOrHHMMSS(newTimeRaw, true)) {
           await conn.rollback();
-          res.status(400).json({ ok: false, message: 'شناسه رکورد و ساعت معتبر الزامی است.' });
+          res.status(400).json({ ok: false, message: 'شناسه رکورد و ساعت معتبر (00:00 تا 23:59) الزامی است.' });
           return;
         }
         const recordedTime = newTimeRaw.length === 5 ? `${newTimeRaw}:00` : newTimeRaw;
@@ -3117,7 +3301,7 @@ apiRouter.get('/finance', requireAuth, async (req: AuthenticatedRequest, res: Re
       `SELECT
          COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN amount_toman ELSE 0 END), 0) AS approved_total,
          COALESCE(SUM(CASE WHEN status = 'PENDING' THEN amount_toman ELSE 0 END), 0) AS pending_total,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type = 'PETTY_CASH' THEN amount_toman ELSE 0 END), 0) AS approved_petty_cash_total,
+         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type IN ('PETTY_CASH', 'OTHER') THEN amount_toman ELSE 0 END), 0) AS approved_petty_cash_total,
          COUNT(CASE WHEN status = 'PENDING' THEN 1 END) AS pending_count
        FROM financial_transactions
        WHERE user_id = ?`,
@@ -3914,11 +4098,13 @@ apiRouter.get(
       let totalConfirmedOvertimeMinutes = 0;
       let totalRecordedWorkDays = 0;
       let incompleteDaysCount = 0;
+      let totalOvertimePayTomanAccum = 0;
+      const confirmedAttendanceShamsiDates = new Set<string>();
 
       const dailySummaries: DailyAttendanceSummary[] = [];
 
       for (const [workDate, dayLogs] of byDate.entries()) {
-        const shamsiDate = dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate);
+        const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
         const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
         const summary = calculateDailyAttendance(workDate, shamsiDate, dayLogs, effectiveSettings, {
           isToday: workDate === nowInfo.workDate,
@@ -3929,17 +4115,21 @@ apiRouter.get(
         if (summary.is_incomplete) {
           incompleteDaysCount += 1;
         } else if (summary.logs.length > 0) {
+          confirmedAttendanceShamsiDates.add(shamsiDate);
           totalRecordedWorkDays += 1;
           totalConfirmedNetWorkMinutes += summary.net_work_minutes;
           totalConfirmedOvertimeMinutes += summary.overtime_minutes;
+
+          const daySalaryCalc = calculateSalaryAndOvertimeRates(
+            effectiveSettings,
+            summary.overtime_minutes
+          );
+          totalOvertimePayTomanAccum += daySalaryCalc.totalOvertimePayToman;
         }
       }
 
       const [histTotals] = await pool.execute<mysql.RowDataPacket[]>(
         `SELECT
-           COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN work_days_count ELSE 0 END), 0) AS hist_days,
-           COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN net_work_minutes ELSE 0 END), 0) AS hist_net_minutes,
-           COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN overtime_minutes ELSE 0 END), 0) AS hist_ot_minutes,
            COUNT(CASE WHEN status = 'PENDING' THEN 1 END) AS pending_hist_count,
            COUNT(CASE WHEN is_seen_by_manager = 0 THEN 1 END) AS unseen_hist_count
          FROM historical_work_records
@@ -3947,9 +4137,55 @@ apiRouter.get(
         [workerId]
       );
 
-      totalRecordedWorkDays += Number(histTotals[0]?.hist_days || 0);
-      totalConfirmedNetWorkMinutes += Number(histTotals[0]?.hist_net_minutes || 0);
-      totalConfirmedOvertimeMinutes += Number(histTotals[0]?.hist_ot_minutes || 0);
+      const [histAllRows] = await pool.execute<mysql.RowDataPacket[]>(
+        `SELECT h.*, u.role AS creator_role
+         FROM historical_work_records h
+         LEFT JOIN users u ON u.id = h.created_by_user_id
+         WHERE h.user_id = ?
+         ORDER BY h.work_date DESC, h.id DESC`,
+        [workerId]
+      );
+      const historicalRecords = histAllRows.map(mapRowToHistoricalWork);
+
+      for (const rec of historicalRecords) {
+        if (rec.status !== 'APPROVED') continue;
+        if (rec.parsed_rows && rec.parsed_rows.length > 0) {
+          for (const row of rec.parsed_rows) {
+            if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
+            const normShamsi = normalizeShamsiDate(row.shamsi_date);
+            if (confirmedAttendanceShamsiDates.has(normShamsi)) continue;
+            confirmedAttendanceShamsiDates.add(normShamsi);
+
+            const rowNetMins = Number(row.net_work_minutes || 0);
+            const rowOtMins = Number(row.overtime_minutes || 0);
+            totalRecordedWorkDays += 1;
+            totalConfirmedNetWorkMinutes += rowNetMins;
+            totalConfirmedOvertimeMinutes += rowOtMins;
+
+            const effSet = await getSystemSettingsFromDb(normShamsi);
+            const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+            totalOvertimePayTomanAccum += rowCalc.totalOvertimePayToman;
+          }
+        } else {
+          const normShamsi = isValidShamsiDate(rec.shamsi_date)
+            ? normalizeShamsiDate(rec.shamsi_date)
+            : rec.shamsi_date;
+          if (rec.work_days_count === 1 && confirmedAttendanceShamsiDates.has(normShamsi)) {
+            continue;
+          }
+          if (rec.work_days_count === 1 && normShamsi) {
+            confirmedAttendanceShamsiDates.add(normShamsi);
+          }
+
+          totalRecordedWorkDays += rec.work_days_count;
+          totalConfirmedNetWorkMinutes += rec.net_work_minutes;
+          totalConfirmedOvertimeMinutes += rec.overtime_minutes;
+
+          const effSet = await getSystemSettingsFromDb(normShamsi);
+          const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
+          totalOvertimePayTomanAccum += recCalc.totalOvertimePayToman;
+        }
+      }
 
       const [finRows] = await pool.execute<mysql.RowDataPacket[]>(
         `SELECT
@@ -3986,15 +4222,6 @@ apiRouter.get(
         totalConfirmedOvertimeMinutes
       );
 
-      const [histAllRows] = await pool.execute<mysql.RowDataPacket[]>(
-        `SELECT h.*, u.role AS creator_role
-         FROM historical_work_records h
-         LEFT JOIN users u ON u.id = h.created_by_user_id
-         WHERE h.user_id = ?
-         ORDER BY h.work_date DESC, h.id DESC`,
-        [workerId]
-      );
-      const historicalRecords = histAllRows.map(mapRowToHistoricalWork);
       const mergedDailySummaries = mergeApprovedHistoricalIntoDailySummaries(
         dailySummaries,
         historicalRecords
@@ -4037,7 +4264,7 @@ apiRouter.get(
           baseSalaryToman: salaryCalc.baseSalaryToman,
           effectiveHourlyRateToman: salaryCalc.effectiveHourlyRateToman,
           effectiveOvertimeHourlyRateToman: salaryCalc.effectiveOvertimeHourlyRateToman,
-          totalOvertimePayToman: salaryCalc.totalOvertimePayToman,
+          totalOvertimePayToman: totalOvertimePayTomanAccum,
         },
         unseenAlerts: {
           financeAlert: Number(finRows[0]?.unseen_or_pending_fin || 0) > 0,
@@ -4321,16 +4548,15 @@ apiRouter.put(
         )
       ).trim();
 
-      const timeRegex = /^\d{2}:\d{2}$/;
       if (
-        !timeRegex.test(shiftStart) ||
-        !timeRegex.test(shiftEnd) ||
-        !timeRegex.test(overtimeStart) ||
-        !timeRegex.test(thuStart) ||
-        !timeRegex.test(thuEnd) ||
-        !timeRegex.test(thuOtStart)
+        !isValidTimeHHMMOrHHMMSS(shiftStart, false) ||
+        !isValidTimeHHMMOrHHMMSS(shiftEnd, false) ||
+        !isValidTimeHHMMOrHHMMSS(overtimeStart, false) ||
+        !isValidTimeHHMMOrHHMMSS(thuStart, false) ||
+        !isValidTimeHHMMOrHHMMSS(thuEnd, false) ||
+        !isValidTimeHHMMOrHHMMSS(thuOtStart, false)
       ) {
-        res.status(400).json({ ok: false, message: 'فرمت تمام ساعات شیفت و پنجشنبه باید HH:MM باشد.' });
+        res.status(400).json({ ok: false, message: 'فرمت تمام ساعات شیفت و پنجشنبه باید HH:MM معتبر (00:00 تا 23:59) باشد.' });
         return;
       }
 
