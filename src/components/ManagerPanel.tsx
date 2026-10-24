@@ -987,10 +987,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         timeHHMM={dashboard?.serverTime.timeHHMM || ''}
         bannerBgUrl={bannerBgUrl}
         userAvatarUrl={user.avatar_url}
-        collaborationStartShamsi={
-          dashboard?.settings.collaboration_start_shamsi || '1405/06/15'
-        }
-        onRefresh={refreshAll}
       />
 
       {/* هشدار هوشمند در صورت فراموشی ثبت خروج پرسنل */}
@@ -1063,7 +1059,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         </div>
       )}
 
-      {/* کادر وضعیت لحظه‌ای پرسنل: امید میثمی + پرداختی‌های تأییدشده در اولین نگاه */}
+      {/* کادر وضعیت لحظه‌ای پرسنل: امید میثمی + لیست پرداختی‌های تأییدشده در اولین نگاه */}
       {dashboard?.liveState && (
         <WorkerStatusAvatar
           status={dashboard.liveState.status}
@@ -1072,6 +1068,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           isOvertimeActive={dashboard.liveState.is_overtime_active}
           workerAvatarUrl={dashboard.liveState.worker_profile?.avatar_url}
           approvedPaymentsToman={dashboard.kpis.approvedPaymentsToman}
+          approvedTransactions={transactions.filter((t) => t.status === 'APPROVED')}
           pendingPaymentsCount={dashboard.kpis.pendingPaymentsCount}
           workerPhone={dashboard.liveState.worker_profile?.phone_number}
           onOpenFinance={() => handleSelectTab('finance')}
@@ -3614,14 +3611,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         <button
                           type="button"
                           disabled={testingSms}
-                          onClick={() => handleTestSms('09387124781')}
-                          className="min-h-[38px] px-3.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-bold cursor-pointer"
-                        >
-                          {testingSms ? 'در حال بررسی...' : 'تست ارسال به شماره مدیریت (۰۹۳۸۷۱۲۴۷۸۱)'}
-                        </button>
-                        <button
-                          type="button"
-                          disabled={testingSms}
                           onClick={() => handleTestSms()}
                           className="min-h-[38px] px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#0B192C] text-xs font-semibold cursor-pointer"
                         >
@@ -3635,7 +3624,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     <button
                       type="submit"
                       disabled={actionLoading}
-                      className="w-full sm:w-auto min-h-[46px] px-8 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold hover:bg-[#152944] transition-colors cursor-pointer"
+                      className="w-full sm:w-auto min-h-[46px] px-8 rounded-xl bg-[#0B192C] text-[#ffffff] border border-[#C5A059] text-xs font-bold hover:bg-[#152944] transition-colors cursor-pointer"
                     >
                       {actionLoading ? 'در حال ذخیره...' : 'ذخیره تنظیمات'}
                     </button>

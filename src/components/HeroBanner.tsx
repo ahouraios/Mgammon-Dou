@@ -1,6 +1,5 @@
 import React from 'react';
 import {
-  RefreshCw,
   CheckCircle2,
   Clock,
   Briefcase,
@@ -21,7 +20,7 @@ interface HeroBannerProps {
   statusText?: string;
   statusDetail?: string;
   isOvertimeActive?: boolean;
-  onRefresh: () => void;
+  onRefresh?: () => void;
 }
 
 const LIVE_STATUS_BADGE: Record<
@@ -75,7 +74,6 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
   statusText,
   statusDetail,
   isOvertimeActive,
-  onRefresh,
 }) => {
   const effectiveBannerUrl = bannerBgUrl || '/assets/media/banner-bg.svg';
   const defaultAvatar =
@@ -173,17 +171,8 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
             )}
           </div>
         </div>
-
-        <button
-          type="button"
-          onClick={onRefresh}
-          title="بروزرسانی اطلاعات"
-          className="min-h-[34px] px-2.5 rounded-xl bg-[#C5A059] hover:bg-[#d1ae68] text-[#0B192C] text-[11px] font-bold flex items-center gap-1 shrink-0 transition-colors cursor-pointer"
-        >
-          <RefreshCw className="w-3 h-3" />
-          <span className="hidden sm:inline">بروزرسانی</span>
-        </button>
       </div>
     </div>
   );
 };
+

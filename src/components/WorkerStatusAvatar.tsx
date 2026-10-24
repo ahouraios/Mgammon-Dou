@@ -8,8 +8,9 @@ import {
   Wallet,
   Phone,
 } from 'lucide-react';
-import { WorkerLiveStatus } from '../shared/types';
+import { FinancialTransaction, WorkerLiveStatus } from '../shared/types';
 import { formatToman, toPersianDigits } from '../shared/jalali';
+import { TX_TYPE_LABELS } from '../services/api';
 
 interface WorkerStatusAvatarProps {
   status: WorkerLiveStatus;
@@ -18,6 +19,7 @@ interface WorkerStatusAvatarProps {
   isOvertimeActive: boolean;
   workerAvatarUrl?: string | null;
   approvedPaymentsToman?: number;
+  approvedTransactions?: FinancialTransaction[];
   pendingPaymentsCount?: number;
   workerPhone?: string | null;
   onOpenFinance?: () => void;
@@ -66,7 +68,7 @@ const STATUS_STYLE_MAP: Record<
     ringBorder: 'border-slate-400 ring-4 ring-slate-300/30',
     cardGradient: 'bg-gradient-to-l from-slate-50 via-white to-sky-50/40 border-[#C5A059]/55',
     badgeBg: 'bg-slate-600 text-white',
-    badgeText: 'text-slate-700',
+    badgeText: 'text-[#ef0404]',
     textColor: 'text-[#0B192C]',
     codeLabel: 'خارج از شیفت',
     IconComponent: Moon,
@@ -89,12 +91,14 @@ export const WorkerStatusAvatar: React.FC<WorkerStatusAvatarProps> = ({
   isOvertimeActive,
   workerAvatarUrl,
   approvedPaymentsToman = 0,
+  approvedTransactions = [],
   pendingPaymentsCount = 0,
   workerPhone,
   onOpenFinance,
 }) => {
   const cfg = STATUS_STYLE_MAP[status] || STATUS_STYLE_MAP.FINISHED;
   const StatusIcon = cfg.IconComponent;
+  const recentApproved = approvedTransactions.slice(0, 3);
 
   return (
     <div
@@ -142,7 +146,7 @@ export const WorkerStatusAvatar: React.FC<WorkerStatusAvatarProps> = ({
             <span aria-hidden="true" className="text-slate-400">
               ·
             </span>
-            <span className={`font-bold ${cfg.badgeText}`}>{cfg.codeLabel}</span>
+            <span className={`font-bold text-[#ef0404] ${cfg.badgeText}`}>{cfg.codeLabel}</span>
             {isOvertimeActive && (
               <>
                 <span aria-hidden="true" className="text-slate-400">
@@ -159,27 +163,46 @@ export const WorkerStatusAvatar: React.FC<WorkerStatusAvatarProps> = ({
         </div>
       </div>
 
-      {/* بخش پرداختی‌های تأییدشده در یک نگاه به جای تاریخ شروع قرارداد */}
-      <div className="flex flex-wrap sm:flex-col items-center sm:items-end justify-between gap-2 pt-2.5 sm:pt-0 border-t sm:border-t-0 border-slate-200/70 shrink-0 text-xs">
+      {/* کادر سبز رنگ پرداختی‌های تأییدشده (کشیده‌شده در تمام عرض کادر در موبایل و عنوان و مبلغ در یک خط) + لیست پرداختی‌های تأییدشده */}
+      <div className="w-full sm:w-auto flex flex-col sm:items-end justify-between gap-2 pt-2.5 sm:pt-0 border-t sm:border-t-0 border-slate-200/70 shrink-0 text-xs">
         <div
           onClick={onOpenFinance}
           title={onOpenFinance ? 'مشاهده جزئیات امور مالی و پرداختی‌ها' : undefined}
-          className={`flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50/90 border border-emerald-200/90 text-[#0B192C] tabular-nums shadow-2xs ${
+          className={`w-full sm:w-auto flex items-center justify-between sm:justify-end gap-2 px-3 py-2 rounded-xl bg-emerald-50/95 border border-emerald-200/90 text-[#0B192C] tabular-nums shadow-2xs ${
             onOpenFinance ? 'hover:bg-emerald-100/80 transition-colors cursor-pointer' : ''
           }`}
         >
-          <Wallet className="w-4 h-4 text-emerald-700 shrink-0" />
-          <div className="flex flex-col sm:items-end">
-            <span className="text-[10px] font-semibold text-emerald-800">
+          <div className="flex items-center gap-1.5">
+            <Wallet className="w-4 h-4 text-emerald-700 shrink-0" />
+            <span className="text-[11px] font-bold text-emerald-900 whitespace-nowrap">
               پرداختی‌های تأییدشده:
             </span>
-            <strong className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
-              {formatToman(approvedPaymentsToman)}
-            </strong>
           </div>
+          <strong className="text-xs sm:text-sm font-extrabold text-[#0B192C] whitespace-nowrap">
+            {formatToman(approvedPaymentsToman)}
+          </strong>
         </div>
 
-        <div className="flex items-center gap-2 text-[11px]">
+        {recentApproved.length > 0 && (
+          <div className="w-full sm:w-auto flex flex-col gap-1 bg-white/80 rounded-xl border border-emerald-100 px-2.5 py-1.5">
+            {recentApproved.map((tx) => (
+              <div
+                key={tx.id}
+                onClick={onOpenFinance}
+                className="flex items-center justify-between gap-3 text-[10.5px] text-slate-700 tabular-nums cursor-pointer"
+              >
+                <span className="truncate font-medium text-slate-600">
+                  {TX_TYPE_LABELS[tx.tx_type]} ({toPersianDigits(tx.shamsi_date)}):
+                </span>
+                <span className="font-bold text-emerald-800 whitespace-nowrap">
+                  {formatToman(tx.amount_toman)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="w-full sm:w-auto flex items-center justify-between sm:justify-end gap-2 text-[11px]">
           {pendingPaymentsCount > 0 && (
             <button
               type="button"
@@ -200,4 +223,5 @@ export const WorkerStatusAvatar: React.FC<WorkerStatusAvatarProps> = ({
     </div>
   );
 };
+
 
