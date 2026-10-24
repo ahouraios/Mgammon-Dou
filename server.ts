@@ -3,52 +3,191 @@ import express from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'path';
 import fs from 'fs';
-import { initializeDatabase } from './src/server/db';
+import mysql from 'mysql2/promise';
+import {
+  getPool,
+  initializeDatabase,
+  validateProductionSecurityConfig,
+} from './src/server/db';
+import { getSessionUser, requireCsrfProtection } from './src/server/auth';
 import { apiRouter } from './src/server/routes';
 
+const PRIVATE_MEDIA_FOLDERS = new Set([
+  'avatars',
+  'attachments',
+  'excel',
+  'audio',
+  'receipts',
+  'reports',
+]);
+
 export async function createApp() {
+  validateProductionSecurityConfig(process.env);
   const app = express();
 
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '25mb' }));
+  app.disable('x-powered-by');
+  app.use(express.json({ limit: '15mb' }));
   app.use(cookieParser());
 
-  // هدرهای امنیتی پایه
+  // هدرهای امنیتی استاندارد
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), geolocation=()');
     next();
   });
 
-  // اطمینان از وجود پوشه‌های ذخیره فایل و رسانه در assets/media
-  const mediaDirs = [
-    path.resolve(process.cwd(), 'public/assets/media'),
-    path.resolve(process.cwd(), 'public/assets/media/avatars'),
-    path.resolve(process.cwd(), 'public/assets/media/attachments'),
-    path.resolve(process.cwd(), 'public/assets/media/excel'),
-    path.resolve(process.cwd(), 'public/assets/media/audio'),
-  ];
-  for (const dir of mediaDirs) {
+  // اطمینان از وجود پوشه‌های ذخیره فایل خصوصی و رسانه
+  const privateBaseDir = path.resolve(process.cwd(), '.data/private_media');
+  const legacyPublicMediaDir = path.resolve(process.cwd(), 'public/assets/media');
+  for (const folder of PRIVATE_MEDIA_FOLDERS) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(path.join(privateBaseDir, folder), { recursive: true });
+      fs.mkdirSync(path.join(legacyPublicMediaDir, folder), { recursive: true });
     } catch {
       // ignore
     }
   }
 
-  // مسیرهای API
-  app.use('/api', apiRouter);
+  // محافظت CSRF روی مسیرهای تغییردهنده API
+  app.use('/api', requireCsrfProtection, apiRouter);
 
-  // سرو کردن فایل‌های استاتیک پوشه public و assets/media
+  // محافظت از فایل‌ها و پیوست‌های خصوصی پیش از express.static
+  app.get('/assets/media/:folder/:filename', async (req, res) => {
+    try {
+      const folder = String(req.params.folder || '').trim();
+      const filename = String(req.params.filename || '').trim();
+
+      if (
+        !PRIVATE_MEDIA_FOLDERS.has(folder) ||
+        !filename ||
+        filename.includes('..') ||
+        filename.includes('/') ||
+        filename.includes('\\') ||
+        filename.includes('\0')
+      ) {
+        res.status(400).json({ ok: false, message: 'مسیر فایل معتبر نیست.' });
+        return;
+      }
+
+      const session = await getSessionUser(req);
+      if (!session) {
+        res.status(401).json({
+          ok: false,
+          code: 'UNAUTHORIZED',
+          message: 'دسترسی مستقیم بدون احراز هویت به فایل‌های خصوصی مجاز نیست.',
+        });
+        return;
+      }
+
+      const fileUrl = `/assets/media/${folder}/${filename}`;
+      const pool = getPool();
+
+      if (session.user.role !== 'manager') {
+        let authorized = false;
+        const uid = session.user.id;
+
+        if (folder === 'receipts') {
+          const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+            'SELECT id FROM financial_transactions WHERE receipt_file_url = ? AND user_id = ? LIMIT 1',
+            [fileUrl, uid]
+          );
+          authorized = rows.length > 0;
+        } else if (folder === 'reports') {
+          const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+            'SELECT id FROM daily_work_reports WHERE photo_url = ? AND user_id = ? LIMIT 1',
+            [fileUrl, uid]
+          );
+          authorized = rows.length > 0;
+        } else if (folder === 'excel') {
+          const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+            'SELECT id FROM historical_work_records WHERE excel_file_url = ? AND user_id = ? LIMIT 1',
+            [fileUrl, uid]
+          );
+          authorized = rows.length > 0;
+        } else if (folder === 'audio') {
+          const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+            'SELECT id FROM work_correspondences WHERE audio_url = ? AND (sender_user_id = ? OR receiver_user_id = ?) LIMIT 1',
+            [fileUrl, uid, uid]
+          );
+          authorized = rows.length > 0;
+        } else if (folder === 'attachments') {
+          const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+            'SELECT id FROM work_correspondences WHERE attachments_json LIKE ? AND (sender_user_id = ? OR receiver_user_id = ?) LIMIT 1',
+            [`%${filename}%`, uid, uid]
+          );
+          authorized = rows.length > 0;
+        } else if (folder === 'avatars') {
+          const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+            'SELECT id FROM users WHERE avatar_url = ? LIMIT 1',
+            [fileUrl]
+          );
+          authorized = rows.length > 0;
+        }
+
+        if (!authorized) {
+          res.status(403).json({
+            ok: false,
+            code: 'FORBIDDEN',
+            message: 'شما مجوز دسترسی به این فایل خصوصی را ندارید.',
+          });
+          return;
+        }
+      }
+
+      const candidatePrivate = path.resolve(privateBaseDir, folder, filename);
+      const candidateLegacy = path.resolve(legacyPublicMediaDir, folder, filename);
+
+      if (
+        !candidatePrivate.startsWith(path.resolve(privateBaseDir, folder)) ||
+        !candidateLegacy.startsWith(path.resolve(legacyPublicMediaDir, folder))
+      ) {
+        res.status(400).json({ ok: false, message: 'مسیر فایل نامعتبر است.' });
+        return;
+      }
+
+      const targetPath = fs.existsSync(candidatePrivate)
+        ? candidatePrivate
+        : fs.existsSync(candidateLegacy)
+          ? candidateLegacy
+          : null;
+
+      if (!targetPath) {
+        res.status(404).json({ ok: false, message: 'فایل مورد نظر یافت نشد.' });
+        return;
+      }
+
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
+      res.sendFile(targetPath);
+    } catch {
+      res.status(500).json({ ok: false, message: 'خطا در بازیابی فایل.' });
+    }
+  });
+
+  // مسدودسازی هرگونه دسترسی مستقیم دیگر به زیرپوشه‌های خصوصی
+  app.use('/assets/media/:folder', (req, res, next) => {
+    const folder = String(req.params.folder || '').trim();
+    if (PRIVATE_MEDIA_FOLDERS.has(folder)) {
+      res.status(403).json({ ok: false, message: 'دسترسی مستقیم به پوشه خصوصی مجاز نیست.' });
+      return;
+    }
+    next();
+  });
+
+  // سرو کردن فایل‌های استاتیک عمومی پوشه public (مانند بنر و آیکون‌های پیش‌فرض)
   const publicDir = path.resolve(process.cwd(), 'public');
   app.use(express.static(publicDir));
-  app.use('/assets/media', express.static(path.resolve(process.cwd(), 'public/assets/media')));
 
   return app;
 }
 
 async function startServer() {
+  validateProductionSecurityConfig(process.env);
   const app = await createApp();
   const PORT = Number(process.env.PORT || 3000);
 

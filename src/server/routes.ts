@@ -7,18 +7,23 @@ import path from 'path';
 import * as XLSX from 'xlsx';
 import {
   checkDatabaseConnection,
+  FORBIDDEN_DEFAULT_PASSWORDS,
   getPool,
   getSystemSettingsFromDb,
   mapRowToSystemSettings,
 } from './db';
 import {
   AuthenticatedRequest,
+  checkLoginRateLimit,
+  clearLoginAttempts,
   clearSessionCookie,
   createServerSession,
+  generateCsrfToken,
   getSessionUser,
   handleServerError,
   hashSessionToken,
   recordAuditLog,
+  recordFailedLoginAttempt,
   requireAuth,
   requireRole,
   setSessionCookie,
@@ -39,6 +44,8 @@ import {
   LeaveRequestItem,
   LeaveType,
   OvertimeCalcMode,
+  SystemSettings,
+  UserRole,
   WorkCorrespondence,
   WorkTaskItem,
 } from '../shared/types';
@@ -65,20 +72,189 @@ import { checkMelipayamakCredit, sendMelipayamakSms } from './melipayamak';
 
 export const apiRouter = Router();
 
+class ValidationError extends Error {
+  statusCode: number;
+  code: string;
+  constructor(statusCode: number, message: string, code = 'INVALID_FILE') {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+export function sanitizeSettingsForRole(
+  settings: SystemSettings,
+  role: UserRole
+): SystemSettings {
+  if (role !== 'manager') {
+    return {
+      ...settings,
+      melipayamak_username: '',
+      melipayamak_password: '',
+      melipayamak_from_number: '',
+    };
+  }
+  return {
+    ...settings,
+    melipayamak_password: settings.melipayamak_password ? '••••••••' : '',
+  };
+}
+
+function detectFileSignature(
+  buf: Buffer
+): 'png' | 'jpg' | 'webp' | 'pdf' | 'xlsx' | 'xls' | 'audio' | 'unknown' | 'dangerous' {
+  if (buf.length < 4) return 'unknown';
+
+  // بررسی فایل‌های اجرایی و اسکریپتی خطرناک (PE/MZ, ELF, PHP, HTML/Script)
+  if (
+    (buf[0] === 0x4d && buf[1] === 0x5a) || // MZ (.exe/.dll)
+    (buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) // ELF
+  ) {
+    return 'dangerous';
+  }
+  const headText = buf.subarray(0, Math.min(256, buf.length)).toString('utf8').toLowerCase();
+  if (
+    headText.includes('<script') ||
+    headText.includes('<?php') ||
+    headText.startsWith('#!/') ||
+    headText.includes('<html')
+  ) {
+    return 'dangerous';
+  }
+
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (
+    buf.length >= 8 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a
+  ) {
+    return 'png';
+  }
+
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return 'jpg';
+  }
+
+  // WebP: RIFF....WEBP
+  if (
+    buf.length >= 12 &&
+    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buf.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return 'webp';
+  }
+
+  // PDF: %PDF
+  if (buf.subarray(0, 4).toString('ascii') === '%PDF') {
+    return 'pdf';
+  }
+
+  // XLSX / ZIP: 50 4B 03 04
+  if (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) {
+    return 'xlsx';
+  }
+
+  // XLS (OLE2): D0 CF 11 E0
+  if (buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0) {
+    return 'xls';
+  }
+
+  // Audio: WebM (1A 45 DF A3), OGG (OggS), WAV (RIFF....WAVE), MP4/M4A (....ftyp), MP3 (ID3 / FF FB)
+  if (
+    (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) ||
+    buf.subarray(0, 4).toString('ascii') === 'OggS' ||
+    (buf.length >= 12 &&
+      buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      buf.subarray(8, 12).toString('ascii') === 'WAVE') ||
+    (buf.length >= 8 && buf.subarray(4, 8).toString('ascii') === 'ftyp') ||
+    buf.subarray(0, 3).toString('ascii') === 'ID3' ||
+    (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)
+  ) {
+    return 'audio';
+  }
+
+  return 'unknown';
+}
+
 function saveBase64MediaFile(
   subFolder: 'avatars' | 'attachments' | 'excel' | 'audio' | 'receipts' | 'reports',
   originalName: string,
   base64Data: string
 ): { publicUrl: string; sizeBytes: number } {
-  const cleanBase64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
+  const rawName = String(originalName || '').trim();
+  if (!rawName || rawName.includes('\0') || rawName.includes('..') || rawName.includes('/') || rawName.includes('\\')) {
+    throw new ValidationError(400, 'نام فایل نامعتبر یا حاوی کاراکترهای غیرمجاز است.');
+  }
+
+  const cleanBase64 = (base64Data.includes(',') ? base64Data.split(',')[1] : base64Data).trim();
+  if (!cleanBase64 || !/^[A-Za-z0-9+/=\r\n]+$/.test(cleanBase64)) {
+    throw new ValidationError(400, 'محتوای فایل ارسالی معتبر نیست.');
+  }
+
   const buffer = Buffer.from(cleanBase64, 'base64');
-  const ext = path.extname(originalName || '').replace(/[^a-zA-Z0-9.]/g, '') || '.bin';
+  if (buffer.length < 8) {
+    throw new ValidationError(400, 'فایل ارسالی خالی یا خراب است.');
+  }
+
+  const maxBytesByFolder: Record<typeof subFolder, number> = {
+    avatars: Math.floor(2.5 * 1024 * 1024),
+    excel: 2 * 1024 * 1024,
+    reports: 5 * 1024 * 1024,
+    receipts: 5 * 1024 * 1024,
+    attachments: 5 * 1024 * 1024,
+    audio: 5 * 1024 * 1024,
+  };
+
+  if (buffer.length > maxBytesByFolder[subFolder]) {
+    throw new ValidationError(413, 'حجم فایل ارسالی بیش از سقف مجاز است.', 'FILE_TOO_LARGE');
+  }
+
+  const ext = path.extname(rawName).toLowerCase();
+  const allowedExtsByFolder: Record<typeof subFolder, string[]> = {
+    avatars: ['.png', '.jpg', '.jpeg', '.webp'],
+    reports: ['.png', '.jpg', '.jpeg', '.webp'],
+    receipts: ['.png', '.jpg', '.jpeg', '.webp', '.pdf'],
+    attachments: ['.png', '.jpg', '.jpeg', '.webp', '.pdf', '.xlsx', '.xls'],
+    excel: ['.xlsx', '.xls'],
+    audio: ['.webm', '.ogg', '.mp4', '.wav', '.mp3', '.m4a'],
+  };
+
+  if (!ext || !allowedExtsByFolder[subFolder].includes(ext)) {
+    throw new ValidationError(400, `پسوند فایل (${ext || 'بدون پسوند'}) برای این بخش مجاز نیست.`);
+  }
+
+  const detectedSig = detectFileSignature(buffer);
+  if (detectedSig === 'dangerous' || detectedSig === 'unknown') {
+    throw new ValidationError(400, 'نوع واقعی فایل نامعتبر یا غیرمجاز است.');
+  }
+
+  const sigToExts: Record<string, string[]> = {
+    png: ['.png'],
+    jpg: ['.jpg', '.jpeg'],
+    webp: ['.webp'],
+    pdf: ['.pdf'],
+    xlsx: ['.xlsx'],
+    xls: ['.xls'],
+    audio: ['.webm', '.ogg', '.mp4', '.wav', '.mp3', '.m4a'],
+  };
+
+  if (!sigToExts[detectedSig]?.includes(ext)) {
+    throw new ValidationError(400, 'محتوای باینری واقعی فایل با پسوند اعلام‌شده مطابقت ندارد.');
+  }
+
   const safeBase = path
-    .basename(originalName || 'file', ext)
+    .basename(rawName, path.extname(rawName))
     .replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_')
-    .slice(0, 40);
-  const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${safeBase}${ext}`;
-  const targetDir = path.resolve(process.cwd(), 'public/assets/media', subFolder);
+    .slice(0, 40) || 'file';
+  const fileName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${safeBase}${ext}`;
+  const targetDir = path.resolve(process.cwd(), '.data/private_media', subFolder);
   fs.mkdirSync(targetDir, { recursive: true });
   const fullPath = path.join(targetDir, fileName);
   fs.writeFileSync(fullPath, buffer);
@@ -377,6 +553,46 @@ async function getWorkerUserId(pool: mysql.Pool): Promise<number> {
   return info.id;
 }
 
+/**
+ * جلوگیری از IDOR و دسترسی عرضی کارمند به اطلاعات کاربر دیگر از طریق پارامترهای userId / user_id
+ */
+async function resolveTargetWorkerId(
+  pool: mysql.Pool,
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<number | null> {
+  const rawTarget =
+    req.query?.userId ?? req.query?.user_id ?? req.body?.userId ?? req.body?.user_id;
+
+  if (req.user!.role !== 'manager') {
+    if (
+      rawTarget !== undefined &&
+      rawTarget !== null &&
+      String(rawTarget).trim() !== '' &&
+      Number(rawTarget) !== req.user!.id
+    ) {
+      res.status(403).json({
+        ok: false,
+        code: 'FORBIDDEN_USER_ACCESS',
+        message: 'شما مجوز دسترسی یا تغییر اطلاعات کاربر دیگر را ندارید.',
+      });
+      return null;
+    }
+    return req.user!.id;
+  }
+
+  if (rawTarget !== undefined && rawTarget !== null && String(rawTarget).trim() !== '') {
+    const parsedId = Number(rawTarget);
+    if (!Number.isInteger(parsedId) || parsedId <= 0) {
+      res.status(400).json({ ok: false, message: 'شناسه کاربر معتبر نیست.' });
+      return null;
+    }
+    return parsedId;
+  }
+
+  return getWorkerUserId(pool);
+}
+
 // ============================================================================
 // ۱. بررسی وضعیت سلامت سرویس
 // ============================================================================
@@ -407,6 +623,7 @@ apiRouter.post('/auth/login', async (req, res) => {
   try {
     const username = String(req.body?.username || '').trim();
     const password = String(req.body?.password || '');
+    const clientIp = req.ip || 'unknown';
 
     if (!username || !password) {
       res.status(400).json({
@@ -416,13 +633,43 @@ apiRouter.post('/auth/login', async (req, res) => {
       return;
     }
 
+    const rateCheck = checkLoginRateLimit(clientIp, username);
+    if (!rateCheck.allowed) {
+      res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+      res.status(429).json({
+        ok: false,
+        code: 'TOO_MANY_ATTEMPTS',
+        message: `تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه دیگر مجدداً تلاش کنید.`,
+      });
+      return;
+    }
+
+    if (process.env.NODE_ENV === 'production' && FORBIDDEN_DEFAULT_PASSWORDS.has(password)) {
+      await recordFailedLoginAttempt(clientIp, username);
+      res.status(403).json({
+        ok: false,
+        code: 'DEFAULT_PASSWORD_FORBIDDEN',
+        message: 'ورود با رمز عبور پیش‌فرض در محیط عملیاتی (Production) ممنوع است.',
+      });
+      return;
+    }
+
     const pool = getPool();
     const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, password_hash, is_active, last_login_at FROM users WHERE username = ? LIMIT 1',
+      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, password_hash, must_change_password, is_active, last_login_at FROM users WHERE username = ? LIMIT 1',
       [username]
     );
 
     if (rows.length === 0 || !rows[0].is_active) {
+      const failState = await recordFailedLoginAttempt(clientIp, username);
+      if (failState.locked) {
+        res.status(429).json({
+          ok: false,
+          code: 'TOO_MANY_ATTEMPTS',
+          message: 'حساب موقتاً به دلیل تلاش‌های ناموفق متوالی قفل شد. لطفاً ۱۵ دقیقه دیگر تلاش کنید.',
+        });
+        return;
+      }
       res.status(401).json({
         ok: false,
         message: 'نام کاربری یا رمز عبور اشتباه است.',
@@ -433,6 +680,7 @@ apiRouter.post('/auth/login', async (req, res) => {
     const userRow = rows[0];
     const match = await bcrypt.compare(password, String(userRow.password_hash));
     if (!match) {
+      const failState = await recordFailedLoginAttempt(clientIp, username);
       await recordAuditLog({
         actorUserId: Number(userRow.id),
         actionType: 'LOGIN_FAILED',
@@ -440,6 +688,14 @@ apiRouter.post('/auth/login', async (req, res) => {
         targetId: Number(userRow.id),
         ipAddress: req.ip || null,
       });
+      if (failState.locked) {
+        res.status(429).json({
+          ok: false,
+          code: 'TOO_MANY_ATTEMPTS',
+          message: 'حساب موقتاً به دلیل تلاش‌های ناموفق متوالی قفل شد. لطفاً ۱۵ دقیقه دیگر تلاش کنید.',
+        });
+        return;
+      }
       res.status(401).json({
         ok: false,
         message: 'نام کاربری یا رمز عبور اشتباه است.',
@@ -447,9 +703,10 @@ apiRouter.post('/auth/login', async (req, res) => {
       return;
     }
 
+    clearLoginAttempts(clientIp, username);
     await pool.execute('UPDATE users SET last_login_at = NOW() WHERE id = ?', [userRow.id]);
 
-    const { rawToken, expiresAt } = await createServerSession(
+    const { rawToken, csrfToken, expiresAt } = await createServerSession(
       Number(userRow.id),
       req.ip || null,
       req.headers['user-agent'] || null
@@ -464,9 +721,14 @@ apiRouter.post('/auth/login', async (req, res) => {
       ipAddress: req.ip || null,
     });
 
+    const mustChangePassword =
+      Boolean(userRow.must_change_password) || FORBIDDEN_DEFAULT_PASSWORDS.has(password);
+
     res.json({
       ok: true,
       token: rawToken,
+      csrfToken,
+      requirePasswordChange: mustChangePassword,
       user: {
         id: Number(userRow.id),
         username: String(userRow.username),
@@ -478,6 +740,7 @@ apiRouter.post('/auth/login', async (req, res) => {
           : '1405/06/15',
         phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
         biometric_enabled: Boolean(userRow.biometric_token_hash),
+        must_change_password: mustChangePassword,
         last_login_at: new Date().toISOString(),
       },
     });
@@ -541,19 +804,31 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
     const username = String(req.body?.username || '').trim();
     const credentialId = String(req.body?.credential_id || '').trim();
     const biometricToken = String(req.body?.biometric_token || '').trim();
+    const clientIp = req.ip || 'unknown';
 
     if (!username || !credentialId || !biometricToken) {
       res.status(400).json({ ok: false, message: 'اطلاعات ورود بیومتریک ناقص است.' });
       return;
     }
 
+    const rateCheck = checkLoginRateLimit(clientIp, username);
+    if (!rateCheck.allowed) {
+      res.status(429).json({
+        ok: false,
+        code: 'TOO_MANY_ATTEMPTS',
+        message: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً بعداً تلاش کنید.',
+      });
+      return;
+    }
+
     const pool = getPool();
     const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_credential_id, biometric_token_hash, is_active FROM users WHERE username = ? LIMIT 1',
+      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_credential_id, biometric_token_hash, must_change_password, is_active FROM users WHERE username = ? LIMIT 1',
       [username]
     );
 
     if (rows.length === 0 || !rows[0].is_active) {
+      await recordFailedLoginAttempt(clientIp, username);
       res.status(401).json({ ok: false, message: 'حساب کاربری معتبر نیست.' });
       return;
     }
@@ -565,6 +840,7 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
       String(userRow.biometric_credential_id) !== credentialId ||
       String(userRow.biometric_token_hash) !== expectedHash
     ) {
+      await recordFailedLoginAttempt(clientIp, username);
       res.status(401).json({
         ok: false,
         message: 'کلید اثر انگشت منقضی شده است. لطفاً یک بار با رمز عبور وارد شوید و مجدداً فعال کنید.',
@@ -572,9 +848,10 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
       return;
     }
 
+    clearLoginAttempts(clientIp, username);
     await pool.execute('UPDATE users SET last_login_at = NOW() WHERE id = ?', [userRow.id]);
 
-    const { rawToken, expiresAt } = await createServerSession(
+    const { rawToken, csrfToken, expiresAt } = await createServerSession(
       Number(userRow.id),
       req.ip || null,
       req.headers['user-agent'] || null
@@ -584,6 +861,7 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
     res.json({
       ok: true,
       token: rawToken,
+      csrfToken,
       user: {
         id: Number(userRow.id),
         username: String(userRow.username),
@@ -595,6 +873,7 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
           : '1405/06/15',
         phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
         biometric_enabled: true,
+        must_change_password: Boolean(userRow.must_change_password),
         last_login_at: new Date().toISOString(),
       },
     });
@@ -621,11 +900,13 @@ apiRouter.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Re
   try {
     const settings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(settings.timezone);
+    const csrfToken = req.rawSessionToken ? generateCsrfToken(req.rawSessionToken) : undefined;
     res.json({
       ok: true,
       user: req.user,
+      csrfToken,
       serverTime: nowInfo,
-      settings,
+      settings: sanitizeSettingsForRole(settings, req.user!.role),
     });
   } catch (err) {
     handleServerError(res, err);
@@ -674,8 +955,8 @@ apiRouter.put('/auth/avatar', requireAuth, async (req: AuthenticatedRequest, res
 
 apiRouter.post('/auth/change-password', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const currentPassword = String(req.body?.currentPassword || '');
-    const newPassword = String(req.body?.newPassword || '');
+    const currentPassword = String(req.body?.currentPassword || req.body?.current_password || '');
+    const newPassword = String(req.body?.newPassword || req.body?.new_password || '');
 
     if (!currentPassword || !newPassword) {
       res.status(400).json({
@@ -689,6 +970,14 @@ apiRouter.post('/auth/change-password', requireAuth, async (req: AuthenticatedRe
       res.status(400).json({
         ok: false,
         message: 'رمز عبور جدید باید حداقل ۸ کاراکتر باشد.',
+      });
+      return;
+    }
+
+    if (FORBIDDEN_DEFAULT_PASSWORDS.has(newPassword) || newPassword === currentPassword) {
+      res.status(400).json({
+        ok: false,
+        message: 'رمز عبور جدید نباید با رمز فعلی یا رمزهای پیش‌فرض یکسان باشد.',
       });
       return;
     }
@@ -715,14 +1004,20 @@ apiRouter.post('/auth/change-password', requireAuth, async (req: AuthenticatedRe
     }
 
     const newHash = await bcrypt.hash(newPassword, 10);
-    await pool.execute('UPDATE users SET password_hash = ? WHERE id = ?', [newHash, userId]);
+    await pool.execute(
+      'UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?',
+      [newHash, userId]
+    );
 
-    if (req.sessionTokenHash) {
-      await pool.execute(
-        'DELETE FROM user_sessions WHERE user_id = ? AND token_hash != ?',
-        [userId, req.sessionTokenHash]
-      );
-    }
+    // بی‌اعتبارسازی تمام نشست‌های قبلی کاربر و صدور نشست جدید (Session Rotation)
+    await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [userId]);
+
+    const { rawToken, csrfToken, expiresAt } = await createServerSession(
+      userId,
+      req.ip || null,
+      req.headers['user-agent'] || null
+    );
+    setSessionCookie(res, rawToken, expiresAt);
 
     await recordAuditLog({
       actorUserId: userId,
@@ -734,7 +1029,9 @@ apiRouter.post('/auth/change-password', requireAuth, async (req: AuthenticatedRe
 
     res.json({
       ok: true,
-      message: 'رمز عبور با موفقیت تغییر یافت.',
+      token: rawToken,
+      csrfToken,
+      message: 'رمز عبور با موفقیت تغییر یافت و نشست‌های قبلی بی‌اعتبار شدند.',
     });
   } catch (err) {
     handleServerError(res, err);
@@ -936,7 +1233,7 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       ok: true,
       serverTime: nowInfo,
       liveState,
-      settings,
+      settings: sanitizeSettingsForRole(settings, req.user!.role),
       unreadMessagesCount,
       latestUnreadMessage,
       workerKpis: {
@@ -1067,7 +1364,8 @@ apiRouter.post(
 apiRouter.get('/attendance/history', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
     const currentSettings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(currentSettings.timezone);
 
@@ -1201,10 +1499,11 @@ async function computeLeaveQuotaSummary(
   };
 }
 
-apiRouter.get('/leaves', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+apiRouter.get('/leaves', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
     const settings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(settings.timezone);
 
@@ -1233,6 +1532,10 @@ apiRouter.get('/leaves', requireAuth, async (_req: AuthenticatedRequest, res: Re
 
 apiRouter.post('/leaves', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
+    const pool = getPool();
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
+
     const shamsiRaw = String(req.body?.shamsi_date || '').trim();
     if (!isValidShamsiDate(shamsiRaw)) {
       res.status(400).json({ ok: false, message: 'تاریخ انتخاب‌شده معتبر نیست.' });
@@ -1268,8 +1571,6 @@ apiRouter.post('/leaves', requireAuth, async (req: AuthenticatedRequest, res: Re
       durationMinutes = eMins - sMins;
     }
 
-    const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
     const isManager = req.user!.role === 'manager';
     const initialStatus: FinancialStatus = isManager ? 'APPROVED' : 'PENDING';
     const seenByManager = isManager ? 1 : 0;
@@ -1405,11 +1706,56 @@ apiRouter.post('/historical-work/upload-excel', requireAuth, async (req: Authent
       return;
     }
 
-    const cleanBase64 = fileBase64.includes(',') ? fileBase64.split(',')[1] : fileBase64;
-    const buffer = Buffer.from(cleanBase64, 'base64');
+    if (
+      fileName.includes('..') ||
+      fileName.includes('/') ||
+      fileName.includes('\\') ||
+      fileName.includes('\0') ||
+      !/\.(xlsx|xls)$/i.test(fileName)
+    ) {
+      res.status(400).json({ ok: false, message: 'نام یا پسوند فایل اکسل معتبر نیست (فقط .xlsx یا .xls مجاز است).' });
+      return;
+    }
 
-    const workbook = XLSX.read(buffer, { type: 'buffer' });
-    const firstSheetName = workbook.SheetNames[0];
+    const cleanBase64 = (fileBase64.includes(',') ? fileBase64.split(',')[1] : fileBase64).trim();
+    if (!cleanBase64 || !/^[A-Za-z0-9+/=\r\n]+$/.test(cleanBase64)) {
+      res.status(400).json({ ok: false, message: 'محتوای فایل اکسل نامعتبر است.' });
+      return;
+    }
+
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    if (buffer.length > 2 * 1024 * 1024) {
+      res.status(413).json({
+        ok: false,
+        code: 'FILE_TOO_LARGE',
+        message: 'حجم فایل اکسل نباید بیشتر از ۲ مگابایت باشد.',
+      });
+      return;
+    }
+
+    const sig = detectFileSignature(buffer);
+    if (sig !== 'xlsx' && sig !== 'xls') {
+      res.status(400).json({
+        ok: false,
+        code: 'INVALID_EXCEL_SIGNATURE',
+        message: 'فایل بارگذاری‌شده یک فایل اکسل واقعی و معتبر نیست.',
+      });
+      return;
+    }
+
+    let workbook: XLSX.WorkBook;
+    try {
+      workbook = XLSX.read(buffer, {
+        type: 'buffer',
+        cellFormula: false,
+        cellHTML: false,
+      });
+    } catch {
+      res.status(400).json({ ok: false, message: 'فایل اکسل خراب یا غیرقابل خواندن است.' });
+      return;
+    }
+
+    const firstSheetName = workbook.SheetNames?.[0];
     if (!firstSheetName) {
       res.status(400).json({ ok: false, message: 'فایل اکسل معتبر نیست یا برگه (Sheet) ندارد.' });
       return;
@@ -1420,6 +1766,14 @@ apiRouter.post('/historical-work/upload-excel', requireAuth, async (req: Authent
 
     if (rawRows.length === 0) {
       res.status(400).json({ ok: false, message: 'فایل اکسل خالی است و هیچ ردیف داده‌ای ندارد.' });
+      return;
+    }
+
+    if (rawRows.length > 500) {
+      res.status(400).json({
+        ok: false,
+        message: 'تعداد ردیف‌های فایل اکسل بیش از حد مجاز (حداکثر ۵۰۰ ردیف) است.',
+      });
       return;
     }
 
@@ -1857,12 +2211,23 @@ apiRouter.post(
         }
 
         const recordedAt = `${workDate} ${recordedTime}`;
-        await conn.execute<mysql.ResultSetHeader>(
+        const [insLog] = await conn.execute<mysql.ResultSetHeader>(
           `INSERT INTO attendance_logs
             (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
           [workerId, workDate, shamsiDate, eventType, recordedAt, recordedTime, note, managerId, reason]
         );
+
+        await recordAuditLog({
+          actorUserId: managerId,
+          actionType: 'ATTENDANCE_OVERRIDE',
+          targetEntity: 'attendance_logs',
+          targetId: insLog.insertId,
+          afterState: { action: 'ADD', shamsi_date: shamsiDate, event_type: eventType, recorded_time: recordedTime },
+          reason,
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
 
         await conn.commit();
         res.status(201).json({
@@ -1921,6 +2286,18 @@ apiRouter.post(
           [newEventType, recordedTime, recordedAt, managerId, reason, logId]
         );
 
+        await recordAuditLog({
+          actorUserId: managerId,
+          actionType: 'ATTENDANCE_OVERRIDE',
+          targetEntity: 'attendance_logs',
+          targetId: logId,
+          beforeState: { event_type: targetLog.event_type, recorded_time: targetLog.recorded_time },
+          afterState: { event_type: newEventType, recorded_time: recordedTime },
+          reason,
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
+
         await conn.commit();
         res.json({
           ok: true,
@@ -1971,6 +2348,18 @@ apiRouter.post(
           [managerId, reason, logId]
         );
 
+        await recordAuditLog({
+          actorUserId: managerId,
+          actionType: 'ATTENDANCE_OVERRIDE',
+          targetEntity: 'attendance_logs',
+          targetId: logId,
+          beforeState: { event_type: targetLog.event_type, recorded_time: targetLog.recorded_time },
+          afterState: { is_deleted: true },
+          reason,
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
+
         await conn.commit();
         res.json({
           ok: true,
@@ -2002,7 +2391,8 @@ apiRouter.post(
 apiRouter.get('/reports', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
 
     const search = req.query.search ? String(req.query.search).trim() : '';
     const shamsiDate = req.query.shamsiDate ? normalizeShamsiDate(String(req.query.shamsiDate)) : '';
@@ -2135,7 +2525,8 @@ apiRouter.post(
 apiRouter.get('/tasks', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
     const shamsiDate = req.query.shamsiDate ? normalizeShamsiDate(String(req.query.shamsiDate)) : '';
 
     let sql = 'SELECT * FROM work_tasks WHERE user_id = ?';
@@ -2210,6 +2601,15 @@ apiRouter.patch('/tasks/:id/toggle', requireAuth, async (req: AuthenticatedReque
       return;
     }
 
+    if (req.user!.role !== 'manager' && Number(rows[0].user_id) !== req.user!.id) {
+      res.status(403).json({
+        ok: false,
+        code: 'FORBIDDEN',
+        message: 'شما مجوز تغییر وظیفه کاربر دیگر را ندارید.',
+      });
+      return;
+    }
+
     const currentCompleted = Boolean(rows[0].is_completed);
     const nextCompleted = req.body?.is_completed !== undefined ? Boolean(req.body.is_completed) : !currentCompleted;
     const addedToReport = req.body?.added_to_report !== undefined ? Boolean(req.body.added_to_report) : Boolean(rows[0].added_to_report);
@@ -2275,7 +2675,8 @@ apiRouter.post(
 apiRouter.get('/finance', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
 
     const statusFilter = req.query.status ? String(req.query.status).trim() : '';
     const typeFilter = req.query.txType ? String(req.query.txType).trim() : '';
@@ -2682,6 +3083,16 @@ apiRouter.put(
       const existing = mapRowToFinancialTx(rows[0]);
       const isManager = req.user!.role === 'manager';
 
+      if (!isManager && (existing.user_id !== req.user!.id || existing.created_by_user_id !== req.user!.id)) {
+        await conn.rollback();
+        res.status(403).json({
+          ok: false,
+          code: 'FORBIDDEN',
+          message: 'شما مجوز ویرایش اطلاعات مالی کاربر دیگر را ندارید.',
+        });
+        return;
+      }
+
       if (!isManager && existing.status !== 'PENDING') {
         await conn.rollback();
         res.status(403).json({
@@ -2775,6 +3186,18 @@ apiRouter.delete(
       }
 
       const existing = mapRowToFinancialTx(rows[0]);
+      if (
+        req.user!.role !== 'manager' &&
+        (existing.user_id !== req.user!.id || existing.created_by_user_id !== req.user!.id)
+      ) {
+        res.status(403).json({
+          ok: false,
+          code: 'FORBIDDEN',
+          message: 'شما مجوز حذف اطلاعات مالی کاربر دیگر را ندارید.',
+        });
+        return;
+      }
+
       if (req.user!.role !== 'manager' && existing.status !== 'PENDING') {
         res.status(403).json({
           ok: false,
@@ -2818,6 +3241,11 @@ apiRouter.get('/correspondences', requireAuth, async (req: AuthenticatedRequest,
       WHERE 1=1
     `;
     const params: (string | number)[] = [];
+
+    if (req.user!.role !== 'manager') {
+      sql += ` AND (c.sender_user_id = ? OR c.receiver_user_id = ?)`;
+      params.push(req.user!.id, req.user!.id);
+    }
 
     if (fromShamsi) {
       sql += ` AND c.shamsi_date >= ?`;
@@ -3236,7 +3664,7 @@ apiRouter.get(
           monthly: monthlyChartData,
         },
         recentSummaries: mergedDailySummaries.slice(0, 14),
-        settings: currentSettings,
+        settings: sanitizeSettingsForRole(currentSettings, 'manager'),
       });
     } catch (err) {
       handleServerError(res, err);
@@ -3404,7 +3832,7 @@ apiRouter.get(
       const backupPayload = {
         exported_at: new Date().toISOString(),
         app: 'Mgammon',
-        settings,
+        settings: sanitizeSettingsForRole(settings, 'manager'),
         attendance,
         historical,
         finance,
@@ -3426,14 +3854,41 @@ apiRouter.get(
 // ============================================================================
 // ۹. تنظیمات قواعد کارکرد، پنجشنبه‌ها، حقوق، اضافه‌کاری، سهمیه مرخصی و پیامک
 // ============================================================================
-apiRouter.get('/settings', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+apiRouter.get('/settings', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const settings = await getSystemSettingsFromDb();
-    res.json({ ok: true, settings });
+    res.json({ ok: true, settings: sanitizeSettingsForRole(settings, req.user!.role) });
   } catch (err) {
     handleServerError(res, err);
   }
 });
+
+apiRouter.put(
+  '/settings/banner',
+  requireAuth,
+  requireRole('manager'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const bannerBgUrl = req.body?.banner_bg_url ? String(req.body.banner_bg_url).trim() : null;
+      if (bannerBgUrl && !bannerBgUrl.startsWith('/') && !bannerBgUrl.startsWith('https://')) {
+        res.status(400).json({ ok: false, message: 'آدرس تصویر بنر معتبر نیست.' });
+        return;
+      }
+      const pool = getPool();
+      await pool.execute('UPDATE system_settings SET banner_bg_url = ?, updated_by_user_id = ?', [
+        bannerBgUrl,
+        req.user!.id,
+      ]);
+      res.json({
+        ok: true,
+        banner_bg_url: bannerBgUrl,
+        message: 'تصویر بنر سامانه با موفقیت به‌روزرسانی شد.',
+      });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
 
 apiRouter.put(
   '/settings',
@@ -3550,7 +4005,11 @@ apiRouter.put(
 
       const smsEnabled = Boolean(req.body?.sms_enabled);
       const melipayamakUsername = String(req.body?.melipayamak_username ?? currentSettings.melipayamak_username).trim();
-      const melipayamakPassword = String(req.body?.melipayamak_password ?? currentSettings.melipayamak_password).trim();
+      const rawInputSmsPass = String(req.body?.melipayamak_password ?? '').trim();
+      const melipayamakPassword =
+        rawInputSmsPass && rawInputSmsPass !== '••••••••'
+          ? rawInputSmsPass
+          : currentSettings.melipayamak_password;
       const melipayamakFromNumber = toEnglishDigits(
         String(req.body?.melipayamak_from_number ?? currentSettings.melipayamak_from_number)
       ).trim();
@@ -3573,7 +4032,11 @@ apiRouter.put(
         await conn.execute(
           `INSERT INTO system_settings_snapshots (effective_from_shamsi, settings_json, created_by_user_id)
            VALUES (?, ?, ?)`,
-          [currentSettings.effective_from_shamsi, JSON.stringify(currentSettings), req.user!.id]
+          [
+            currentSettings.effective_from_shamsi,
+            JSON.stringify(sanitizeSettingsForRole(currentSettings, 'manager')),
+            req.user!.id,
+          ]
         );
       }
 
@@ -3651,7 +4114,7 @@ apiRouter.put(
         'SELECT * FROM system_settings WHERE id = ?',
         [currentSettings.id]
       );
-      const newSettings = mapRowToSystemSettings(updatedRows[0]);
+      const newSettings = sanitizeSettingsForRole(mapRowToSystemSettings(updatedRows[0]), 'manager');
 
       await conn.commit();
 
@@ -3682,14 +4145,14 @@ apiRouter.post(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const currentSettings = await getSystemSettingsFromDb();
+      const rawPass = String(req.body?.melipayamak_password ?? '').trim();
       const mergedSettings = {
         ...currentSettings,
         melipayamak_username: String(
           req.body?.melipayamak_username ?? currentSettings.melipayamak_username
         ),
-        melipayamak_password: String(
-          req.body?.melipayamak_password ?? currentSettings.melipayamak_password
-        ),
+        melipayamak_password:
+          rawPass && rawPass !== '••••••••' ? rawPass : currentSettings.melipayamak_password,
         melipayamak_from_number: String(
           req.body?.melipayamak_from_number ?? currentSettings.melipayamak_from_number
         ),

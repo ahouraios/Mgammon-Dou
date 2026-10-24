@@ -308,17 +308,16 @@ export default function App() {
                 </button>
               </form>
 
-              {/* انتخاب سریع حساب برای ورود */}
+              {/* انتخاب سریع نام کاربری */}
               <div className="pt-3.5 border-t border-slate-100 space-y-2">
                 <div className="text-[11px] font-medium text-slate-500 text-center">
-                  ورود سریع به حساب کاربری:
+                  انتخاب سریع نام کاربری:
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     type="button"
                     onClick={() => {
                       setUsername('manager');
-                      setPassword('Mgammon@1405');
                     }}
                     className="min-h-[40px] px-2.5 py-1.5 rounded-xl border border-[#C5A059]/50 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] bg-white transition-colors cursor-pointer"
                   >
@@ -328,7 +327,6 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setUsername('worker');
-                      setPassword('Worker@1405');
                     }}
                     className="min-h-[40px] px-2.5 py-1.5 rounded-xl border border-[#C5A059]/50 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] bg-white transition-colors cursor-pointer"
                   >

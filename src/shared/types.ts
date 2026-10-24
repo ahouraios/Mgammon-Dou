@@ -38,6 +38,7 @@ export interface UserProfile {
   collaboration_start_shamsi: string | null;
   phone_number: string | null;
   biometric_enabled?: boolean;
+  must_change_password?: boolean;
   last_login_at: string | null;
 }
 

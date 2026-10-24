@@ -17,7 +17,9 @@ import {
   getPool,
   initializeDatabase,
   setSimulatedDatabaseDisconnect,
+  validateProductionSecurityConfig,
 } from '../src/server/db';
+import { resetAllLoginRateLimits } from '../src/server/auth';
 import { createApp } from '../server';
 import type { Server } from 'http';
 
@@ -424,5 +426,394 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(JSON.stringify(clockFailData)).not.toContain('mgammon_pass');
 
     setSimulatedDatabaseDisconnect(false);
+  });
+
+  it('آزمون امنیتی ۱: بررسی ورود با رمز اشتباه، منع رمز پیش‌فرض و SESSION_SECRET ضعیف در محیط عملیاتی، و محدودیت تلاش ورود (Brute-Force)', async () => {
+    resetAllLoginRateLimits();
+
+    // ۱-الف: بررسی توقف راه‌اندازی در محیط Production با SESSION_SECRET ضعیف یا پیش‌فرض
+    expect(() =>
+      validateProductionSecurityConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'mgammon-duo-enterprise-secret-2026',
+      })
+    ).toThrow(/SESSION_SECRET/);
+
+    expect(() =>
+      validateProductionSecurityConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'short-secret',
+      })
+    ).toThrow(/SESSION_SECRET/);
+
+    // ۱-ب: مسدودسازی ورود با رمز پیش‌فرض در محیط عملیاتی (Production)
+    const prevNodeEnv = process.env.NODE_ENV;
+    const prevSecret = process.env.SESSION_SECRET;
+    process.env.NODE_ENV = 'production';
+    process.env.SESSION_SECRET = 'a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8';
+    try {
+      const defaultPwdProdRes = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'worker',
+          password: 'Worker@1405',
+        }),
+      });
+      expect(defaultPwdProdRes.status).toBe(403);
+      const defaultPwdProdData = await defaultPwdProdRes.json();
+      expect(defaultPwdProdData.code).toBe('DEFAULT_PASSWORD_FORBIDDEN');
+    } finally {
+      if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = prevNodeEnv;
+      if (prevSecret === undefined) delete process.env.SESSION_SECRET;
+      else process.env.SESSION_SECRET = prevSecret;
+    }
+
+    // ۱-ج: بررسی ورود با رمز اشتباه و اعمال قفل موقت در تلاش پنجم و ششم (Rate Limiting)
+    resetAllLoginRateLimits();
+    try {
+      for (let i = 0; i < 4; i++) {
+        const wrongRes = await fetch(`${baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: 'worker',
+            password: `WrongPassword_${i}`,
+          }),
+        });
+        expect(wrongRes.status).toBe(401);
+      }
+
+      const fifthAttemptLockedRes = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'worker',
+          password: 'WrongPassword_5',
+        }),
+      });
+      expect(fifthAttemptLockedRes.status).toBe(429);
+
+      const sixthAttemptLockedRes = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'worker',
+          password: 'WrongPassword_6',
+        }),
+      });
+      expect(sixthAttemptLockedRes.status).toBe(429);
+      const lockedData = await sixthAttemptLockedRes.json();
+      expect(lockedData.code).toBe('TOO_MANY_ATTEMPTS');
+    } finally {
+      resetAllLoginRateLimits();
+    }
+  });
+
+  it('آزمون امنیتی ۲ و ۳: جلوگیری از اجرای APIهای مدیریتی توسط کارمند (RBAC) و جلوگیری از دسترسی به اطلاعات کاربر دیگر با تغییر شناسه (IDOR)', async () => {
+    // ۲: تلاش کارمند برای اجرای APIهای مدیریتی
+    const workerSettingsPut = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify(BASE_SETTINGS),
+    });
+    expect(workerSettingsPut.status).toBe(403);
+
+    const workerDirectFinance = await fetch(`${baseUrl}/api/finance/manager-direct`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        amount_toman: 5000000,
+        tx_type: 'BONUS',
+        shamsi_date: '1405/07/30',
+        description: 'تلاش غیرمجاز کارمند',
+      }),
+    });
+    expect(workerDirectFinance.status).toBe(403);
+
+    const workerOverride = await fetch(`${baseUrl}/api/attendance/manager-override`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        action: 'CREATE',
+        work_date: '2026-10-24',
+        event_type: 'WORK_START',
+        recorded_time: '08:00',
+        reason: 'تلاش غیرمجاز',
+      }),
+    });
+    expect(workerOverride.status).toBe(403);
+
+    // بررسی عدم افشای رمز پنل پیامکی برای کارمند در تنظیمات
+    const workerSettingsGet = await fetch(`${baseUrl}/api/settings`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    const workerSettingsData = await workerSettingsGet.json();
+    expect(workerSettingsData.settings.melipayamak_password).toBe('');
+
+    // ۳: تلاش کارمند برای دسترسی به اطلاعات کاربر دیگر با تغییر شناسه (userId=1 متعلق به مدیر)
+    const idorFinanceRes = await fetch(`${baseUrl}/api/finance?userId=1`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(idorFinanceRes.status).toBe(403);
+    const idorFinanceData = await idorFinanceRes.json();
+    expect(idorFinanceData.code).toBe('FORBIDDEN_USER_ACCESS');
+
+    const idorHistoryRes = await fetch(`${baseUrl}/api/attendance/history?user_id=1`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(idorHistoryRes.status).toBe(403);
+
+    const idorLeaveRes = await fetch(`${baseUrl}/api/leaves?userId=1`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(idorLeaveRes.status).toBe(403);
+  });
+
+  it('آزمون امنیتی ۴ و ۵: درخواست بدون توکن، بررسی کوکی HttpOnly، محافظت CSRF و بی‌اعتبارسازی نشست پس از خروج یا انقضا', async () => {
+    // ۵-الف: درخواست بدون توکن
+    const noTokenRes = await fetch(`${baseUrl}/api/auth/me`);
+    expect(noTokenRes.status).toBe(401);
+
+    // ورود برای دریافت کوکی نشست HttpOnly و توکن CSRF
+    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'worker',
+        password: process.env.INITIAL_WORKER_PASSWORD || 'Worker@1405',
+      }),
+    });
+    expect(loginRes.status).toBe(200);
+    const setCookieHeaders = loginRes.headers.getSetCookie
+      ? loginRes.headers.getSetCookie()
+      : [loginRes.headers.get('set-cookie') || ''];
+    const cookieJoined = setCookieHeaders.join('; ');
+    expect(cookieJoined).toContain('mgammon_duo_sid=');
+    expect(cookieJoined).toContain('HttpOnly');
+    expect(cookieJoined).toContain('SameSite=Lax');
+    expect(cookieJoined).toContain('mgammon_csrf_token=');
+
+    const sidMatch = cookieJoined.match(/mgammon_duo_sid=([^;]+)/);
+    const csrfMatch = cookieJoined.match(/mgammon_csrf_token=([^;]+)/);
+    expect(sidMatch).not.toBeNull();
+    expect(csrfMatch).not.toBeNull();
+    const sidCookie = `mgammon_duo_sid=${sidMatch![1]}; mgammon_csrf_token=${csrfMatch![1]}`;
+    const csrfToken = decodeURIComponent(csrfMatch![1]);
+    const tempLoginData = await loginRes.json();
+    const tempBearer = tempLoginData.token;
+
+    // ۵-ب: درخواست تغییردهنده داده با کوکی اما بدون هدر X-CSRF-Token باید مسدود شود (403)
+    const csrfMissingRes = await fetch(`${baseUrl}/api/finance/worker-request`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: sidCookie,
+      },
+      body: JSON.stringify({
+        amount_toman: 100000,
+        tx_type: 'PETTY_CASH',
+        shamsi_date: '1405/07/30',
+        description: 'تست بدون توکن CSRF',
+      }),
+    });
+    expect(csrfMissingRes.status).toBe(403);
+    const csrfMissingData = await csrfMissingRes.json();
+    expect(csrfMissingData.code).toBe('CSRF_TOKEN_INVALID');
+
+    // ۵-ج: درخواست با Origin نامعتبر بیگانه باید مسدود شود (403)
+    const csrfBadOriginRes = await fetch(`${baseUrl}/api/finance/worker-request`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: sidCookie,
+        'X-CSRF-Token': csrfToken,
+        Origin: 'https://evil-attacker.example.com',
+      },
+      body: JSON.stringify({
+        amount_toman: 100000,
+        tx_type: 'PETTY_CASH',
+        shamsi_date: '1405/07/30',
+        description: 'تست Origin جعلی',
+      }),
+    });
+    expect(csrfBadOriginRes.status).toBe(403);
+    const csrfBadOriginData = await csrfBadOriginRes.json();
+    expect(csrfBadOriginData.code).toBe('CSRF_ORIGIN_MISMATCH');
+
+    // ۴: خروج از حساب و تلاش برای استفاده مجدد از نشست خروج‌کرده
+    const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
+      method: 'POST',
+      headers: {
+        Cookie: sidCookie,
+        'X-CSRF-Token': csrfToken,
+      },
+    });
+    expect(logoutRes.status).toBe(200);
+
+    const reuseAfterLogoutRes = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${tempBearer}` },
+    });
+    expect(reuseAfterLogoutRes.status).toBe(401);
+  });
+
+  it('آزمون امنیتی ۶ و ۷: محافظت از پیوست‌های خصوصی و جلوگیری از آپلود فایل جعلی، خراب یا نامعتبر', async () => {
+    // ۷-الف: آپلود فایل جعلی (محتوای اسکریپت/اجرایی با پسوند تصویر .jpg) باید رد شود
+    const fakeJpgBase64 =
+      'data:image/jpeg;base64,' + Buffer.from('MZ_FAKE_EXECUTABLE_SCRIPT_CONTENT').toString('base64');
+
+    const fakeUploadRes = await fetch(`${baseUrl}/api/finance/worker-request`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        amount_toman: 250000,
+        tx_type: 'PETTY_CASH',
+        shamsi_date: '1405/07/30',
+        description: 'تست فایل جعلی',
+        receipt_base64: fakeJpgBase64,
+        receipt_file_name: 'fake_receipt.jpg',
+      }),
+    });
+    expect(fakeUploadRes.status).toBe(400);
+
+    // ۷-ب: آپلود فایل اکسل جعلی یا خراب باید رد شود
+    const fakeExcelBase64 = Buffer.from('NOT_A_VALID_EXCEL_OR_ZIP_FILE').toString('base64');
+    const fakeExcelRes = await fetch(`${baseUrl}/api/historical-work/upload-excel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        file_data: fakeExcelBase64,
+      }),
+    });
+    expect(fakeExcelRes.status).toBe(400);
+
+    // ۶: ایجاد یک پیوست خصوصی معتبر (PNG واقعی) و بررسی عدم دسترسی مستقیم بدون احراز هویت
+    const validMinimalPngBase64 =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    const validReceiptRes = await fetch(`${baseUrl}/api/finance/worker-request`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        amount_toman: 400000,
+        tx_type: 'PETTY_CASH',
+        shamsi_date: '1405/07/30',
+        description: 'رسید معتبر خصوصی',
+        receipt_base64: validMinimalPngBase64,
+        receipt_file_name: 'receipt.png',
+      }),
+    });
+    expect(validReceiptRes.status).toBe(201);
+
+    const financeListRes = await fetch(`${baseUrl}/api/finance`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    const financeListData = await financeListRes.json();
+    const txWithReceipt = financeListData.transactions.find(
+      (t: { description: string; receipt_file_url?: string }) =>
+        t.description === 'رسید معتبر خصوصی' && t.receipt_file_url
+    );
+    expect(txWithReceipt).toBeDefined();
+    const privateMediaPath = txWithReceipt.receipt_file_url as string;
+    expect(privateMediaPath).toMatch(/^\/assets\/media\/receipts\//);
+
+    // تلاش برای دانلود مستقیم پیوست خصوصی بدون توکن احراز هویت باید با 401 مسدود شود
+    const unauthFileRes = await fetch(`${baseUrl}${privateMediaPath}`);
+    expect(unauthFileRes.status).toBe(401);
+
+    // دانلود پیوست خصوصی توسط مالک یا مدیر مجاز باید با 200 انجام شود
+    const authFileRes = await fetch(`${baseUrl}${privateMediaPath}`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(authFileRes.status).toBe(200);
+    expect(authFileRes.headers.get('content-type')).toBe('image/png');
+  });
+
+  it('آزمون امنیتی ۸: تغییر رمز عبور، الزام تغییر رمز اولیه و ابطال تمام نشست‌های قبلی پس از تغییر رمز', async () => {
+    const originalWorkerPassword = process.env.INITIAL_WORKER_PASSWORD || 'Worker@1405';
+    const newTemporaryPassword = 'NewSecure@1405!Worker';
+
+    // ورود اولیه برای دریافت نشست قدیمی
+    const oldSessionRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'worker',
+        password: originalWorkerPassword,
+      }),
+    });
+    expect(oldSessionRes.status).toBe(200);
+    const oldSessionData = await oldSessionRes.json();
+    const oldToken = oldSessionData.token;
+
+    // تغییر رمز عبور توسط کاربر
+    const changePwdRes = await fetch(`${baseUrl}/api/auth/change-password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${oldToken}`,
+      },
+      body: JSON.stringify({
+        currentPassword: originalWorkerPassword,
+        newPassword: newTemporaryPassword,
+      }),
+    });
+    expect(changePwdRes.status).toBe(200);
+    const changePwdData = await changePwdRes.json();
+    const rotatedToken = changePwdData.token;
+    expect(rotatedToken).toBeTruthy();
+
+    // نشست قبلی (oldToken) باید بلافاصله باطل شده باشد
+    const oldTokenCheckRes = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${oldToken}` },
+    });
+    expect(oldTokenCheckRes.status).toBe(401);
+
+    // نشست جدید (rotatedToken) باید معتبر باشد
+    const newTokenCheckRes = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${rotatedToken}` },
+    });
+    expect(newTokenCheckRes.status).toBe(200);
+
+    // بررسی اینکه تغییر رمز به یکی از رمزهای پیش‌فرض ناامن توسط سرور رد می‌شود (400)
+    const rejectDefaultPwdRes = await fetch(`${baseUrl}/api/auth/change-password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${rotatedToken}`,
+      },
+      body: JSON.stringify({
+        currentPassword: newTemporaryPassword,
+        newPassword: 'Worker@1405',
+      }),
+    });
+    expect(rejectDefaultPwdRes.status).toBe(400);
+
+    // بازگرداندن رمز عبور محیط توسعه در دیتابیس برای تکرارپذیری تست‌ها
+    const bcrypt = await import('bcryptjs');
+    const restoredHash = await bcrypt.default.hash(originalWorkerPassword, 10);
+    await getPool().execute('UPDATE users SET password_hash = ? WHERE username = ?', [
+      restoredHash,
+      'worker',
+    ]);
   });
 });

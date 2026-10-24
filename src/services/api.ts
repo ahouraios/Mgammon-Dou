@@ -1,22 +1,28 @@
-const TOKEN_STORAGE_KEY = 'mgammon_session_token';
+let inMemoryCsrfToken: string | null = null;
 
-export function getStoredToken(): string | null {
-  try {
-    return sessionStorage.getItem(TOKEN_STORAGE_KEY);
-  } catch {
-    return null;
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined' || !document.cookie) return null;
+  const parts = document.cookie.split(';');
+  for (const part of parts) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) {
+      return decodeURIComponent(v.join('='));
+    }
   }
+  return null;
 }
 
-export function setStoredToken(token: string | null): void {
+export function getStoredToken(): string | null {
+  return null;
+}
+
+export function setStoredToken(_token: string | null): void {
+  // توکن نشست صرفاً در کوکی امن HttpOnly نگهداری می‌شود و در localStorage یا sessionStorage ذخیره نمی‌گردد
   try {
-    if (token) {
-      sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-    } else {
-      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-    }
+    sessionStorage.removeItem('mgammon_session_token');
+    localStorage.removeItem('mgammon_session_token');
   } catch {
-    // ignore storage errors
+    // ignore
   }
 }
 
@@ -24,14 +30,14 @@ export async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const token = getStoredToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> | undefined),
   };
 
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
+  const csrfToken = inMemoryCsrfToken || readCookie('mgammon_csrf_token');
+  if (csrfToken) {
+    headers['X-CSRF-Token'] = csrfToken;
   }
 
   let response: Response;
@@ -45,11 +51,20 @@ export async function apiRequest<T>(
     throw new Error('عدم برقراری ارتباط با سرور. لطفاً اتصال اینترنت یا وضعیت سرور را بررسی کنید.');
   }
 
+  const headerCsrf = response.headers.get('X-CSRF-Token');
+  if (headerCsrf) {
+    inMemoryCsrfToken = headerCsrf;
+  }
+
   let data: Record<string, unknown>;
   try {
     data = await response.json();
   } catch {
     throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
+  }
+
+  if (typeof data.csrfToken === 'string' && data.csrfToken) {
+    inMemoryCsrfToken = data.csrfToken;
   }
 
   if (!response.ok || data.ok === false) {
