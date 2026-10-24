@@ -8,6 +8,10 @@ import {
   Download,
   DatabaseBackup,
   Image as ImageIcon,
+  Smartphone,
+  ShieldAlert,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { UserProfile } from '../shared/types';
 import { apiRequest } from '../services/api';
@@ -37,11 +41,30 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
     text: string;
   } | null>(null);
 
+  const [phoneNumber, setPhoneNumber] = useState(user.phone_number || '');
+  const [phoneLoading, setPhoneLoading] = useState(false);
+  const [phoneFeedback, setPhoneFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [showCurrentPwd, setShowCurrentPwd] = useState(false);
+  const [showNewPwd, setShowNewPwd] = useState(false);
   const [pwdLoading, setPwdLoading] = useState(false);
   const [pwdFeedback, setPwdFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+
+  // بازنشانی رمز عبور پرسنل توسط مدیر
+  const [workerNewPassword, setWorkerNewPassword] = useState('');
+  const [showWorkerNewPwd, setShowWorkerNewPwd] = useState(false);
+  const [sendWorkerResetSms, setSendWorkerResetSms] = useState(true);
+  const [workerResetLoading, setWorkerResetLoading] = useState(false);
+  const [workerResetFeedback, setWorkerResetFeedback] = useState<{
     type: 'success' | 'error';
     text: string;
   } | null>(null);
@@ -127,6 +150,28 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
     }
   };
 
+  const handlePhoneSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPhoneFeedback(null);
+    setPhoneLoading(true);
+    try {
+      const res = await apiRequest<{
+        ok: boolean;
+        phone_number: string | null;
+        message: string;
+      }>('/api/auth/phone', {
+        method: 'PUT',
+        body: JSON.stringify({ phone_number: phoneNumber }),
+      });
+      setPhoneNumber(res.phone_number || '');
+      setPhoneFeedback({ type: 'success', text: res.message });
+    } catch (err) {
+      setPhoneFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      setPhoneLoading(false);
+    }
+  };
+
   const handlePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setPwdFeedback(null);
@@ -161,6 +206,38 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
       setPwdFeedback({ type: 'error', text: (err as Error).message });
     } finally {
       setPwdLoading(false);
+    }
+  };
+
+  const handleManagerResetWorkerPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setWorkerResetFeedback(null);
+    if (workerNewPassword.trim().length < 8) {
+      setWorkerResetFeedback({
+        type: 'error',
+        text: 'رمز عبور جدید پرسنل باید حداقل ۸ کاراکتر باشد.',
+      });
+      return;
+    }
+
+    setWorkerResetLoading(true);
+    try {
+      const res = await apiRequest<{ ok: boolean; message: string }>(
+        '/api/auth/manager-reset-worker-password',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            newPassword: workerNewPassword.trim(),
+            sendSms: sendWorkerResetSms,
+          }),
+        }
+      );
+      setWorkerNewPassword('');
+      setWorkerResetFeedback({ type: 'success', text: res.message });
+    } catch (err) {
+      setWorkerResetFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      setWorkerResetLoading(false);
     }
   };
 
@@ -207,11 +284,11 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* کارت تغییر تصویر پروفایل شخصی کاربر */}
+        {/* کارت تغییر تصویر پروفایل شخصی کاربر + شماره موبایل بازیابی رمز */}
         <div className="rounded-2xl bg-white border border-slate-200 p-5 space-y-4">
           <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
             <Camera className="w-4 h-4 text-[#9A7428]" />
-            <h4 className="text-sm font-bold text-[#0B192C]">تصویر پروفایل شما</h4>
+            <h4 className="text-sm font-bold text-[#0B192C]">تصویر پروفایل و شماره موبایل</h4>
           </div>
 
           <div className="flex items-center gap-4">
@@ -287,6 +364,41 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
               <span>{avatarFeedback.text}</span>
             </div>
           )}
+
+          <form onSubmit={handlePhoneSubmit} className="pt-3 border-t border-slate-100 space-y-2.5">
+            <label className="flex items-center gap-1.5 text-xs font-bold text-[#0B192C]">
+              <Smartphone className="w-3.5 h-3.5 text-[#9A7428]" />
+              <span>شماره موبایل شما (جهت دریافت کد پیامکی فراموشی رمز عبور)</span>
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="tel"
+                dir="ltr"
+                value={phoneNumber}
+                onChange={(e) => setPhoneNumber(e.target.value)}
+                placeholder="09123456789"
+                className="flex-1 min-h-[40px] rounded-xl border border-slate-200 px-3 text-xs text-right focus:outline-none focus:border-[#0B192C]"
+              />
+              <button
+                type="submit"
+                disabled={phoneLoading}
+                className="min-h-[40px] px-4 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold shrink-0 cursor-pointer"
+              >
+                {phoneLoading ? 'ذخیره...' : 'ثبت شماره'}
+              </button>
+            </div>
+            {phoneFeedback && (
+              <div
+                className={`rounded-xl p-2.5 text-xs font-medium ${
+                  phoneFeedback.type === 'success'
+                    ? 'bg-emerald-50 text-emerald-900 border border-emerald-200'
+                    : 'bg-red-50 text-red-900 border border-red-200'
+                }`}
+              >
+                {phoneFeedback.text}
+              </div>
+            )}
+          </form>
         </div>
 
         {/* کارت تغییر رمز عبور */}
@@ -313,13 +425,23 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
 
           <div>
             <label className="block text-xs font-medium text-slate-700 mb-1">رمز عبور فعلی</label>
-            <input
-              type="password"
-              required
-              value={currentPassword}
-              onChange={(e) => setCurrentPassword(e.target.value)}
-              className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs focus:outline-none focus:border-[#0B192C]"
-            />
+            <div className="relative">
+              <input
+                type={showCurrentPwd ? 'text' : 'password'}
+                required
+                dir="ltr"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 pl-9 pr-3 text-xs text-right focus:outline-none focus:border-[#0B192C]"
+              />
+              <button
+                type="button"
+                onClick={() => setShowCurrentPwd((p) => !p)}
+                className="absolute inset-y-0 left-0 flex items-center px-2.5 text-slate-400 hover:text-[#0B192C] cursor-pointer"
+              >
+                {showCurrentPwd ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -327,27 +449,38 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
               <label className="block text-xs font-medium text-slate-700 mb-1">
                 رمز عبور جدید
               </label>
-              <input
-                type="password"
-                required
-                minLength={8}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="حداقل ۸ کاراکتر"
-                className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs focus:outline-none focus:border-[#0B192C]"
-              />
+              <div className="relative">
+                <input
+                  type={showNewPwd ? 'text' : 'password'}
+                  required
+                  minLength={8}
+                  dir="ltr"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="حداقل ۸ کاراکتر"
+                  className="w-full min-h-[42px] rounded-xl border border-slate-200 pl-9 pr-3 text-xs text-right focus:outline-none focus:border-[#0B192C]"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPwd((p) => !p)}
+                  className="absolute inset-y-0 left-0 flex items-center px-2.5 text-slate-400 hover:text-[#0B192C] cursor-pointer"
+                >
+                  {showNewPwd ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
                 تکرار رمز جدید
               </label>
               <input
-                type="password"
+                type={showNewPwd ? 'text' : 'password'}
                 required
                 minLength={8}
+                dir="ltr"
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
-                className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs focus:outline-none focus:border-[#0B192C]"
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs text-right focus:outline-none focus:border-[#0B192C]"
               />
             </div>
           </div>
@@ -361,6 +494,87 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
           </button>
         </form>
       </div>
+
+      {/* کارت بازنشانی مستقیم رمز عبور پرسنل ویژه مدیر */}
+      {user.role === 'manager' && (
+        <form
+          onSubmit={handleManagerResetWorkerPassword}
+          className="rounded-2xl bg-white border border-[#C5A059]/60 p-5 space-y-3.5"
+        >
+          <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
+            <ShieldAlert className="w-4 h-4 text-[#9A7428]" />
+            <h4 className="text-sm font-bold text-[#0B192C]">
+              بازنشانی مستقیم رمز عبور پرسنل (امید میثمی)
+            </h4>
+          </div>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            در صورتی که پرسنل رمز عبور خود را فراموش کرده یا به پیامک دسترسی ندارد، می‌توانید از این بخش رمز عبور جدیدی برای حساب ایشان (`worker`) تنظیم نمایید.
+          </p>
+
+          {workerResetFeedback && (
+            <div
+              className={`rounded-xl p-3 text-xs font-medium ${
+                workerResetFeedback.type === 'success'
+                  ? 'bg-emerald-50 text-emerald-900 border border-emerald-200'
+                  : 'bg-red-50 text-red-900 border border-red-200'
+              }`}
+            >
+              {workerResetFeedback.text}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                رمز عبور جدید برای امید میثمی
+              </label>
+              <div className="relative">
+                <input
+                  type={showWorkerNewPwd ? 'text' : 'password'}
+                  required
+                  minLength={8}
+                  dir="ltr"
+                  value={workerNewPassword}
+                  onChange={(e) => setWorkerNewPassword(e.target.value)}
+                  placeholder="حداقل ۸ کاراکتر"
+                  className="w-full min-h-[42px] rounded-xl border border-slate-200 pl-9 pr-3 text-xs text-right focus:outline-none focus:border-[#0B192C]"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowWorkerNewPwd((p) => !p)}
+                  className="absolute inset-y-0 left-0 flex items-center px-2.5 text-slate-400 hover:text-[#0B192C] cursor-pointer"
+                >
+                  {showWorkerNewPwd ? (
+                    <EyeOff className="w-3.5 h-3.5" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={sendWorkerResetSms}
+                  onChange={(e) => setSendWorkerResetSms(e.target.checked)}
+                  className="w-4 h-4 rounded border-slate-300 accent-[#0B192C] cursor-pointer"
+                />
+                <span>ارسال رمز جدید با پیامک به پرسنل</span>
+              </label>
+
+              <button
+                type="submit"
+                disabled={workerResetLoading}
+                className="min-h-[42px] px-4 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold shrink-0 cursor-pointer"
+              >
+                {workerResetLoading ? 'در حال بازنشانی...' : 'بازنشانی رمز پرسنل'}
+              </button>
+            </div>
+          </div>
+        </form>
+      )}
 
       {/* کارت ورود با اثر انگشت / تشخیص چهره موبایل + پشتیبان‌گیری برای مدیر */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -459,3 +673,4 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
     </div>
   );
 };
+

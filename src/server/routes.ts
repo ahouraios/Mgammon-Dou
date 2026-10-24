@@ -606,14 +606,24 @@ apiRouter.get('/health', async (_req, res) => {
     });
     return;
   }
-  const settings = await getSystemSettingsFromDb();
-  const nowInfo = getNowInTimezone(settings.timezone);
-  res.json({
-    ok: true,
-    dbConnected: true,
-    serverTime: nowInfo,
-    bannerBgUrl: settings.banner_bg_url || '/assets/media/banner-bg.svg',
-  });
+  try {
+    const settings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(settings.timezone);
+    res.json({
+      ok: true,
+      dbConnected: true,
+      serverTime: nowInfo,
+      bannerBgUrl: settings.banner_bg_url || '/assets/media/banner-bg.svg',
+    });
+  } catch {
+    const nowInfo = getNowInTimezone('Asia/Tehran');
+    res.json({
+      ok: true,
+      dbConnected: true,
+      serverTime: nowInfo,
+      bannerBgUrl: '/assets/media/banner-bg.svg',
+    });
+  }
 });
 
 // ============================================================================
@@ -621,7 +631,7 @@ apiRouter.get('/health', async (_req, res) => {
 // ============================================================================
 apiRouter.post('/auth/login', async (req, res) => {
   try {
-    const username = String(req.body?.username || '').trim();
+    const username = toEnglishDigits(String(req.body?.username || '')).trim().toLowerCase();
     const password = String(req.body?.password || '');
     const clientIp = req.ip || 'unknown';
 
@@ -656,7 +666,7 @@ apiRouter.post('/auth/login', async (req, res) => {
 
     const pool = getPool();
     const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, password_hash, must_change_password, is_active, last_login_at FROM users WHERE username = ? LIMIT 1',
+      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, password_hash, must_change_password, is_active, last_login_at FROM users WHERE LOWER(username) = ? LIMIT 1',
       [username]
     );
 
@@ -678,7 +688,13 @@ apiRouter.post('/auth/login', async (req, res) => {
     }
 
     const userRow = rows[0];
-    const match = await bcrypt.compare(password, String(userRow.password_hash));
+    let match = await bcrypt.compare(password, String(userRow.password_hash));
+    if (!match) {
+      const normalizedPassword = toEnglishDigits(password).trim();
+      if (normalizedPassword !== password) {
+        match = await bcrypt.compare(normalizedPassword, String(userRow.password_hash));
+      }
+    }
     if (!match) {
       const failState = await recordFailedLoginAttempt(clientIp, username);
       await recordAuditLog({
@@ -1037,6 +1053,385 @@ apiRouter.post('/auth/change-password', requireAuth, async (req: AuthenticatedRe
     handleServerError(res, err);
   }
 });
+
+// ============================================================================
+// ۲-ب. فراموشی رمز عبور با کد پیامکی (ملی‌پیامک) + بازنشانی رمز پرسنل توسط مدیر
+// ============================================================================
+interface PasswordResetOtpEntry {
+  codeHash: string;
+  expiresAtMs: number;
+  attempts: number;
+  lastSentAtMs: number;
+}
+
+const passwordResetOtpStore = new Map<string, PasswordResetOtpEntry>();
+
+function normalizeIranMobile(raw: string | null | undefined): string {
+  const clean = toEnglishDigits(String(raw || '')).replace(/\s+/g, '').trim();
+  if (/^\+989\d{9}$/.test(clean)) return `0${clean.slice(3)}`;
+  if (/^989\d{9}$/.test(clean)) return `0${clean.slice(2)}`;
+  if (/^9\d{9}$/.test(clean)) return `0${clean}`;
+  if (/^09\d{9}$/.test(clean)) return clean;
+  return '';
+}
+
+function maskMobileNumber(phone: string): string {
+  if (phone.length < 10) return phone;
+  return `${phone.slice(0, 4)}***${phone.slice(-4)}`;
+}
+
+/**
+ * به‌روزرسانی شماره موبایل کاربر جاری برای بازیابی رمز عبور و پیامک‌ها
+ */
+apiRouter.put('/auth/phone', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const rawPhone = String(req.body?.phone_number || '').trim();
+    const normalized = rawPhone ? normalizeIranMobile(rawPhone) : '';
+    if (rawPhone && !normalized) {
+      res.status(400).json({
+        ok: false,
+        message: 'فرمت شماره موبایل معتبر نیست (مثال: 09123456789).',
+      });
+      return;
+    }
+
+    const pool = getPool();
+    await pool.execute('UPDATE users SET phone_number = ? WHERE id = ?', [
+      normalized || null,
+      req.user!.id,
+    ]);
+
+    if (req.user!.role === 'worker') {
+      await pool.execute('UPDATE system_settings SET worker_phone_number = ?', [normalized]);
+    }
+
+    res.json({
+      ok: true,
+      phone_number: normalized || null,
+      message: normalized
+        ? 'شماره موبایل شما برای دریافت کد بازیابی رمز عبور ذخیره شد.'
+        : 'شماره موبایل حذف شد.',
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+/**
+ * درخواست ارسال کد یک‌بارمصرف (OTP) فراموشی رمز عبور از طریق ملی‌پیامک
+ */
+apiRouter.post('/auth/forgot-password/request-otp', async (req, res) => {
+  try {
+    const username = toEnglishDigits(String(req.body?.username || ''))
+      .trim()
+      .toLowerCase();
+
+    if (!username) {
+      res.status(400).json({
+        ok: false,
+        message: 'لطفاً ابتدا نام کاربری (مدیریت یا پرسنل) را انتخاب یا وارد کنید.',
+      });
+      return;
+    }
+
+    const pool = getPool();
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT id, username, full_name, role, phone_number, is_active FROM users WHERE LOWER(username) = ? LIMIT 1',
+      [username]
+    );
+
+    if (rows.length === 0 || !rows[0].is_active) {
+      res.status(404).json({
+        ok: false,
+        message: 'حساب کاربری مورد نظر یافت نشد.',
+      });
+      return;
+    }
+
+    const userRow = rows[0];
+    const userKey = String(userRow.username).toLowerCase();
+    const existingOtp = passwordResetOtpStore.get(userKey);
+    const nowMs = Date.now();
+
+    if (existingOtp && nowMs - existingOtp.lastSentAtMs < 60_000) {
+      const waitSec = Math.ceil((60_000 - (nowMs - existingOtp.lastSentAtMs)) / 1000);
+      res.status(429).json({
+        ok: false,
+        message: `کد بازیابی به تازگی ارسال شده است. لطفاً ${toPersianDigits(waitSec)} ثانیه دیگر مجدداً تلاش کنید.`,
+      });
+      return;
+    }
+
+    const settings = await getSystemSettingsFromDb();
+    let targetPhone = normalizeIranMobile(userRow.phone_number);
+
+    if (!targetPhone) {
+      if (userRow.role === 'worker') {
+        targetPhone = normalizeIranMobile(settings.worker_phone_number);
+      } else if (userRow.role === 'manager') {
+        targetPhone = normalizeIranMobile(settings.melipayamak_username);
+      }
+    }
+
+    if (!targetPhone) {
+      res.status(400).json({
+        ok: false,
+        message:
+          userRow.role === 'worker'
+            ? 'شماره موبایل پرسنل در سامانه ثبت نشده است. لطفاً از مدیر مجموعه (مجید نورایی) بخواهید از بخش تنظیمات حساب، رمز عبور شما را بازنشانی کند.'
+            : 'شماره موبایل مدیریت در سامانه ثبت نشده است. لطفاً پس از ورود در بخش تنظیمات حساب، شماره موبایل خود را ثبت نمایید.',
+      });
+      return;
+    }
+
+    if (!settings.melipayamak_username || !settings.melipayamak_password) {
+      res.status(400).json({
+        ok: false,
+        message:
+          userRow.role === 'worker'
+            ? 'تنظیمات وب‌سرویس پیامک (ملی‌پیامک) هنوز تکمیل نشده است. مدیر مجموعه (مجید نورایی) می‌تواند از پنل مدیریت رمز عبور شما را مستقیماً بازنشانی کند.'
+            : 'اطلاعات وب‌سرویس ملی‌پیامک در تنظیمات سامانه ثبت نشده است.',
+      });
+      return;
+    }
+
+    const otpCode = String(crypto.randomInt(100000, 999999));
+    const smsText = `سامانه Mgammon\nکد بازیابی رمز عبور حساب ${userRow.full_name}: ${otpCode}\nاعتبار: ۲ دقیقه`;
+
+    const smsResult = await sendMelipayamakSms(settings, targetPhone, smsText);
+    if (!smsResult.sent) {
+      res.status(502).json({
+        ok: false,
+        message: `خطا در ارسال پیامک کد بازیابی: ${smsResult.statusMessage}`,
+      });
+      return;
+    }
+
+    passwordResetOtpStore.set(userKey, {
+      codeHash: hashSessionToken(otpCode),
+      expiresAtMs: nowMs + 2 * 60 * 1000,
+      attempts: 0,
+      lastSentAtMs: nowMs,
+    });
+
+    await recordAuditLog({
+      actorUserId: Number(userRow.id),
+      actionType: 'PASSWORD_RESET_OTP_SENT',
+      targetEntity: 'users',
+      targetId: Number(userRow.id),
+      ipAddress: req.ip || null,
+    });
+
+    res.json({
+      ok: true,
+      maskedPhone: toPersianDigits(maskMobileNumber(targetPhone)),
+      expiresInSeconds: 120,
+      message: `کد تایید ۶ رقمی به شماره موبایل ${toPersianDigits(maskMobileNumber(targetPhone))} پیامک شد.`,
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+/**
+ * تایید کد پیامکی (OTP) و ثبت رمز عبور جدید
+ */
+apiRouter.post('/auth/forgot-password/reset', async (req, res) => {
+  try {
+    const username = toEnglishDigits(String(req.body?.username || ''))
+      .trim()
+      .toLowerCase();
+    const otpCode = toEnglishDigits(String(req.body?.otpCode || req.body?.otp_code || ''))
+      .replace(/\D/g, '')
+      .trim();
+    const newPassword = String(req.body?.newPassword || req.body?.new_password || '');
+
+    if (!username || !otpCode || !newPassword) {
+      res.status(400).json({
+        ok: false,
+        message: 'نام کاربری، کد تایید ۶ رقمی و رمز عبور جدید الزامی است.',
+      });
+      return;
+    }
+
+    if (newPassword.length < 8) {
+      res.status(400).json({
+        ok: false,
+        message: 'رمز عبور جدید باید حداقل ۸ کاراکتر باشد.',
+      });
+      return;
+    }
+
+    const pool = getPool();
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, is_active FROM users WHERE LOWER(username) = ? LIMIT 1',
+      [username]
+    );
+
+    if (rows.length === 0 || !rows[0].is_active) {
+      res.status(404).json({ ok: false, message: 'حساب کاربری معتبر نیست.' });
+      return;
+    }
+
+    const userRow = rows[0];
+    const userKey = String(userRow.username).toLowerCase();
+    const otpEntry = passwordResetOtpStore.get(userKey);
+
+    if (!otpEntry || Date.now() > otpEntry.expiresAtMs) {
+      passwordResetOtpStore.delete(userKey);
+      res.status(400).json({
+        ok: false,
+        message: 'کد بازیابی منقضی شده یا وجود ندارد. لطفاً مجدداً درخواست ارسال کد بدهید.',
+      });
+      return;
+    }
+
+    if (otpEntry.attempts >= 5) {
+      passwordResetOtpStore.delete(userKey);
+      res.status(429).json({
+        ok: false,
+        message: 'تعداد تلاش‌های اشتباه بیش از حد مجاز بود. لطفاً کد جدید دریافت کنید.',
+      });
+      return;
+    }
+
+    if (hashSessionToken(otpCode) !== otpEntry.codeHash) {
+      otpEntry.attempts += 1;
+      res.status(400).json({
+        ok: false,
+        message: 'کد تایید واردشده صحیح نیست.',
+      });
+      return;
+    }
+
+    passwordResetOtpStore.delete(userKey);
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    const userId = Number(userRow.id);
+    await pool.execute(
+      'UPDATE users SET password_hash = ?, must_change_password = 0, last_login_at = NOW() WHERE id = ?',
+      [newHash, userId]
+    );
+    await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [userId]);
+    clearLoginAttempts(req.ip || 'unknown', userKey);
+
+    const { rawToken, csrfToken, expiresAt } = await createServerSession(
+      userId,
+      req.ip || null,
+      req.headers['user-agent'] || null
+    );
+    setSessionCookie(res, rawToken, expiresAt);
+
+    await recordAuditLog({
+      actorUserId: userId,
+      actionType: 'PASSWORD_RESET_OTP_SUCCESS',
+      targetEntity: 'users',
+      targetId: userId,
+      ipAddress: req.ip || null,
+    });
+
+    res.json({
+      ok: true,
+      token: rawToken,
+      csrfToken,
+      message: 'رمز عبور شما با موفقیت بازنشانی شد.',
+      user: {
+        id: userId,
+        username: String(userRow.username),
+        full_name: String(userRow.full_name),
+        role: userRow.role,
+        avatar_url: userRow.avatar_url ? String(userRow.avatar_url) : null,
+        collaboration_start_shamsi: userRow.collaboration_start_shamsi
+          ? String(userRow.collaboration_start_shamsi)
+          : '1405/06/15',
+        phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
+        biometric_enabled: Boolean(userRow.biometric_token_hash),
+        must_change_password: false,
+        last_login_at: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+/**
+ * بازنشانی مستقیم رمز عبور پرسنل (امید میثمی) توسط مدیر (مجید نورایی)
+ */
+apiRouter.post(
+  '/auth/manager-reset-worker-password',
+  requireAuth,
+  requireRole('manager'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const newPassword = String(req.body?.newPassword || req.body?.new_password || '').trim();
+      const sendSmsToWorker = Boolean(req.body?.sendSms);
+
+      if (!newPassword || newPassword.length < 8) {
+        res.status(400).json({
+          ok: false,
+          message: 'رمز عبور جدید پرسنل باید حداقل ۸ کاراکتر باشد.',
+        });
+        return;
+      }
+
+      const pool = getPool();
+      const [workerRows] = await pool.execute<mysql.RowDataPacket[]>(
+        "SELECT id, username, full_name, phone_number FROM users WHERE role = 'worker' LIMIT 1"
+      );
+
+      if (workerRows.length === 0) {
+        res.status(404).json({ ok: false, message: 'حساب پرسنل یافت نشد.' });
+        return;
+      }
+
+      const worker = workerRows[0];
+      const workerId = Number(worker.id);
+      const newHash = await bcrypt.hash(newPassword, 10);
+
+      await pool.execute(
+        'UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?',
+        [newHash, workerId]
+      );
+      await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [workerId]);
+
+      await recordAuditLog({
+        actorUserId: req.user!.id,
+        actionType: 'MANAGER_RESET_WORKER_PASSWORD',
+        targetEntity: 'users',
+        targetId: workerId,
+        ipAddress: req.ip || null,
+      });
+
+      let smsStatusNote = '';
+      if (sendSmsToWorker) {
+        const settings = await getSystemSettingsFromDb();
+        const targetPhone =
+          normalizeIranMobile(worker.phone_number) ||
+          normalizeIranMobile(settings.worker_phone_number);
+        if (targetPhone && settings.melipayamak_username && settings.melipayamak_password) {
+          const smsRes = await sendMelipayamakSms(
+            settings,
+            targetPhone,
+            `سامانه Mgammon\nهمکار گرامی ${worker.full_name}، رمز عبور جدید شما توسط مدیریت تنظیم شد:\nنام کاربری: ${worker.username}\nرمز عبور: ${newPassword}`
+          );
+          smsStatusNote = smsRes.sent
+            ? ' و از طریق پیامک برای ایشان ارسال شد.'
+            : ` (ارسال پیامک انجام نشد: ${smsRes.statusMessage})`;
+        } else {
+          smsStatusNote = ' (شماره موبایل یا تنظیمات پیامک برای ارسال پیامک ثبت نشده است).';
+        }
+      }
+
+      res.json({
+        ok: true,
+        message: `رمز عبور حساب پرسنل (${worker.full_name}) با موفقیت بازنشانی شد${smsStatusNote}`,
+      });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
 
 // ============================================================================
 // ۳. عملیات تردد پرسنل (امید میثمی) + وضعیت زنده و یادآور هوشمند فراموشی ثبت خروج

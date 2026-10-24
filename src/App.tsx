@@ -8,10 +8,23 @@ import {
 } from './services/biometric';
 import { BrandLogo } from './components/BrandLogo';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { TopShamsiCalendarBar } from './components/TopShamsiCalendarBar';
+import { ForgotPasswordModal } from './components/ForgotPasswordModal';
 import { Footer } from './components/Footer';
 import { WorkerPanel } from './components/WorkerPanel';
 import { ManagerPanel } from './components/ManagerPanel';
-import { LogOut, AlertTriangle, Fingerprint } from 'lucide-react';
+import { LogOut, AlertTriangle, Fingerprint, Eye, EyeOff } from 'lucide-react';
+
+const REMEMBERED_USERNAME_KEY = 'mgammon_remembered_username';
+const REMEMBER_ME_KEY = 'mgammon_remember_me';
+
+function getRememberedUsername(): string {
+  try {
+    return localStorage.getItem(REMEMBERED_USERNAME_KEY) || '';
+  } catch {
+    return '';
+  }
+}
 
 export default function App() {
   const [initializing, setInitializing] = useState(true);
@@ -21,15 +34,30 @@ export default function App() {
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // فرم ورود
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(() => getRememberedUsername());
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [rememberMe, setRememberMe] = useState(() => Boolean(getRememberedUsername()));
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [storedBio, setStoredBio] = useState<StoredBiometricInfo | null>(null);
+  const [isForgotOpen, setIsForgotOpen] = useState(false);
 
   useEffect(() => {
     setStoredBio(getStoredBiometricInfo());
   }, [user]);
+
+  useEffect(() => {
+    try {
+      if (rememberMe && username.trim()) {
+        localStorage.setItem(REMEMBERED_USERNAME_KEY, username.trim());
+      } else if (!rememberMe) {
+        localStorage.removeItem(REMEMBERED_USERNAME_KEY);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, [rememberMe, username]);
 
   useEffect(() => {
     let mounted = true;
@@ -92,18 +120,40 @@ export default function App() {
     setLoginError(null);
     setConnectionError(null);
     setLoginLoading(true);
+    const trimmedUsername = username.trim();
     try {
+      try {
+        if (rememberMe && trimmedUsername) {
+          localStorage.setItem(REMEMBERED_USERNAME_KEY, trimmedUsername);
+        } else {
+          localStorage.removeItem(REMEMBERED_USERNAME_KEY);
+        }
+      } catch {
+        // ignore storage errors
+      }
+
       const res = await apiRequest<{
         ok: boolean;
         token: string;
         user: UserProfile;
       }>('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ username: username.trim(), password }),
+        body: JSON.stringify({ username: trimmedUsername, password }),
       });
       setStoredToken(res.token);
+      try {
+        localStorage.setItem(REMEMBER_ME_KEY, rememberMe ? 'true' : 'false');
+        if (rememberMe && username.trim()) {
+          localStorage.setItem(REMEMBERED_USERNAME_KEY, username.trim());
+        } else {
+          localStorage.removeItem(REMEMBERED_USERNAME_KEY);
+        }
+      } catch {
+        // ignore storage errors
+      }
       setUser(res.user);
       setPassword('');
+      setShowPassword(false);
     } catch (err) {
       setLoginError((err as Error).message);
     } finally {
@@ -133,6 +183,9 @@ export default function App() {
     } finally {
       setStoredToken(null);
       setUser(null);
+      const savedUsername = getRememberedUsername();
+      setUsername(savedUsername);
+      setRememberMe(Boolean(savedUsername));
     }
   };
 
@@ -162,9 +215,9 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F9FAFB] text-[#0B192C]">
-      {/* هدر مینیمال سفید، سرمه‌ای و طلایی */}
+      {/* هدر مینیمال سفید، سرمه‌ای و طلایی همراه با تقویم کوچک شمسی */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-[#C5A059]/45 px-3.5 py-2.5">
-        <div className="max-w-5xl mx-auto flex items-center justify-between gap-3">
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-2 sm:gap-3">
           <div className="flex items-center gap-2.5 min-w-0">
             <BrandLogo size="sm" />
             <div className="min-w-0">
@@ -173,13 +226,14 @@ export default function App() {
                   Mgammon
                 </span>
               </div>
-              <p className="text-[10px] sm:text-[11px] text-slate-500 truncate">
+              <p className="hidden xs:block text-[10px] sm:text-[11px] text-slate-500 truncate">
                 سامانه مدیریت کارکرد و امور مالی
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            <TopShamsiCalendarBar serverShamsiDate={serverShamsiDate} />
             <PWAInstallButton />
             {user && (
               <button
@@ -277,7 +331,19 @@ export default function App() {
                     autoComplete="username"
                     dir="ltr"
                     value={username}
-                    onChange={(e) => setUsername(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setUsername(val);
+                      try {
+                        if (rememberMe && val.trim()) {
+                          localStorage.setItem(REMEMBERED_USERNAME_KEY, val.trim());
+                        } else if (!val.trim()) {
+                          localStorage.removeItem(REMEMBERED_USERNAME_KEY);
+                        }
+                      } catch {
+                        // ignore
+                      }
+                    }}
                     placeholder="نام کاربری خود را وارد کنید"
                     className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3.5 text-sm text-right focus:outline-none focus:border-[#0B192C]"
                   />
@@ -287,16 +353,64 @@ export default function App() {
                   <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                     رمز عبور
                   </label>
-                  <input
-                    type="password"
-                    required
-                    autoComplete="current-password"
-                    dir="ltr"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3.5 text-sm text-right focus:outline-none focus:border-[#0B192C]"
-                  />
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      required
+                      autoComplete="current-password"
+                      dir="ltr"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className="w-full min-h-[44px] rounded-xl border border-slate-200 pl-10 pr-3.5 text-sm text-right focus:outline-none focus:border-[#0B192C]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((prev) => !prev)}
+                      aria-label={showPassword ? 'مخفی کردن رمز عبور' : 'نمایش رمز عبور'}
+                      title={showPassword ? 'مخفی کردن رمز عبور' : 'نمایش رمز عبور'}
+                      className="absolute inset-y-0 left-0 flex items-center px-3 text-slate-400 hover:text-[#0B192C] transition-colors cursor-pointer"
+                    >
+                      {showPassword ? (
+                        <EyeOff className="w-4 h-4" />
+                      ) : (
+                        <Eye className="w-4 h-4" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-0.5">
+                  <label className="inline-flex items-center gap-2 cursor-pointer select-none text-xs font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={rememberMe}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setRememberMe(checked);
+                        try {
+                          localStorage.setItem(REMEMBER_ME_KEY, checked ? 'true' : 'false');
+                          if (checked && username.trim()) {
+                            localStorage.setItem(REMEMBERED_USERNAME_KEY, username.trim());
+                          } else if (!checked) {
+                            localStorage.removeItem(REMEMBERED_USERNAME_KEY);
+                          }
+                        } catch {
+                          // ignore
+                        }
+                      }}
+                      className="w-4 h-4 rounded border-slate-300 accent-[#0B192C] cursor-pointer"
+                    />
+                    <span>مرا به خاطر بسپار</span>
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsForgotOpen(true)}
+                    className="text-xs font-bold text-[#9A7428] hover:text-[#0B192C] transition-colors cursor-pointer"
+                  >
+                    فراموشی رمز عبور؟
+                  </button>
                 </div>
 
                 <button
@@ -318,6 +432,13 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setUsername('manager');
+                      try {
+                        if (rememberMe) {
+                          localStorage.setItem(REMEMBERED_USERNAME_KEY, 'manager');
+                        }
+                      } catch {
+                        // ignore
+                      }
                     }}
                     className="min-h-[40px] px-2.5 py-1.5 rounded-xl border border-[#C5A059]/50 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] bg-white transition-colors cursor-pointer"
                   >
@@ -327,6 +448,13 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setUsername('worker');
+                      try {
+                        if (rememberMe) {
+                          localStorage.setItem(REMEMBERED_USERNAME_KEY, 'worker');
+                        }
+                      } catch {
+                        // ignore
+                      }
                     }}
                     className="min-h-[40px] px-2.5 py-1.5 rounded-xl border border-[#C5A059]/50 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] bg-white transition-colors cursor-pointer"
                   >
@@ -335,6 +463,16 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            <ForgotPasswordModal
+              isOpen={isForgotOpen}
+              initialUsername={username}
+              onClose={() => setIsForgotOpen(false)}
+              onResetSuccess={(loggedInUser) => {
+                setUser(loggedInUser);
+                setPassword('');
+              }}
+            />
           </div>
         ) : user.role === 'manager' ? (
           <ManagerPanel

@@ -2,19 +2,31 @@ import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
 import fs from 'fs';
 import path from 'path';
-import { execSync, spawn } from 'child_process';
+import { exec, spawn } from 'child_process';
+import { promisify } from 'util';
 import { OvertimeCalcMode, SystemSettings } from '../shared/types';
+
+const execAsync = promisify(exec);
 
 let pool: mysql.Pool | null = null;
 let localMariaDbBootstrapped = false;
+let localMariaDbBootstrapPromise: Promise<void> | null = null;
+
+const PLACEHOLDER_DB_USERS = new Set(['', 'cpanel_username_mgammon', 'your_db_user']);
+const PLACEHOLDER_DB_PASSWORDS = new Set(['', 'YOUR_STRONG_MYSQL_PASSWORD', 'your_db_password']);
+const PLACEHOLDER_DB_NAMES = new Set(['', 'cpanel_username_mgammon_duo', 'your_db_name']);
 
 export function getDbConfig() {
+  const rawUser = (process.env.DB_USER || '').trim();
+  const rawPassword = process.env.DB_PASSWORD || '';
+  const rawDbName = (process.env.DB_NAME || '').trim();
+
   return {
     host: process.env.DB_HOST || '127.0.0.1',
     port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'mgammon_duo',
+    user: PLACEHOLDER_DB_USERS.has(rawUser) ? 'root' : rawUser,
+    password: PLACEHOLDER_DB_PASSWORDS.has(rawPassword) ? '' : rawPassword,
+    database: PLACEHOLDER_DB_NAMES.has(rawDbName) ? 'mgammon_duo' : rawDbName,
     waitForConnections: true,
     connectionLimit: 10,
     connectTimeout: 4000,
@@ -25,129 +37,146 @@ export function getDbConfig() {
   };
 }
 
-function ensureLocalMariaDbRunningIfNeeded(): void {
-  if (localMariaDbBootstrapped) return;
-  const cfg = getDbConfig();
-  const isLocal = cfg.host === '127.0.0.1' || cfg.host === 'localhost';
-  if (!isLocal) {
-    localMariaDbBootstrapped = true;
-    return;
-  }
-
+async function hasMariadbdBinary(): Promise<boolean> {
   try {
-    const persistentDataDir = path.resolve(process.cwd(), '.data/mysql');
-    const debCacheDir = path.resolve(process.cwd(), '.data/deb-cache');
-
-    // در محیط کانتینر محلی، اگر باینری mariadbd پس از ری‌استارت کانتینر پاک شده باشد از کش محلی نصب می‌شود
-    let hasMariadbd = false;
-    try {
-      execSync('which mariadbd', { stdio: 'ignore' });
-      hasMariadbd = true;
-    } catch {
-      hasMariadbd = false;
-    }
-
-    if (!hasMariadbd && fs.existsSync('/etc/debian_version')) {
-      fs.mkdirSync(debCacheDir, { recursive: true });
-      const cachedDebs = fs.readdirSync(debCacheDir).filter((f) => f.endsWith('.deb'));
-      if (cachedDebs.length > 0) {
-        try {
-          execSync(
-            `DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold -i "${debCacheDir}"/*.deb`,
-            { stdio: 'ignore' }
-          );
-        } catch {
-          // ignore partial dpkg warnings
-        }
-      } else {
-        try {
-          execSync(
-            `DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Dir::Cache::archives="${debCacheDir}" mariadb-server`,
-            { stdio: 'ignore' }
-          );
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    const socketExists =
-      fs.existsSync('/run/mysqld/mysqld.sock') ||
-      fs.existsSync('/var/run/mysqld/mysqld.sock');
-
-    if (!socketExists) {
-      fs.mkdirSync('/run/mysqld', { recursive: true });
-      fs.mkdirSync(persistentDataDir, { recursive: true });
-
-      if (
-        !fs.existsSync(path.join(persistentDataDir, 'mysql')) ||
-        !fs.existsSync(path.join(persistentDataDir, 'ib_logfile0'))
-      ) {
-        try {
-          fs.rmSync(persistentDataDir, { recursive: true, force: true });
-          fs.mkdirSync(persistentDataDir, { recursive: true });
-          execSync(`chown -R mysql:mysql /run/mysqld "${persistentDataDir}"`, {
-            stdio: 'ignore',
-          });
-          execSync(
-            `mariadb-install-db --user=mysql --datadir="${persistentDataDir}" --innodb-log-file-size=8M --auth-root-authentication-method=normal`,
-            { stdio: 'ignore' }
-          );
-        } catch {
-          // ignore
-        }
-      }
-
-      try {
-        execSync(`chown -R mysql:mysql /run/mysqld "${persistentDataDir}"`, {
-          stdio: 'ignore',
-        });
-      } catch {
-        // ignore if mysql user not present
-      }
-
-      const child = spawn(
-        'mariadbd',
-        [
-          '--user=mysql',
-          `--datadir=${persistentDataDir}`,
-          '--innodb-log-file-size=8M',
-          '--socket=/run/mysqld/mysqld.sock',
-          '--pid-file=/run/mysqld/mysqld.pid',
-          '--bind-address=127.0.0.1',
-          '--port=3306',
-        ],
-        {
-          detached: true,
-          stdio: 'ignore',
-        }
-      );
-      child.on('error', () => {
-        // نادیده گرفتن خطا در صورتی که باینری mariadbd روی هاست خارجی نصب نباشد
-      });
-      child.unref();
-
-      for (let i = 0; i < 20; i++) {
-        if (
-          fs.existsSync('/run/mysqld/mysqld.sock') ||
-          fs.existsSync('/var/run/mysqld/mysqld.sock')
-        ) {
-          break;
-        }
-        execSync('sleep 0.5');
-      }
-    }
-
-    const safeDbName = cfg.database.replace(/[^a-zA-Z0-9_]/g, '');
-    execSync(
-      `mysql -u root -e "CREATE DATABASE IF NOT EXISTS \\\`${safeDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD(''); GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('') WITH GRANT OPTION; FLUSH PRIVILEGES;"`,
-      { stdio: 'ignore' }
-    );
+    await execAsync('which mariadbd');
+    return true;
   } catch {
-    // در هاست اشتراکی cPanel سرویس MySQL از قبل توسط هاست اجرا شده است
-  } finally {
-    localMariaDbBootstrapped = true;
+    return false;
   }
+}
+
+async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
+  if (localMariaDbBootstrapped) return;
+  if (localMariaDbBootstrapPromise) {
+    return localMariaDbBootstrapPromise;
+  }
+
+  localMariaDbBootstrapPromise = (async () => {
+    const cfg = getDbConfig();
+    const isLocal = cfg.host === '127.0.0.1' || cfg.host === 'localhost';
+    if (!isLocal) {
+      localMariaDbBootstrapped = true;
+      return;
+    }
+
+    try {
+      const persistentDataDir = path.resolve(process.cwd(), '.data/mysql');
+
+      const hasMariadbd = await hasMariadbdBinary();
+
+      if (!hasMariadbd && fs.existsSync('/etc/debian_version')) {
+        try {
+          if (
+            fs.existsSync('/etc/apt/sources.list.d/debian.sources') &&
+            fs.existsSync('/etc/apt/sources.list')
+          ) {
+            fs.unlinkSync('/etc/apt/sources.list');
+          }
+        } catch {
+          // ignore
+        }
+
+        try {
+          await execAsync(
+            'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" mariadb-server'
+          );
+        } catch {
+          // ignore
+        }
+      }
+
+      const isSocketReady = () =>
+        fs.existsSync('/run/mysqld/mysqld.sock') ||
+        fs.existsSync('/var/run/mysqld/mysqld.sock');
+
+      const initFreshDataDir = async () => {
+        fs.rmSync(persistentDataDir, { recursive: true, force: true });
+        fs.mkdirSync(persistentDataDir, { recursive: true });
+        await execAsync(`chown -R mysql:mysql /run/mysqld "${persistentDataDir}"`);
+        await execAsync(
+          `mariadb-install-db --user=mysql --datadir="${persistentDataDir}" --innodb-log-file-size=8M --auth-root-authentication-method=normal`
+        );
+      };
+
+      const spawnMariadbdAndWait = async (): Promise<boolean> => {
+        try {
+          await execAsync(`chown -R mysql:mysql /run/mysqld "${persistentDataDir}"`);
+        } catch {
+          // ignore if mysql user not present
+        }
+
+        const child = spawn(
+          'mariadbd',
+          [
+            '--user=mysql',
+            `--datadir=${persistentDataDir}`,
+            '--innodb-log-file-size=8M',
+            '--socket=/run/mysqld/mysqld.sock',
+            '--pid-file=/run/mysqld/mysqld.pid',
+            '--bind-address=127.0.0.1',
+            '--port=3306',
+          ],
+          {
+            detached: true,
+            stdio: 'ignore',
+          }
+        );
+        child.on('error', () => {
+          // نادیده گرفتن خطا در صورتی که باینری mariadbd روی هاست خارجی نصب نباشد
+        });
+        child.unref();
+
+        for (let i = 0; i < 20; i++) {
+          if (isSocketReady()) {
+            return true;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+        return isSocketReady();
+      };
+
+      if (!isSocketReady()) {
+        fs.mkdirSync('/run/mysqld', { recursive: true });
+        fs.mkdirSync(persistentDataDir, { recursive: true });
+
+        // اگر فایل tablespace اصلی InnoDB (ibdata1) وجود نداشته باشد، دایرکتوری ناقص است و باید بازسازی شود
+        if (
+          !fs.existsSync(path.join(persistentDataDir, 'mysql')) ||
+          !fs.existsSync(path.join(persistentDataDir, 'ib_logfile0')) ||
+          !fs.existsSync(path.join(persistentDataDir, 'ibdata1'))
+        ) {
+          try {
+            await initFreshDataDir();
+          } catch {
+            // ignore
+          }
+        }
+
+        let started = await spawnMariadbdAndWait();
+        if (!started) {
+          try {
+            await initFreshDataDir();
+            started = await spawnMariadbdAndWait();
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      const safeDbName = cfg.database.replace(/[^a-zA-Z0-9_]/g, '');
+      await execAsync(
+        `mysql -u root -e "CREATE DATABASE IF NOT EXISTS \\\`${safeDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD(''); GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('') WITH GRANT OPTION; FLUSH PRIVILEGES;"`
+      );
+    } catch {
+      // در هاست اشتراکی cPanel سرویس MySQL از قبل توسط هاست اجرا شده است
+    } finally {
+      localMariaDbBootstrapped = true;
+      localMariaDbBootstrapPromise = null;
+    }
+  })();
+
+  return localMariaDbBootstrapPromise;
 }
 
 let simulatedDisconnect = false;
@@ -183,6 +212,9 @@ export async function checkDatabaseConnection(): Promise<{
     };
   }
   try {
+    if (!localMariaDbBootstrapped) {
+      await ensureLocalMariaDbRunningIfNeeded();
+    }
     const p = getPool();
     await p.execute('SELECT 1 AS ok');
     return { connected: true };
@@ -245,7 +277,7 @@ export function validateProductionSecurityConfig(env: NodeJS.ProcessEnv = proces
 
 export async function initializeDatabase(): Promise<void> {
   validateProductionSecurityConfig(process.env);
-  ensureLocalMariaDbRunningIfNeeded();
+  await ensureLocalMariaDbRunningIfNeeded();
 
   const p = getPool();
   const schemaPath = path.resolve(process.cwd(), 'database/schema.sql');
@@ -324,9 +356,15 @@ export async function initializeDatabase(): Promise<void> {
   const hasWorker = existingUsers.some((u) => u.role === 'worker');
   const isProd = process.env.NODE_ENV === 'production';
 
+  const rawMgrPass = (process.env.INITIAL_MANAGER_PASSWORD || '').trim();
+  const managerUsername = (process.env.INITIAL_MANAGER_USERNAME || 'manager').trim();
+  const managerPassword =
+    !rawMgrPass || (!isProd && rawMgrPass === 'CHANGE_ME_MANAGER_PASSWORD')
+      ? isProd
+        ? ''
+        : 'Mgammon@1405'
+      : rawMgrPass;
   if (!hasManager) {
-    const managerUsername = (process.env.INITIAL_MANAGER_USERNAME || 'manager').trim();
-    const managerPassword = process.env.INITIAL_MANAGER_PASSWORD || (isProd ? '' : 'Mgammon@1405');
     if (isProd && (!managerPassword || FORBIDDEN_DEFAULT_PASSWORDS.has(managerPassword) || managerPassword.length < 8)) {
       throw new Error(
         'SECURITY_CONFIG_ERROR: برای ایجاد حساب اولیه مدیر در محیط عملیاتی باید متغیر محیطی INITIAL_MANAGER_PASSWORD با مقدار امن و غیرپیش‌فرض تنظیم شود.'
@@ -337,13 +375,25 @@ export async function initializeDatabase(): Promise<void> {
       'INSERT INTO users (username, full_name, role, password_hash, collaboration_start_shamsi, is_active, must_change_password) VALUES (?, ?, ?, ?, ?, 1, 1)',
       [managerUsername, 'مجید نورایی', 'manager', hash, '1405/06/15']
     );
+  } else if (!isProd && managerPassword) {
+    const hash = await bcrypt.hash(managerPassword, 10);
+    await p.execute(
+      "UPDATE users SET username = ?, full_name = 'مجید نورایی', password_hash = ?, is_active = 1 WHERE role = 'manager'",
+      [managerUsername, hash]
+    );
   } else {
     await p.execute("UPDATE users SET full_name = 'مجید نورایی' WHERE role = 'manager'");
   }
 
+  const rawWrkPass = (process.env.INITIAL_WORKER_PASSWORD || '').trim();
+  const workerUsername = (process.env.INITIAL_WORKER_USERNAME || 'worker').trim();
+  const workerPassword =
+    !rawWrkPass || (!isProd && rawWrkPass === 'CHANGE_ME_WORKER_PASSWORD')
+      ? isProd
+        ? ''
+        : 'Worker@1405'
+      : rawWrkPass;
   if (!hasWorker) {
-    const workerUsername = (process.env.INITIAL_WORKER_USERNAME || 'worker').trim();
-    const workerPassword = process.env.INITIAL_WORKER_PASSWORD || (isProd ? '' : 'Worker@1405');
     if (isProd && (!workerPassword || FORBIDDEN_DEFAULT_PASSWORDS.has(workerPassword) || workerPassword.length < 8)) {
       throw new Error(
         'SECURITY_CONFIG_ERROR: برای ایجاد حساب اولیه پرسنل در محیط عملیاتی باید متغیر محیطی INITIAL_WORKER_PASSWORD با مقدار امن و غیرپیش‌فرض تنظیم شود.'
@@ -353,6 +403,12 @@ export async function initializeDatabase(): Promise<void> {
     await p.execute(
       'INSERT INTO users (username, full_name, role, password_hash, collaboration_start_shamsi, is_active, must_change_password) VALUES (?, ?, ?, ?, ?, 1, 1)',
       [workerUsername, 'امید میثمی', 'worker', hash, '1405/06/15']
+    );
+  } else if (!isProd && workerPassword) {
+    const hash = await bcrypt.hash(workerPassword, 10);
+    await p.execute(
+      "UPDATE users SET username = ?, full_name = 'امید میثمی', password_hash = ?, is_active = 1, collaboration_start_shamsi = CASE WHEN collaboration_start_shamsi IS NULL OR collaboration_start_shamsi = '1405/01/01' THEN '1405/06/15' ELSE collaboration_start_shamsi END WHERE role = 'worker'",
+      [workerUsername, hash]
     );
   } else {
     await p.execute(
