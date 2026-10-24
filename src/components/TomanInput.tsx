@@ -28,7 +28,18 @@ export const TomanInput: React.FC<TomanInputProps> = ({
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.value;
-    const cleanDigits = formatNumericInputWithCommas(raw).replace(/,/g, '');
+    const prevClean = formatNumericInputWithCommas(value).replace(/,/g, '');
+    let cleanDigits = formatNumericInputWithCommas(raw).replace(/,/g, '');
+
+    // اگر کاربر دکمه Backspace را روی ویرگول جداکننده سه‌رقمی زده باشد، رقم قبلی را هم حذف کن
+    if (
+      raw.length < formattedPersianDisplay.length &&
+      cleanDigits === prevClean &&
+      cleanDigits.length > 0
+    ) {
+      cleanDigits = cleanDigits.slice(0, -1);
+    }
+
     onChange(cleanDigits);
   };
 

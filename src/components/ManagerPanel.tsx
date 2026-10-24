@@ -244,11 +244,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [testingSms, setTestingSms] = useState(false);
   const [showSmsHelpModal, setShowSmsHelpModal] = useState(false);
 
-  const loadDashboardAndSettings = useCallback(async () => {
+  const loadDashboardAndSettings = useCallback(async (syncSettings = false) => {
     try {
       const dashRes = await apiRequest<DashboardResponse>('/api/manager/dashboard');
       setDashboard(dashRes);
-      setSettingsForm(dashRes.settings);
+      setSettingsForm((prev) => (syncSettings || prev === null ? dashRes.settings : prev));
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     }
@@ -299,11 +299,13 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     setTransactions(res.transactions);
   }, [finStatusFilter, finTypeFilter, finSearch]);
 
+  const hasInitialLoadedRef = useRef(false);
+
   const refreshAll = useCallback(async () => {
     setLoading(true);
     try {
       await Promise.all([
-        loadDashboardAndSettings(),
+        loadDashboardAndSettings(false),
         loadAttendanceList(),
         loadReportsList(),
         loadFinanceList(),
@@ -314,17 +316,44 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   }, [loadDashboardAndSettings, loadAttendanceList, loadReportsList, loadFinanceList]);
 
   useEffect(() => {
-    refreshAll();
+    if (!hasInitialLoadedRef.current) {
+      hasInitialLoadedRef.current = true;
+      refreshAll();
+    }
   }, [refreshAll]);
 
-  // بروزرسانی خودکار وضعیت لحظه‌ای پرسنل در پنل مدیریت (هر ۱۵ ثانیه و هنگام بازگشت به تب مرورگر)
+  useEffect(() => {
+    if (!hasInitialLoadedRef.current) return;
+    const timer = window.setTimeout(() => {
+      loadAttendanceList();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [loadAttendanceList]);
+
+  useEffect(() => {
+    if (!hasInitialLoadedRef.current) return;
+    const timer = window.setTimeout(() => {
+      loadReportsList();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [loadReportsList]);
+
+  useEffect(() => {
+    if (!hasInitialLoadedRef.current) return;
+    const timer = window.setTimeout(() => {
+      loadFinanceList();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [loadFinanceList]);
+
+  // بروزرسانی خودکار وضعیت لحظه‌ای پرسنل در پنل مدیریت (هر ۱۵ ثانیه و هنگام بازگشت به تب مرورگر) بدون بازنویسی فرم تنظیمات
   useEffect(() => {
     const interval = window.setInterval(() => {
-      loadDashboardAndSettings();
+      loadDashboardAndSettings(false);
     }, 15000);
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
-        loadDashboardAndSettings();
+        loadDashboardAndSettings(false);
       }
     };
     window.addEventListener('focus', onFocusOrVisible);
@@ -342,7 +371,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         method: 'POST',
         body: JSON.stringify({ section }),
       });
-      await loadDashboardAndSettings();
+      await loadDashboardAndSettings(false);
     } catch {
       // ignore
     }
@@ -678,7 +707,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
       });
       setSettingsForm(res.settings);
       setFeedback({ type: 'success', text: res.message });
-      await loadDashboardAndSettings();
+      await loadDashboardAndSettings(true);
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     } finally {
@@ -1101,6 +1130,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         </div>
       ) : (
         <>
+          {activeTab === 'dashboard' && !dashboard && (
+            <div className="rounded-2xl bg-white border border-slate-200 p-6 text-center space-y-3 shadow-2xs">
+              <p className="text-xs font-bold text-[#0B192C]">
+                اطلاعات داشبورد هنوز بارگذاری نشده است.
+              </p>
+              <button
+                type="button"
+                onClick={() => loadDashboardAndSettings()}
+                className="min-h-[38px] px-5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
+              >
+                بارگذاری مجدد داشبورد
+              </button>
+            </div>
+          )}
+
           {/* ================= تب ۱: صفحه اول مدیریت (مکاتبات ← گزارش کار ← مطالبات ← نمودار روند کلی) ================= */}
           {activeTab === 'dashboard' && dashboard && (
             <div className="space-y-4">
@@ -3402,15 +3446,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         <TomanInput
                           label="مبلغ حقوق پایه ماهانه (تومان)"
                           value={
-                            settingsForm.base_salary_toman
+                            settingsForm.base_salary_toman !== null &&
+                            settingsForm.base_salary_toman !== undefined &&
+                            settingsForm.base_salary_toman > 0
                               ? String(settingsForm.base_salary_toman)
                               : ''
                           }
                           onChange={(val) =>
-                            setSettingsForm({
-                              ...settingsForm,
-                              base_salary_toman: val ? Number(val) : null,
-                            })
+                            setSettingsForm((prev) =>
+                              prev
+                                ? {
+                                    ...prev,
+                                    base_salary_toman: val ? Number(val) : null,
+                                  }
+                                : prev
+                            )
                           }
                           placeholder="مثلاً 18,000,000"
                         />
@@ -3422,10 +3472,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                           <select
                             value={settingsForm.overtime_calc_mode}
                             onChange={(e) =>
-                              setSettingsForm({
-                                ...settingsForm,
-                                overtime_calc_mode: e.target.value as OvertimeCalcMode,
-                              })
+                              setSettingsForm((prev) =>
+                                prev
+                                  ? {
+                                      ...prev,
+                                      overtime_calc_mode: e.target.value as OvertimeCalcMode,
+                                    }
+                                  : prev
+                              )
                             }
                             className="w-full min-h-[44px] rounded-xl border border-[#C5A059]/70 px-3 text-xs bg-white font-semibold text-[#0B192C]"
                           >
@@ -3452,10 +3506,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                               step={5}
                               value={settingsForm.overtime_percentage}
                               onChange={(e) =>
-                                setSettingsForm({
-                                  ...settingsForm,
-                                  overtime_percentage: Number(e.target.value),
-                                })
+                                setSettingsForm((prev) =>
+                                  prev
+                                    ? {
+                                        ...prev,
+                                        overtime_percentage: Number(e.target.value),
+                                      }
+                                    : prev
+                                )
                               }
                               className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3.5 text-xs font-bold tabular-nums bg-white"
                             />
@@ -3464,15 +3522,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                           <TomanInput
                             label="مبلغ ثابت هر ساعت اضافه‌کاری (تومان)"
                             value={
-                              settingsForm.overtime_rate_toman
+                              settingsForm.overtime_rate_toman !== null &&
+                              settingsForm.overtime_rate_toman !== undefined &&
+                              settingsForm.overtime_rate_toman > 0
                                 ? String(settingsForm.overtime_rate_toman)
                                 : ''
                             }
                             onChange={(val) =>
-                              setSettingsForm({
-                                ...settingsForm,
-                                overtime_rate_toman: val ? Number(val) : null,
-                              })
+                              setSettingsForm((prev) =>
+                                prev
+                                  ? {
+                                      ...prev,
+                                      overtime_rate_toman: val ? Number(val) : null,
+                                    }
+                                  : prev
+                              )
                             }
                             placeholder="مثلاً 120,000"
                           />
@@ -3481,15 +3545,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         <TomanInput
                           label="نرخ پایه هر ساعت کاری عادی (تومان - اختیاری)"
                           value={
-                            settingsForm.hourly_rate_toman
+                            settingsForm.hourly_rate_toman !== null &&
+                            settingsForm.hourly_rate_toman !== undefined &&
+                            settingsForm.hourly_rate_toman > 0
                               ? String(settingsForm.hourly_rate_toman)
                               : ''
                           }
                           onChange={(val) =>
-                            setSettingsForm({
-                              ...settingsForm,
-                              hourly_rate_toman: val ? Number(val) : null,
-                            })
+                            setSettingsForm((prev) =>
+                              prev
+                                ? {
+                                    ...prev,
+                                    hourly_rate_toman: val ? Number(val) : null,
+                                  }
+                                : prev
+                            )
                           }
                           placeholder="محاسبه خودکار از روی حقوق ماهانه"
                         />

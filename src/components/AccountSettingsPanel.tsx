@@ -14,7 +14,7 @@ import {
   EyeOff,
 } from 'lucide-react';
 import { UserProfile } from '../shared/types';
-import { apiRequest } from '../services/api';
+import { apiRequest, withAuthTokenUrl } from '../services/api';
 import {
   disableDeviceBiometric,
   getStoredBiometricInfo,
@@ -644,7 +644,7 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
             </p>
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <a
-                href="/api/manager/backup/excel"
+                href={withAuthTokenUrl('/api/manager/backup/excel')}
                 download="mgammon-full-backup.xlsx"
                 className="min-h-[42px] px-4 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center gap-2 hover:bg-[#142844]"
               >
@@ -652,7 +652,7 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
                 <span>دانلود اکسل جامع کارکرد و مالی</span>
               </a>
               <a
-                href="/api/manager/backup/json"
+                href={withAuthTokenUrl('/api/manager/backup/json')}
                 download="mgammon-backup.json"
                 className="min-h-[42px] px-3.5 rounded-xl border border-[#C5A059]/60 bg-[#FCF9F2] text-[#0B192C] text-xs font-bold flex items-center gap-1.5 hover:border-[#C5A059]"
               >

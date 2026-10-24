@@ -108,6 +108,10 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
   const [toShamsi, setToShamsi] = useState('');
   const [mediaFilter, setMediaFilter] = useState<MediaQuickFilter>('ALL');
 
+  const onUnreadChangeRef = useRef(onUnreadChange);
+  onUnreadChangeRef.current = onUnreadChange;
+  const lastReportedUnreadRef = useRef<number | null>(null);
+
   const loadCorrespondences = useCallback(async () => {
     try {
       const params = new URLSearchParams();
@@ -124,18 +128,25 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
 
       setItems(res.correspondences);
       setUnreadCount(res.unreadCount);
-      if (onUnreadChange) {
-        onUnreadChange(res.unreadCount);
+      if (
+        onUnreadChangeRef.current &&
+        lastReportedUnreadRef.current !== res.unreadCount
+      ) {
+        lastReportedUnreadRef.current = res.unreadCount;
+        onUnreadChangeRef.current(res.unreadCount);
       }
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     } finally {
       setLoading(false);
     }
-  }, [search, senderFilter, fromShamsi, toShamsi, onUnreadChange]);
+  }, [search, senderFilter, fromShamsi, toShamsi]);
 
   useEffect(() => {
-    loadCorrespondences();
+    const timer = window.setTimeout(() => {
+      loadCorrespondences();
+    }, 200);
+    return () => window.clearTimeout(timer);
   }, [loadCorrespondences]);
 
   useEffect(() => {

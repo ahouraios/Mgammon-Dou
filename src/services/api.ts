@@ -1,4 +1,6 @@
+const SESSION_TOKEN_STORAGE_KEY = 'mgammon_session_token';
 let inMemoryCsrfToken: string | null = null;
+let inMemorySessionToken: string | null = null;
 
 function readCookie(name: string): string | null {
   if (typeof document === 'undefined' || !document.cookie) return null;
@@ -13,17 +15,44 @@ function readCookie(name: string): string | null {
 }
 
 export function getStoredToken(): string | null {
+  if (inMemorySessionToken) return inMemorySessionToken;
+  try {
+    const stored =
+      localStorage.getItem(SESSION_TOKEN_STORAGE_KEY) ||
+      sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
+    if (stored && stored.trim().length >= 32) {
+      inMemorySessionToken = stored.trim();
+      return inMemorySessionToken;
+    }
+  } catch {
+    // ignore storage errors
+  }
   return null;
 }
 
-export function setStoredToken(_token: string | null): void {
-  // توکن نشست صرفاً در کوکی امن HttpOnly نگهداری می‌شود و در localStorage یا sessionStorage ذخیره نمی‌گردد
+export function setStoredToken(token: string | null): void {
+  const normalized = token && token.trim().length >= 32 ? token.trim() : null;
+  inMemorySessionToken = normalized;
   try {
-    sessionStorage.removeItem('mgammon_session_token');
-    localStorage.removeItem('mgammon_session_token');
+    if (normalized) {
+      localStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
+      sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
+    } else {
+      localStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
+      sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
+    }
   } catch {
-    // ignore
+    // ignore storage errors
   }
+}
+
+export function withAuthTokenUrl(url: string | null | undefined): string {
+  if (!url) return '';
+  const token = getStoredToken();
+  if (!token) return url;
+  if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}token=${encodeURIComponent(token)}`;
 }
 
 export async function apiRequest<T>(
@@ -34,6 +63,11 @@ export async function apiRequest<T>(
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> | undefined),
   };
+
+  const sessionToken = getStoredToken();
+  if (sessionToken && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${sessionToken}`;
+  }
 
   const csrfToken = inMemoryCsrfToken || readCookie('mgammon_csrf_token');
   if (csrfToken) {
@@ -65,6 +99,10 @@ export async function apiRequest<T>(
 
   if (typeof data.csrfToken === 'string' && data.csrfToken) {
     inMemoryCsrfToken = data.csrfToken;
+  }
+
+  if (typeof data.token === 'string' && data.token.length >= 32) {
+    setStoredToken(data.token);
   }
 
   if (!response.ok || data.ok === false) {

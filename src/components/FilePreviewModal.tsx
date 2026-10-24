@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Download, ZoomIn, ZoomOut, FileText, Image as ImageIcon, Film, Volume2 } from 'lucide-react';
 import { toPersianDigits } from '../shared/jalali';
+import { withAuthTokenUrl } from '../services/api';
 
 export interface PreviewFileItem {
   file_name: string;
@@ -19,6 +20,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({ file, onClos
 
   if (!file) return null;
 
+  const authenticatedUrl = withAuthTokenUrl(file.file_url);
   const lowerName = (file.file_name || file.file_url || '').toLowerCase();
   const mime = (file.mime_type || '').toLowerCase();
 
@@ -110,7 +112,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({ file, onClos
           {isImage ? (
             <div className="overflow-auto max-h-[65vh] flex items-center justify-center">
               <img
-                src={file.file_url}
+                src={authenticatedUrl}
                 alt={file.file_name}
                 style={{ transform: `scale(${zoom})`, transformOrigin: 'center center' }}
                 className="max-w-full max-h-[62vh] object-contain rounded-xl transition-transform duration-200"
@@ -118,7 +120,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({ file, onClos
             </div>
           ) : isPdf ? (
             <iframe
-              src={file.file_url}
+              src={authenticatedUrl}
               title={file.file_name}
               className="w-full h-[65vh] rounded-xl border border-slate-200 bg-white"
             />
@@ -128,12 +130,12 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({ file, onClos
               <div className="text-xs font-bold text-[#0B192C]" dir="ltr">
                 {file.file_name}
               </div>
-              <audio controls src={file.file_url} className="w-full" />
+              <audio controls src={authenticatedUrl} className="w-full" />
             </div>
           ) : isVideo ? (
             <video
               controls
-              src={file.file_url}
+              src={authenticatedUrl}
               className="max-w-full max-h-[62vh] rounded-xl bg-black"
             />
           ) : (
@@ -165,7 +167,7 @@ export const FilePreviewModal: React.FC<FilePreviewModalProps> = ({ file, onClos
           </button>
 
           <a
-            href={file.file_url}
+            href={authenticatedUrl}
             download={file.file_name || true}
             target="_blank"
             rel="noopener noreferrer"

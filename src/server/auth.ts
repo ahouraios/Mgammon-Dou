@@ -273,11 +273,17 @@ export function requireCsrfProtection(
 export async function getSessionUser(
   req: Request
 ): Promise<{ user: UserProfile; tokenHash: string; rawToken: string } | null> {
+  const queryToken =
+    req.method === 'GET' && typeof req.query?.token === 'string'
+      ? req.query.token.trim()
+      : null;
+
   const rawToken =
     req.cookies?.[SESSION_COOKIE_NAME] ||
     (req.headers.authorization?.startsWith('Bearer ')
       ? req.headers.authorization.slice(7).trim()
-      : null);
+      : null) ||
+    queryToken;
 
   if (!rawToken || typeof rawToken !== 'string' || rawToken.length < 32) {
     return null;
