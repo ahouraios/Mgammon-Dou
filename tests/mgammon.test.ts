@@ -2,8 +2,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   calculateDailyAttendance,
   calculateMonthlyPayrollPeriod,
+  calculatePeriodStatement,
   calculateSalaryAndOvertimeRates,
   evaluateWorkerLiveState,
+  generateStatementPeriods,
   validateAttendanceSequence,
   validateFullDayLogSequence,
 } from '../src/shared/calculationEngine';
@@ -21,14 +23,35 @@ import {
 } from '../src/shared/jalali';
 import { AttendanceLog, SystemSettings, SystemSettingsSnapshot } from '../src/shared/types';
 import {
+  columnExists,
+  getDbConfig,
   getPool,
+  indexExists,
   initializeDatabase,
+  isCpanelOrProductionEnvironment,
+  resetPool,
+  setDatabaseInitializedForTest,
   setSimulatedDatabaseDisconnect,
+  setSimulatedMidTransactionFailure,
   validateProductionSecurityConfig,
 } from '../src/server/db';
+import {
+  BACKUP_TABLES_ORDERED,
+  collectDatabaseMetrics,
+  createFullBackup,
+  restoreFromBackupArchive,
+  verifyBackupArchive,
+} from '../src/server/backup';
 import { resetAllLoginRateLimits } from '../src/server/auth';
 import { createApp } from '../server';
 import type { Server } from 'http';
+import fs from 'fs';
+import path from 'path';
+import mysql from 'mysql2/promise';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 const BASE_SETTINGS: SystemSettings = {
   id: 1,
@@ -96,28 +119,28 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
 
   let savedSettingsRow: Record<string, unknown> | null = null;
 
-  const backupTables = [
-    'user_sessions',
-    'financial_transactions',
-    'daily_work_reports',
-    'historical_work_records',
-    'attendance_logs',
-    'leave_requests',
-    'system_settings_snapshots',
-  ];
+  const origDbName = process.env.DB_NAME;
+  const origMediaDir = process.env.PRIVATE_MEDIA_DIR;
+  const origBackupDir = process.env.BACKUP_DIR;
 
   beforeAll(async () => {
+    // اجرای تمام آزمون‌ها روی دیتابیس و پوشه‌های کاملاً ایزوله آزمایشی (بدون کوچک‌ترین دستکاری در اطلاعات واقعی mgammon_duo)
+    process.env.DB_NAME = 'mgammon_duo_test';
+    process.env.PRIVATE_MEDIA_DIR = '.data/test_private_media';
+    process.env.BACKUP_DIR = '.data/test_backups';
+
+    await resetPool();
     await initializeDatabase();
+
     const pool = getPool();
+    for (const tbl of [...BACKUP_TABLES_ORDERED].reverse()) {
+      if (tbl === 'users' || tbl === 'system_settings' || tbl === 'schema_migrations') continue;
+      await pool.execute(`DELETE FROM \`${tbl}\``);
+    }
+
     const [sRows] = await pool.execute('SELECT * FROM system_settings ORDER BY id ASC LIMIT 1');
     if (Array.isArray(sRows) && sRows.length > 0) {
       savedSettingsRow = sRows[0] as Record<string, unknown>;
-    }
-
-    for (const tbl of backupTables) {
-      await pool.execute(`DROP TABLE IF EXISTS _test_bak_${tbl}`);
-      await pool.execute(`CREATE TABLE _test_bak_${tbl} AS SELECT * FROM ${tbl}`);
-      await pool.execute(`DELETE FROM ${tbl}`);
     }
 
     const app = await createApp();
@@ -130,59 +153,32 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
         resolve();
       });
     });
-  });
+  }, 60000);
 
   afterAll(async () => {
     setSimulatedDatabaseDisconnect(false);
-    const pool = getPool();
-    for (const tbl of backupTables) {
-      await pool.execute(`DELETE FROM ${tbl}`);
-      await pool.execute(`INSERT INTO ${tbl} SELECT * FROM _test_bak_${tbl}`);
-      await pool.execute(`DROP TABLE IF EXISTS _test_bak_${tbl}`);
-    }
-    await pool.execute(
-      "DELETE FROM audit_logs WHERE reason LIKE '%TEST%' OR reason LIKE '%تست%'"
-    );
-    if (savedSettingsRow) {
-      await pool.execute(
-        `UPDATE system_settings SET
-          shift_start_time = ?,
-          shift_end_time = ?,
-          thursday_shift_start_time = ?,
-          thursday_shift_end_time = ?,
-          thursday_overtime_start_time = ?,
-          grace_period_minutes = ?,
-          break_duration_minutes = ?,
-          base_salary_toman = ?,
-          hourly_rate_toman = ?,
-          overtime_calc_mode = ?,
-          overtime_percentage = ?,
-          overtime_rate_toman = ?,
-          effective_from_shamsi = ?,
-          banner_bg_url = ?
-         WHERE id = ?`,
-        [
-          savedSettingsRow.shift_start_time,
-          savedSettingsRow.shift_end_time,
-          savedSettingsRow.thursday_shift_start_time,
-          savedSettingsRow.thursday_shift_end_time,
-          savedSettingsRow.thursday_overtime_start_time,
-          savedSettingsRow.grace_period_minutes,
-          savedSettingsRow.break_duration_minutes,
-          savedSettingsRow.base_salary_toman,
-          savedSettingsRow.hourly_rate_toman,
-          savedSettingsRow.overtime_calc_mode,
-          savedSettingsRow.overtime_percentage,
-          savedSettingsRow.overtime_rate_toman,
-          savedSettingsRow.effective_from_shamsi,
-          savedSettingsRow.banner_bg_url ?? null,
-          savedSettingsRow.id,
-        ]
-      );
-    }
+    setSimulatedMidTransactionFailure(null);
+    setDatabaseInitializedForTest(true);
     if (server) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    await resetPool();
+
+    const testMediaPath = path.resolve(process.cwd(), '.data/test_private_media');
+    const testBackupPath = path.resolve(process.cwd(), '.data/test_backups');
+    try {
+      fs.rmSync(testMediaPath, { recursive: true, force: true });
+      fs.rmSync(testBackupPath, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+
+    if (origDbName === undefined) delete process.env.DB_NAME;
+    else process.env.DB_NAME = origDbName;
+    if (origMediaDir === undefined) delete process.env.PRIVATE_MEDIA_DIR;
+    else process.env.PRIVATE_MEDIA_DIR = origMediaDir;
+    if (origBackupDir === undefined) delete process.env.BACKUP_DIR;
+    else process.env.BACKUP_DIR = origBackupDir;
   });
 
   it('سناریو ۱۳ + تقویم شمسی و تبدیل مبلغ به حروف فارسی', () => {
@@ -1557,5 +1553,683 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(dashAfterDelete.kpis.totalOvertimeMinutes).toBe(240); // 120 + 120
     expect(dashAfterDelete.kpis.totalOvertimePayToman).toBe(560000); // 280,000 + 280,000
   });
+
+  // ============================================================================
+  // مرحله ۳: ۱۰ آزمون اجباری افزایش پایداری دیتابیس، مهاجرت، تراکنش، پشتیبان‌گیری و بازیابی
+  // (تمام آزمون‌ها روی دیتابیس ایزوله mgammon_duo_test اجرا می‌شوند و دیتابیس واقعی mgammon_duo دست‌نخورده می‌ماند)
+  // ============================================================================
+  it('مرحله ۳ — آزمون اجباری ۱ و ۲: اجرای اولیه با دیتابیس کاملاً خالی + اجرای مجدد با اطلاعات موجود بدون بازنشانی رمز یا تنظیمات', async () => {
+    expect(getDbConfig().database).toBe('mgammon_duo_test');
+
+    // بررسی محافظت از محیط عملیاتی cPanel (عدم اجرای دستورات نصب محلی در Production یا کاربر غیر root)
+    expect(isCpanelOrProductionEnvironment({ NODE_ENV: 'production' })).toBe(true);
+    expect(isCpanelOrProductionEnvironment({ CPANEL_ENV: 'true' })).toBe(true);
+    expect(isCpanelOrProductionEnvironment({ DB_USER: 'cpanel_real_user' })).toBe(true);
+
+    // ۱. تخلیه کامل دیتابیس آزمایشی mgammon_duo_test برای شبیه‌سازی اجرای اولیه روی دیتابیس کاملاً خالی
+    const cfg = getDbConfig();
+    const adminConn = await mysql.createConnection({
+      host: cfg.host,
+      port: cfg.port,
+      user: cfg.user,
+      password: cfg.password,
+    });
+    await adminConn.query('REPAIR TABLE mysql.proc').catch(() => {});
+    try {
+      await adminConn.query('DROP DATABASE IF EXISTS `mgammon_duo_test`');
+      await adminConn.query(
+        'CREATE DATABASE `mgammon_duo_test` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
+      );
+    } catch {
+      await adminConn.query(
+        'CREATE DATABASE IF NOT EXISTS `mgammon_duo_test` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
+      );
+      await adminConn.query('USE `mgammon_duo_test`');
+      await adminConn.query('SET FOREIGN_KEY_CHECKS = 0');
+      const [tbls] = await adminConn.query<mysql.RowDataPacket[]>('SHOW TABLES');
+      for (const row of tbls) {
+        const tblName = Object.values(row)[0];
+        if (tblName) {
+          await adminConn.query(`DROP TABLE IF EXISTS \`${tblName}\``);
+        }
+      }
+      await adminConn.query('SET FOREIGN_KEY_CHECKS = 1');
+    }
+    await adminConn.end();
+
+    await resetPool();
+
+    // بررسی اینکه پیش از اجرای initializeDatabase، برنامه وضعیت آماده کاذب گزارش نمی‌دهد
+    const unreadyHealthRes = await fetch(`${baseUrl}/api/health`);
+    expect(unreadyHealthRes.status).toBe(503);
+    const unreadyHealthData = await unreadyHealthRes.json();
+    expect(unreadyHealthData.ok).toBe(false);
+    expect(unreadyHealthData.dbConnected).toBe(false);
+
+    const unreadyApiRes = await fetch(`${baseUrl}/api/settings`);
+    expect(unreadyApiRes.status).toBe(503);
+
+    // اجرای اولیه initializeDatabase روی دیتابیس کاملاً خالی
+    await initializeDatabase();
+
+    const pool = getPool();
+    const metricsAfterFreshInit = await collectDatabaseMetrics(pool);
+    expect(metricsAfterFreshInit.tableCounts.users).toBe(2);
+    expect(metricsAfterFreshInit.tableCounts.system_settings).toBe(1);
+    expect(metricsAfterFreshInit.tableCounts.schema_migrations).toBe(6);
+
+    // ۲. درج اطلاعات سفارشی (تغییر رمز عبور، تغییر بنر، تغییر حقوق پایه و ثبت تراکنش مالی) و اجرای مجدد initializeDatabase
+    const bcrypt = await import('bcryptjs');
+    const customManagerHash = await bcrypt.default.hash('CustomMgrPass#1405', 10);
+    await pool.execute(
+      "UPDATE users SET password_hash = ?, phone_number = '09121112233' WHERE role = 'manager'",
+      [customManagerHash]
+    );
+    await pool.execute(
+      "UPDATE system_settings SET base_salary_toman = 45000000, banner_bg_url = '/assets/media/custom-banner.png'"
+    );
+
+    const [uRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT id, role FROM users ORDER BY id ASC'
+    );
+    const mgrId = Number(uRows.find((u) => u.role === 'manager')!.id);
+    const wrkId = Number(uRows.find((u) => u.role === 'worker')!.id);
+
+    await pool.execute(
+      `INSERT INTO financial_transactions
+        (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, status, is_seen_by_manager)
+       VALUES (?, ?, 7500000, 'ADVANCE', '2026-10-24', '1405/08/02', 'مساعده تست پایداری', 'APPROVED', 1)`,
+      [wrkId, mgrId]
+    );
+
+    // اجرای مجدد initializeDatabase روی دیتابیس دارای اطلاعات
+    await initializeDatabase();
+    await initializeDatabase();
+
+    const [mgrAfterRestart] = await pool.execute<mysql.RowDataPacket[]>(
+      "SELECT password_hash, phone_number FROM users WHERE role = 'manager'"
+    );
+    expect(mgrAfterRestart[0].password_hash).toBe(customManagerHash);
+    expect(mgrAfterRestart[0].phone_number).toBe('09121112233');
+
+    const [settingsAfterRestart] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT base_salary_toman, banner_bg_url FROM system_settings LIMIT 1'
+    );
+    expect(Number(settingsAfterRestart[0].base_salary_toman)).toBe(45000000);
+    expect(settingsAfterRestart[0].banner_bg_url).toBe('/assets/media/custom-banner.png');
+
+    const [txAfterRestart] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt, SUM(amount_toman) AS total FROM financial_transactions'
+    );
+    expect(Number(txAfterRestart[0].cnt)).toBe(1);
+    expect(Number(txAfterRestart[0].total)).toBe(7500000);
+
+    // بازگرداندن رمز پیش‌فرض مدیر برای ادامه تست‌ها
+    const defaultMgrHash = await bcrypt.default.hash(mgrInitialPass, 10);
+    await pool.execute("UPDATE users SET password_hash = ? WHERE role = 'manager'", [
+      defaultMgrHash,
+    ]);
+  });
+
+  it('مرحله ۳ — آزمون اجباری ۳ و ۴: قطع دیتابیس هنگام ثبت تردد و ثبت پرداخت (در ابتدای عملیات و در میانه تراکنش) + جلوگیری از پرداخت تکراری', async () => {
+    const pool = getPool();
+
+    // دریافت توکن‌های معتبر روی دیتابیس آزمایشی
+    const mgrLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'manager', password: mgrInitialPass }),
+    });
+    managerToken = (await mgrLogin.json()).token;
+
+    const wrkLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'worker', password: wrkInitialPass }),
+    });
+    workerToken = (await wrkLogin.json()).token;
+
+    const [attBefore] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt FROM attendance_logs'
+    );
+    const [auditBefore] = await pool.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) AS cnt FROM audit_logs WHERE action_type = 'ATTENDANCE_CLOCK'"
+    );
+
+    // ۳-الف: قطع دیتابیس در میانه تراکنش ثبت تردد (پس از درج رکورد در attendance_logs و پیش از COMMIT)
+    setSimulatedMidTransactionFailure('attendance_clock');
+    try {
+      const midFailClockRes = await fetch(`${baseUrl}/api/attendance/clock`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({ event_type: 'WORK_START', note: 'تردد ناتمام به دلیل قطع دیتابیس' }),
+      });
+      expect(midFailClockRes.status).toBe(503);
+      const midFailClockData = await midFailClockRes.json();
+      expect(midFailClockData.code).toBe('DB_UNAVAILABLE');
+    } finally {
+      setSimulatedMidTransactionFailure(null);
+    }
+
+    // بررسی اینکه Rollback انجام شده و هیچ رکوردی در attendance_logs یا audit_logs باقی نمانده است
+    const [attAfterRollback] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt FROM attendance_logs'
+    );
+    const [auditAfterRollback] = await pool.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) AS cnt FROM audit_logs WHERE action_type = 'ATTENDANCE_CLOCK'"
+    );
+    expect(Number(attAfterRollback[0].cnt)).toBe(Number(attBefore[0].cnt));
+    expect(Number(auditAfterRollback[0].cnt)).toBe(Number(auditBefore[0].cnt));
+
+    // ۴-الف: قطع دیتابیس در میانه تراکنش ثبت پرداخت مالی (پس از درج در financial_transactions و پیش از COMMIT)
+    const [finBefore] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_toman), 0) AS sum_toman FROM financial_transactions'
+    );
+
+    setSimulatedMidTransactionFailure('finance_payment');
+    try {
+      const midFailPayRes = await fetch(`${baseUrl}/api/finance/manager-direct`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${managerToken}`,
+        },
+        body: JSON.stringify({
+          amount_toman: 18000000,
+          tx_type: 'SALARY',
+          shamsi_date: '1405/08/02',
+          description: 'پرداخت ناتمام در حین قطع دیتابیس',
+        }),
+      });
+      expect(midFailPayRes.status).toBe(503);
+    } finally {
+      setSimulatedMidTransactionFailure(null);
+    }
+
+    const [finAfterRollback] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_toman), 0) AS sum_toman FROM financial_transactions'
+    );
+    expect(Number(finAfterRollback[0].cnt)).toBe(Number(finBefore[0].cnt));
+    expect(Number(finAfterRollback[0].sum_toman)).toBe(Number(finBefore[0].sum_toman));
+
+    // ۴-ب: جلوگیری از ثبت پرداخت تکراری با کلید یکتای Idempotency
+    const idemKey = 'pay-idem-1405-08-02-unique-001';
+    const pay1Res = await fetch(`${baseUrl}/api/finance/manager-direct`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+        'X-Idempotency-Key': idemKey,
+      },
+      body: JSON.stringify({
+        amount_toman: 9500000,
+        tx_type: 'SALARY',
+        shamsi_date: '1405/08/02',
+        description: 'پرداخت با کلید یکتا',
+      }),
+    });
+    expect(pay1Res.status).toBe(201);
+
+    const pay2DupRes = await fetch(`${baseUrl}/api/finance/manager-direct`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+        'X-Idempotency-Key': idemKey,
+      },
+      body: JSON.stringify({
+        amount_toman: 9500000,
+        tx_type: 'SALARY',
+        shamsi_date: '1405/08/02',
+        description: 'پرداخت با کلید یکتا',
+      }),
+    });
+    expect(pay2DupRes.status).toBe(409);
+    const pay2DupData = await pay2DupRes.json();
+    expect(pay2DupData.code).toBe('DUPLICATE_REQUEST');
+  });
+
+  it('مرحله ۳ — آزمون اجباری ۵ و ۶: Restart کامل برنامه با حفظ نشست‌ها و اطلاعات + اجرای مهاجرت روی نسخه قبلی دیتابیس', async () => {
+    // ۵. شبیه‌سازی Restart کامل سرور و استخر اتصالات دیتابیس (Pool) و بررسی حفظ نشست‌های فعال کاربران
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await resetPool();
+    await initializeDatabase();
+    const restartedApp = await createApp();
+    await new Promise<void>((resolve) => {
+      server = restartedApp.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        if (addr && typeof addr === 'object') {
+          baseUrl = `http://127.0.0.1:${addr.port}`;
+        }
+        resolve();
+      });
+    });
+
+    // بررسی اینکه نشست‌های قبلی (managerToken و workerToken) پس از Restart برنامه همچنان معتبر و فعال هستند
+    const mgrMeAfterRestart = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    expect(mgrMeAfterRestart.status).toBe(200);
+
+    const wrkMeAfterRestart = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(wrkMeAfterRestart.status).toBe(200);
+
+    // ۶. شبیه‌سازی دیتابیس نسخه قبلی (حذف جدول schema_migrations و حذف چند ستون و ایندکس اضافه‌شده در نسخه‌های جدیدتر)
+    const pool = getPool();
+    const preMigrationMetrics = await collectDatabaseMetrics(pool);
+
+    await pool.query('DROP TABLE IF EXISTS `schema_migrations`');
+    await pool.query('ALTER TABLE `attendance_logs` DROP INDEX `uq_attendance_idempotency`');
+    await pool.query('ALTER TABLE `attendance_logs` DROP COLUMN `idempotency_key`');
+    await pool.query('ALTER TABLE `work_correspondences` DROP COLUMN `audio_url`');
+
+    expect(await columnExists(pool, 'attendance_logs', 'idempotency_key')).toBe(false);
+    expect(await columnExists(pool, 'work_correspondences', 'audio_url')).toBe(false);
+
+    // اجرای initializeDatabase روی ساختار قدیمی و بررسی ارتقای خودکار بدون از دست رفتن اطلاعات
+    await initializeDatabase();
+
+    expect(await columnExists(pool, 'attendance_logs', 'idempotency_key')).toBe(true);
+    expect(await indexExists(pool, 'attendance_logs', 'uq_attendance_idempotency')).toBe(true);
+    expect(await columnExists(pool, 'work_correspondences', 'audio_url')).toBe(true);
+
+    const postMigrationMetrics = await collectDatabaseMetrics(pool);
+    expect(postMigrationMetrics.tableCounts.users).toBe(preMigrationMetrics.tableCounts.users);
+    expect(postMigrationMetrics.financialSums.totalAmountToman).toBe(
+      preMigrationMetrics.financialSums.totalAmountToman
+    );
+    expect(postMigrationMetrics.tableCounts.schema_migrations).toBe(6);
+  });
+
+  it('مرحله ۳ — آزمون اجباری ۷، ۸ و ۹: پشتیبان‌گیری و بازیابی کامل روی محیط آزمایشی، تطابق ۱۰۰٪ تعداد رکوردها و جمع مبالغ پیش و پس از بازیابی، تشخیص پشتیبان خراب، و کنترل دسترسی به فایل‌ها', async () => {
+    const pool = getPool();
+
+    // ثبت یک تردد، یک گزارش روزانه، یک سابقه کارکرد و یک درخواست مالی با فایل پیوست خصوصی PNG
+    const validPngBase64 =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    const wrkFinRes = await fetch(`${baseUrl}/api/finance/worker-request`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        amount_toman: 1250000,
+        tx_type: 'PETTY_CASH',
+        shamsi_date: '1405/08/02',
+        description: 'فاکتور خرید ابزار جهت تست پشتیبان‌گیری',
+        receipt_base64: validPngBase64,
+        receipt_file_name: 'tool-invoice.png',
+      }),
+    });
+    expect(wrkFinRes.status).toBe(201);
+
+    // ثبت یک فاکتور مستقیم توسط مدیر برای بررسی عدم دسترسی کارمند به فایل خصوصی متعلق به کاربر دیگر (IDOR File Check)
+    const [mgrRows] = await pool.execute<mysql.RowDataPacket[]>(
+      "SELECT id FROM users WHERE role = 'manager' LIMIT 1"
+    );
+    const mgrId = Number(mgrRows[0].id);
+    const managerOnlyReceiptUrl = '/assets/media/receipts/manager_private_doc.png';
+    const testMediaBase = path.resolve(process.cwd(), '.data/test_private_media');
+    fs.mkdirSync(path.join(testMediaBase, 'receipts'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(testMediaBase, 'receipts', 'manager_private_doc.png'),
+      Buffer.from(validPngBase64.split(',')[1], 'base64')
+    );
+    await pool.execute(
+      `INSERT INTO financial_transactions
+        (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, receipt_file_url, receipt_file_name, status, is_seen_by_manager)
+       VALUES (?, ?, 500000, 'OTHER', '2026-10-24', '1405/08/02', 'سند اختصاصی مدیر', ?, 'manager_private_doc.png', 'APPROVED', 1)`,
+      [mgrId, mgrId, managerOnlyReceiptUrl]
+    );
+
+    // ۹. بررسی دسترسی غیرمجاز به فایل‌ها و مسیر پشتیبان‌ها
+    // الف) بدون توکن -> 401
+    const unauthMediaRes = await fetch(`${baseUrl}${managerOnlyReceiptUrl}`);
+    expect(unauthMediaRes.status).toBe(401);
+
+    // ب) تلاش کارمند برای دسترسی به پیوست متعلق به مدیر -> 403
+    const workerForbiddenMediaRes = await fetch(`${baseUrl}${managerOnlyReceiptUrl}`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(workerForbiddenMediaRes.status).toBe(403);
+
+    // ج) دسترسی مدیر به همان فایل -> 200
+    const managerAllowedMediaRes = await fetch(`${baseUrl}${managerOnlyReceiptUrl}`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    expect(managerAllowedMediaRes.status).toBe(200);
+
+    // د) تلاش برای دسترسی وب به پوشه مخفی پشتیبان‌ها (/.data/backups) -> 403
+    const directBackupWebAccessRes = await fetch(`${baseUrl}/.data/backups/test.json`);
+    expect(directBackupWebAccessRes.status).toBe(403);
+
+    // ۷ و ۸. ثبت آمار دقیق پیش از پشتیبان‌گیری (تعداد رکوردهای تمام ۱۳ جدول و جمع کل مبالغ مالی)
+    const metricsBeforeBackup = await collectDatabaseMetrics(pool);
+    expect(metricsBeforeBackup.financialSums.totalAmountToman).toBe(
+      7500000 + 9500000 + 1250000 + 500000
+    ); // 18,750,000 تومان
+
+    const testBackupDir = path.resolve(process.cwd(), '.data/test_backups');
+    const backupResult = await createFullBackup({
+      backupDir: testBackupDir,
+      privateMediaDir: testMediaBase,
+      customPool: pool,
+    });
+
+    expect(fs.existsSync(backupResult.backupFilePath)).toBe(true);
+    expect(fs.existsSync(backupResult.sqlDumpFilePath)).toBe(true);
+    expect(backupResult.sizeBytes).toBeGreaterThan(500);
+    expect(backupResult.manifest.mediaFilesCount).toBeGreaterThanOrEqual(2);
+
+    // بررسی تشخیص فایل پشتیبان خالی یا دستکاری‌شده
+    const emptyBackupPath = path.join(testBackupDir, 'empty_corrupt.mgbackup.json');
+    fs.writeFileSync(emptyBackupPath, '');
+    const emptyCheck = verifyBackupArchive(emptyBackupPath);
+    expect(emptyCheck.valid).toBe(false);
+
+    const tamperedBackupPath = path.join(testBackupDir, 'tampered_corrupt.mgbackup.json');
+    const tamperedContent = fs
+      .readFileSync(backupResult.backupFilePath, 'utf8')
+      .replace('18750000', '99999999');
+    fs.writeFileSync(tamperedBackupPath, tamperedContent);
+    const tamperedCheck = verifyBackupArchive(tamperedBackupPath);
+    expect(tamperedCheck.valid).toBe(false);
+    await expect(
+      restoreFromBackupArchive(tamperedBackupPath, {
+        targetMediaDir: testMediaBase,
+        customPool: pool,
+      })
+    ).rejects.toThrow(/RESTORE_ABORTED_INVALID_BACKUP/);
+
+    // پاکسازی کامل رکوردهای مالی، ترددها و فایل‌های رسانه در محیط آزمایشی برای آزمایش بازیابی واقعی
+    await pool.execute('DELETE FROM financial_transactions');
+    await pool.execute('DELETE FROM attendance_logs');
+    fs.rmSync(testMediaBase, { recursive: true, force: true });
+
+    const wipedMetrics = await collectDatabaseMetrics(pool);
+    expect(wipedMetrics.tableCounts.financial_transactions).toBe(0);
+    expect(wipedMetrics.financialSums.totalAmountToman).toBe(0);
+
+    // اجرای بازیابی کامل از فایل پشتیبان معتبر
+    const restoreResult = await restoreFromBackupArchive(backupResult.backupFilePath, {
+      targetMediaDir: testMediaBase,
+      customPool: pool,
+    });
+
+    // ۸. مقایسه دقیق تعداد رکوردها و جمع مبالغ پیش از پشتیبان‌گیری و پس از بازیابی
+    const metricsAfterRestore = await collectDatabaseMetrics(pool);
+    expect(metricsAfterRestore.tableCounts).toEqual(metricsBeforeBackup.tableCounts);
+    expect(metricsAfterRestore.financialSums).toEqual(metricsBeforeBackup.financialSums);
+    expect(restoreResult.restoredMediaFilesCount).toBe(backupResult.manifest.mediaFilesCount);
+    expect(
+      fs.existsSync(path.join(testMediaBase, 'receipts', 'manager_private_doc.png'))
+    ).toBe(true);
+  });
+
+  it('مرحله ۳ — آزمون اجباری ۱۰: اجرای بیلد نهایی (npm run build) و بررسی صحت فایل اجرایی استقرار cPanel (app.cjs و dist/index.html)', async () => {
+    const { stdout, stderr } = await execAsync('npm run build', {
+      cwd: process.cwd(),
+    });
+    expect(stdout + stderr).toContain('app.cjs');
+
+    const appCjsPath = path.resolve(process.cwd(), 'app.cjs');
+    const distIndexHtmlPath = path.resolve(process.cwd(), 'dist/index.html');
+
+    expect(fs.existsSync(appCjsPath)).toBe(true);
+    expect(fs.existsSync(distIndexHtmlPath)).toBe(true);
+
+    const appCjsStat = fs.statSync(appCjsPath);
+    const distIndexStat = fs.statSync(distIndexHtmlPath);
+    expect(appCjsStat.size).toBeGreaterThan(20_000);
+    expect(distIndexStat.size).toBeGreaterThan(200);
+  }, 60_000);
+
+  it('آزمون صورتحساب ماهانه و دوره‌ای (مثلاً از ۱۵ شهریور تا ۱۵ مهر): محاسبه دقیق حقوق + اضافه‌کاری، دریافتی/پرداختی و مانده دوره مجزا از مانده کل', () => {
+    const stmt = calculatePeriodStatement({
+      periodKey: 'cycle-1405/06/15-1405/07/15',
+      title: 'دوره ۱۵ شهریور تا ۱۵ مهر ۱۴۰۵',
+      fromShamsi: '1405/06/15',
+      toShamsi: '1405/07/15',
+      dailySummaries: [
+        {
+          work_date: '2026-09-06',
+          shamsi_date: '1405/06/15',
+          day_name: 'یکشنبه',
+          is_holiday_or_friday: false,
+          is_working_day: true,
+          logs: [
+            {
+              id: 1,
+              user_id: 2,
+              work_date: '2026-09-06',
+              shamsi_date: '1405/06/15',
+              event_type: 'WORK_START',
+              recorded_at: '',
+              recorded_time: '07:00:00',
+              note: null,
+              is_manual_override: false,
+              modified_by_user_id: null,
+              modification_reason: null,
+              is_deleted: false,
+              created_at: '',
+            },
+            {
+              id: 2,
+              user_id: 2,
+              work_date: '2026-09-06',
+              shamsi_date: '1405/06/15',
+              event_type: 'WORK_END',
+              recorded_at: '',
+              recorded_time: '17:00:00',
+              note: null,
+              is_manual_override: false,
+              modified_by_user_id: null,
+              modification_reason: null,
+              is_deleted: false,
+              created_at: '',
+            },
+          ],
+          first_in_time: '07:00',
+          last_out_time: '17:00',
+          is_incomplete: false,
+          is_late: false,
+          late_minutes: 0,
+          gross_presence_minutes: 600,
+          mission_minutes: 0,
+          break_deducted_minutes: 0,
+          net_work_minutes: 600, // ۸ ساعت کار عادی (۴۸۰ دقیقه) + ۲ ساعت اضافه‌کاری (۱۲۰ دقیقه)
+          provisional_work_minutes: 600,
+          overtime_minutes: 120,
+          status_label: 'ثبت قطعی',
+        },
+      ],
+      historicalRecords: [],
+      transactions: [
+        {
+          id: 10,
+          user_id: 2,
+          created_by_user_id: 1,
+          amount_toman: 500000,
+          tx_type: 'ADVANCE',
+          tx_date: '2026-09-10',
+          shamsi_date: '1405/06/19',
+          description: 'مساعده شهریور',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          manager_note: null,
+          idempotency_key: null,
+          created_at: '',
+        },
+        {
+          id: 11,
+          user_id: 2,
+          created_by_user_id: 2,
+          amount_toman: 200000,
+          tx_type: 'PETTY_CASH',
+          tx_date: '2026-09-12',
+          shamsi_date: '1405/06/21',
+          description: 'خرید ابزار کارگاه',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          manager_note: null,
+          idempotency_key: null,
+          created_at: '',
+        },
+      ],
+      settings: {
+        ...BASE_SETTINGS,
+        base_salary_toman: 19200000,
+        hourly_rate_toman: 100000,
+        overtime_calc_mode: 'FIXED_RATE',
+        overtime_rate_toman: 140000,
+      },
+    });
+
+    // ۸ ساعت کار عادی × ۱۰۰,۰۰۰ = ۸۰۰,۰۰۰ تومان
+    expect(stmt.earnedRegularSalaryToman).toBe(800000);
+    // ۲ ساعت اضافه‌کاری × ۱۴۰,۰۰۰ = ۲۸۰,۰۰۰ تومان
+    expect(stmt.earnedOvertimePayToman).toBe(280000);
+    // جمع حقوق + اضافه‌کاری دوره = ۱,۰۸۰,۰۰۰ تومان
+    expect(stmt.salaryPlusOvertimeToman).toBe(1080000);
+    // تنخواه تأییدشده = ۲۰۰,۰۰۰ تومان
+    expect(stmt.approvedPettyCashToman).toBe(200000);
+    // جمع کل استحقاقی دوره = ۱,۲۸۰,۰۰۰ تومان
+    expect(stmt.totalPeriodEntitlementToman).toBe(1280000);
+    // جمع کل دریافتی پرسنل / پرداختی مدیر در دوره = ۵۰۰,۰۰۰ تومان
+    expect(stmt.approvedTotalPaidOrReceivedToman).toBe(500000);
+    // مانده تسویه همین دوره = ۱,۲۸۰,۰۰۰ - ۵۰۰,۰۰۰ = ۷۸۰,۰۰۰ تومان
+    expect(stmt.periodBalanceToman).toBe(780000);
+
+    const periods = generateStatementPeriods({
+      mode: 'CONTRACT_CYCLE',
+      cycleStartDay: 15,
+      inclusiveEndDay: true,
+      currentShamsiDate: '1405/07/01',
+      collaborationStartShamsi: '1405/06/15',
+      dailySummaries: [],
+      transactions: [],
+      settings: BASE_SETTINGS,
+    });
+    expect(periods.length).toBeGreaterThan(0);
+    expect(periods.some((p) => p.fromShamsi === '1405/06/15' && p.toShamsi === '1405/07/15')).toBe(
+      true
+    );
+
+    // سناریوی واقعی ماه کاری ۲۶ روزه با پایه حقوق ۲۵,۰۰۰,۰۰۰ تومان و ۲ ماه کارکرد (۱۵ شهریور تا ۱۵ آبان) و ۴۰ میلیون پرداختی در ۱۴۰۵/۰۷/۱۵
+    const monthlyFixedSettings: SystemSettings = {
+      ...BASE_SETTINGS,
+      base_salary_toman: 25000000,
+      hourly_rate_toman: null,
+      overtime_calc_mode: 'PERCENTAGE',
+      overtime_percentage: 140,
+      overtime_rate_toman: null,
+      collaboration_start_shamsi: '1405/06/15',
+    };
+    const twoMonthsPeriods = generateStatementPeriods({
+      mode: 'CONTRACT_CYCLE',
+      cycleStartDay: 15,
+      inclusiveEndDay: true,
+      currentShamsiDate: '1405/08/02',
+      collaborationStartShamsi: '1405/06/15',
+      dailySummaries: [],
+      historicalRecords: [
+        {
+          id: 1,
+          user_id: 2,
+          created_by_user_id: 2,
+          work_date: '2026-09-06',
+          shamsi_date: '1405/06/15',
+          title: 'فایل اکسل دو ماهه',
+          work_days_count: 2,
+          net_work_minutes: 224 * 60 + 112 * 60,
+          overtime_minutes: 160 * 60,
+          note: 'اکسل کارکرد',
+          excel_file_url: null,
+          excel_file_name: null,
+          parsed_rows: [
+            {
+              shamsi_date: '1405/06/20',
+              title: 'کارکرد ماه اول',
+              work_days_count: 1,
+              check_in: '07:00',
+              check_out: '18:00',
+              net_work_minutes: 224 * 60,
+              overtime_minutes: 106 * 60,
+              note: 'کارکرد ماه اول',
+            },
+            {
+              shamsi_date: '1405/07/20',
+              title: 'کارکرد ماه دوم',
+              work_days_count: 1,
+              check_in: '07:00',
+              check_out: '18:00',
+              net_work_minutes: 112 * 60,
+              overtime_minutes: 54 * 60,
+              note: 'کارکرد ماه دوم',
+            },
+          ],
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          created_at: '',
+        },
+      ],
+      transactions: [
+        {
+          id: 99,
+          user_id: 2,
+          created_by_user_id: 1,
+          amount_toman: 40000000,
+          tx_type: 'SALARY',
+          tx_date: '2026-10-07',
+          shamsi_date: '1405/07/15',
+          description: 'پرداخت حقوق ماهانه',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          manager_note: null,
+          idempotency_key: null,
+          created_at: '',
+        },
+      ],
+      settings: monthlyFixedSettings,
+    });
+
+    const cycle1 = twoMonthsPeriods.find(
+      (p) => p.fromShamsi === '1405/06/15' && p.toShamsi === '1405/07/15'
+    )!;
+    const cycle2 = twoMonthsPeriods.find(
+      (p) => p.fromShamsi === '1405/07/15' && p.toShamsi === '1405/08/15'
+    )!;
+    expect(cycle1).toBeDefined();
+    expect(cycle2).toBeDefined();
+
+    // هر دو ماه فعال، حقوق کامل ۲۵,۰۰۰,۰۰۰ تومان می‌گیرند (نه روزشمار)
+    expect(cycle1.earnedRegularSalaryToman).toBe(25000000);
+    expect(cycle2.earnedRegularSalaryToman).toBe(25000000);
+
+    // پرداخت ۴۰ میلیون در ۱۴۰۵/۰۷/۱۵ فقط در ماه اول (۱۵ شهریور تا ۱۵ مهر) لحاظ می‌شود و در ماه دوم تکرار نمی‌شود
+    expect(cycle1.approvedTotalPaidOrReceivedToman).toBe(40000000);
+    expect(cycle2.approvedTotalPaidOrReceivedToman).toBe(0);
+
+    // مانده ماه اول و ماه دوم هر دو مثبت (بستانکار) هستند و پرسنل بدهکار نمی‌شود
+    expect(cycle1.periodBalanceToman).toBeGreaterThan(2800000);
+    expect(cycle2.periodBalanceToman).toBeGreaterThan(34000000);
+  });
 });
+
+
 

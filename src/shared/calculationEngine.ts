@@ -2,6 +2,7 @@ import {
   AttendanceEventType,
   AttendanceLog,
   DailyAttendanceSummary,
+  FinancialTransaction,
   HistoricalWorkRecord,
   SystemSettings,
   WorkerLiveState,
@@ -11,6 +12,7 @@ import {
   getDayOfWeekFromGregorian,
   getNowInTimezone,
   getPersianDayName,
+  getShamsiMonthDays,
   getShamsiMonthRange,
   gregorianToShamsi,
   isValidShamsiDate,
@@ -18,8 +20,10 @@ import {
   normalizeShamsiDate,
   pad2,
   parseTimeToMinutes,
+  PERSIAN_MONTHS,
   shamsiToGregorian,
   toEnglishDigits,
+  toPersianDigits,
 } from './jalali';
 
 function normalizeTimeHHMMSS(raw: string): string {
@@ -576,8 +580,35 @@ export function evaluateWorkerLiveState(
   };
 }
 
+export const STANDARD_MONTHLY_WORK_DAYS = 26;
+export const STANDARD_DAILY_WORK_HOURS = 8;
+export const STANDARD_MONTHLY_WORK_HOURS =
+  STANDARD_MONTHLY_WORK_DAYS * STANDARD_DAILY_WORK_HOURS; // 208 ساعت در ماه کاری ۲۶ روزه
+
+/**
+ * استخراج کلید دوره ماهانه (پیش‌فرض ۱۵ام هر ماه تا ۱۵ام ماه بعد) برای یک تاریخ شمسی
+ */
+export function getMonthlyCycleKeyForShamsiDate(
+  shamsiDate: string,
+  anchorDay = 15
+): string {
+  if (!shamsiDate || !isValidShamsiDate(shamsiDate)) {
+    return '1405/06/15';
+  }
+  const norm = normalizeShamsiDate(shamsiDate);
+  const [jy, jm, jd] = norm.split('/').map(Number);
+  const safeAnchor = Math.min(29, Math.max(1, Math.round(Number(anchorDay) || 15)));
+  if (jd >= safeAnchor) {
+    return `${jy}/${pad2(jm)}/${pad2(safeAnchor)}`;
+  }
+  const prevJm = jm === 1 ? 12 : jm - 1;
+  const prevJy = jm === 1 ? jy - 1 : jy;
+  return `${prevJy}/${pad2(prevJm)}/${pad2(safeAnchor)}`;
+}
+
 /**
  * محاسبه نرخ ساعتی و مبلغ اضافه‌کاری بر اساس تنظیمات مدیر (مبلغ ثابت یا درصدی از حقوق پایه)
+ * ماه کاری استاندارد: ۲۶ روز کاری (معادل ۲۰۸ ساعت کار عادی در ماه)
  * واحد تمام خروجی‌ها و ورودی‌ها: تومان (عدد صحیح گردشده با Math.round)
  */
 export function calculateSalaryAndOvertimeRates(
@@ -585,6 +616,7 @@ export function calculateSalaryAndOvertimeRates(
   totalOvertimeMinutes: number
 ): {
   baseSalaryToman: number;
+  dailyBaseRateToman: number;
   effectiveHourlyRateToman: number;
   effectiveOvertimeHourlyRateToman: number;
   totalOvertimePayToman: number;
@@ -595,12 +627,15 @@ export function calculateSalaryAndOvertimeRates(
       : 0;
   const safeOvertimeMinutes = Math.max(0, Number(totalOvertimeMinutes) || 0);
 
-  // اگر نرخ ساعتی مستقیم وارد شده باشد از آن استفاده می‌شود، وگرنه از تقسیم حقوق پایه بر ۱۹۲ ساعت کاری ماهانه به دست می‌آید
+  const dailyBaseRateToman =
+    baseSalaryToman > 0 ? Math.round(baseSalaryToman / STANDARD_MONTHLY_WORK_DAYS) : 0;
+
+  // اگر نرخ ساعتی مستقیم وارد شده باشد از آن استفاده می‌شود، وگرنه از تقسیم حقوق پایه بر ۲۰۸ ساعت (۲۶ روز کاری × ۸ ساعت) به دست می‌آید
   const effectiveHourlyRateToman =
     settings.hourly_rate_toman && settings.hourly_rate_toman > 0
       ? Math.round(settings.hourly_rate_toman)
       : baseSalaryToman > 0
-        ? Math.round(baseSalaryToman / 192)
+        ? Math.round(baseSalaryToman / STANDARD_MONTHLY_WORK_HOURS)
         : 0;
 
   let effectiveOvertimeHourlyRateToman = 0;
@@ -619,6 +654,7 @@ export function calculateSalaryAndOvertimeRates(
 
   return {
     baseSalaryToman,
+    dailyBaseRateToman,
     effectiveHourlyRateToman,
     effectiveOvertimeHourlyRateToman,
     totalOvertimePayToman,
@@ -659,6 +695,10 @@ export function resolveEffectiveSettingsForShamsiDate(
       return {
         ...currentSettings,
         ...snap.settings,
+        base_salary_toman:
+          snap.settings.base_salary_toman ?? currentSettings.base_salary_toman,
+        hourly_rate_toman:
+          snap.settings.hourly_rate_toman ?? currentSettings.hourly_rate_toman,
         banner_bg_url: currentSettings.banner_bg_url,
       };
     }
@@ -669,6 +709,10 @@ export function resolveEffectiveSettingsForShamsiDate(
   return {
     ...currentSettings,
     ...oldestSnap.settings,
+    base_salary_toman:
+      oldestSnap.settings.base_salary_toman ?? currentSettings.base_salary_toman,
+    hourly_rate_toman:
+      oldestSnap.settings.hourly_rate_toman ?? currentSettings.hourly_rate_toman,
     banner_bg_url: currentSettings.banner_bg_url,
   };
 }
@@ -852,4 +896,535 @@ export function calculateMonthlyPayrollPeriod(params: {
     dailySummaries: dailySummaries.sort((a, b) => b.work_date.localeCompare(a.work_date)),
   };
 }
+
+// ============================================================================
+// صورتحساب دقیق ماهانه (۱۵ام هر ماه تا ۱۵ام ماه بعد، بر پایه ماه کاری ۲۶ روزه)
+// ============================================================================
+
+export type StatementCycleMode = 'CONTRACT_CYCLE' | 'CALENDAR_MONTH' | 'CUSTOM_RANGE';
+
+export interface StatementDayDetail {
+  shamsiDate: string;
+  dayName: string;
+  regularWorkMinutes: number;
+  overtimeMinutes: number;
+  totalWorkMinutes: number;
+  regularPayToman: number;
+  overtimePayToman: number;
+  totalDayPayToman: number;
+  firstInTime: string | null;
+  lastOutTime: string | null;
+  statusLabel: string;
+  isHistorical: boolean;
+  workDaysCount: number;
+}
+
+export interface PeriodStatementSummary {
+  periodKey: string;
+  title: string;
+  subtitle: string;
+  fromShamsi: string;
+  toShamsi: string;
+  workDaysCount: number;
+  standardMonthlyWorkDays: number;
+  regularWorkMinutes: number;
+  overtimeMinutes: number;
+  totalNetWorkMinutes: number;
+  baseSalaryReferenceToman: number;
+  effectiveHourlyRateToman: number;
+  effectiveOvertimeHourlyRateToman: number;
+  earnedRegularSalaryToman: number;
+  earnedOvertimePayToman: number;
+  salaryPlusOvertimeToman: number;
+  approvedPettyCashToman: number;
+  totalPeriodEntitlementToman: number;
+  approvedTotalPaidOrReceivedToman: number;
+  salaryPaidToman: number;
+  advanceAndOnAccountPaidToman: number;
+  otherPaidForWorkerToman: number;
+  pendingAmountToman: number;
+  pendingCount: number;
+  periodBalanceToman: number;
+  salaryAndOvertimeBalanceToman: number;
+  dayDetails: StatementDayDetail[];
+  periodTransactions: FinancialTransaction[];
+}
+
+/**
+ * محاسبه دقیق صورتحساب یک ماه کاری (مثلاً از ۱۵ شهریور تا ۱۵ مهر)
+ * - در صورتی که حقوق پایه ماهانه (base_salary_toman) تنظیم شده باشد و قرارداد ساعتی دستی نباشد،
+ *   حقوق کارکرد ماه به صورت ماهانه (مبلغ کامل حقوق پایه ماهانه به ازای هر ماه کاری فعال ۱۵ام به ۱۵ام) محاسبه می‌شود
+ *   و نه روزبه‌روز، و اضافه‌کاری کل ماه به آن اضافه می‌گردد.
+ */
+export function calculatePeriodStatement(params: {
+  periodKey: string;
+  title: string;
+  subtitle?: string;
+  fromShamsi: string;
+  toShamsi: string;
+  txFromShamsi?: string;
+  txToShamsi?: string;
+  dailySummaries: DailyAttendanceSummary[];
+  historicalRecords?: HistoricalWorkRecord[];
+  transactions: FinancialTransaction[];
+  settings: SystemSettings;
+  snapshots?: { effective_from_shamsi: string; settings: SystemSettings }[];
+}): PeriodStatementSummary {
+  const {
+    periodKey,
+    title,
+    subtitle,
+    fromShamsi,
+    toShamsi,
+    txFromShamsi,
+    txToShamsi,
+    dailySummaries = [],
+    historicalRecords = [],
+    transactions = [],
+    settings,
+    snapshots = [],
+  } = params;
+
+  const normFrom = isValidShamsiDate(fromShamsi) ? normalizeShamsiDate(fromShamsi) : fromShamsi;
+  const normTo = isValidShamsiDate(toShamsi) ? normalizeShamsiDate(toShamsi) : toShamsi;
+  const normTxFrom = txFromShamsi && isValidShamsiDate(txFromShamsi) ? normalizeShamsiDate(txFromShamsi) : normFrom;
+  const normTxTo = txToShamsi && isValidShamsiDate(txToShamsi) ? normalizeShamsiDate(txToShamsi) : normTo;
+
+  const refSettings = resolveEffectiveSettingsForShamsiDate(normTo || normFrom, settings, snapshots);
+  const refRates = calculateSalaryAndOvertimeRates(refSettings, 0);
+
+  let workDaysCount = 0;
+  let regularWorkMinutes = 0;
+  let overtimeMinutes = 0;
+  let totalNetWorkMinutes = 0;
+  let hourlyAccumRegularSalaryToman = 0;
+  let earnedOvertimePayToman = 0;
+
+  const dayDetails: StatementDayDetail[] = [];
+  const coveredDates = new Set<string>();
+  const activeMonthlyCycles = new Set<string>();
+
+  for (const day of dailySummaries) {
+    if (!day.shamsi_date) continue;
+    const normDate = isValidShamsiDate(day.shamsi_date)
+      ? normalizeShamsiDate(day.shamsi_date)
+      : day.shamsi_date;
+
+    if (normDate < normFrom || normDate > normTo) {
+      continue;
+    }
+
+    if (day.is_incomplete) {
+      continue;
+    }
+
+    const isLiveLogDay = Array.isArray(day.logs) && day.logs.length > 0;
+    const hasHistoricalWork =
+      !isLiveLogDay && (day.net_work_minutes > 0 || day.overtime_minutes > 0);
+
+    if (!isLiveLogDay && !hasHistoricalWork) {
+      continue;
+    }
+
+    coveredDates.add(normDate);
+    activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normDate, 15));
+
+    const effDaySettings = resolveEffectiveSettingsForShamsiDate(normDate, settings, snapshots);
+    const dayOtMins = Math.max(0, Number(day.overtime_minutes) || 0);
+    const dayRegMins = isLiveLogDay
+      ? Math.max(0, Number(day.net_work_minutes || 0) - dayOtMins)
+      : Math.max(0, Number(day.net_work_minutes || 0));
+    const dayTotalMins = isLiveLogDay
+      ? Math.max(0, Number(day.net_work_minutes || 0))
+      : dayRegMins + dayOtMins;
+
+    const dayRates = calculateSalaryAndOvertimeRates(effDaySettings, dayOtMins);
+    const dayRegPay = Math.round((dayRegMins / 60) * dayRates.effectiveHourlyRateToman);
+    const dayOtPay = dayRates.totalOvertimePayToman;
+
+    workDaysCount += 1;
+    regularWorkMinutes += dayRegMins;
+    overtimeMinutes += dayOtMins;
+    totalNetWorkMinutes += dayTotalMins;
+    hourlyAccumRegularSalaryToman += dayRegPay;
+    earnedOvertimePayToman += dayOtPay;
+
+    dayDetails.push({
+      shamsiDate: normDate,
+      dayName: day.day_name || '',
+      regularWorkMinutes: dayRegMins,
+      overtimeMinutes: dayOtMins,
+      totalWorkMinutes: dayTotalMins,
+      regularPayToman: dayRegPay,
+      overtimePayToman: dayOtPay,
+      totalDayPayToman: dayRegPay + dayOtPay,
+      firstInTime: day.first_in_time,
+      lastOutTime: day.last_out_time,
+      statusLabel: day.status_label || 'ثبت قطعی',
+      isHistorical: !isLiveLogDay,
+      workDaysCount: 1,
+    });
+  }
+
+  for (const rec of historicalRecords) {
+    if (rec.status !== 'APPROVED') continue;
+    if (rec.parsed_rows && rec.parsed_rows.length > 0) {
+      for (const row of rec.parsed_rows) {
+        if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
+        const normRowDate = normalizeShamsiDate(row.shamsi_date);
+        if (normRowDate < normFrom || normRowDate > normTo) continue;
+        if (coveredDates.has(normRowDate)) continue;
+        coveredDates.add(normRowDate);
+        activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normRowDate, 15));
+
+        const rowRegMins = Math.max(0, Number(row.net_work_minutes || 0));
+        const rowOtMins = Math.max(0, Number(row.overtime_minutes || 0));
+        const effRowSettings = resolveEffectiveSettingsForShamsiDate(
+          normRowDate,
+          settings,
+          snapshots
+        );
+        const rowRates = calculateSalaryAndOvertimeRates(effRowSettings, rowOtMins);
+        const rowRegPay = Math.round((rowRegMins / 60) * rowRates.effectiveHourlyRateToman);
+        const rowOtPay = rowRates.totalOvertimePayToman;
+
+        workDaysCount += Number(row.work_days_count || 1);
+        regularWorkMinutes += rowRegMins;
+        overtimeMinutes += rowOtMins;
+        totalNetWorkMinutes += rowRegMins;
+        hourlyAccumRegularSalaryToman += rowRegPay;
+        earnedOvertimePayToman += rowOtPay;
+
+        dayDetails.push({
+          shamsiDate: normRowDate,
+          dayName: '',
+          regularWorkMinutes: rowRegMins,
+          overtimeMinutes: rowOtMins,
+          totalWorkMinutes: rowRegMins + rowOtMins,
+          regularPayToman: rowRegPay,
+          overtimePayToman: rowOtPay,
+          totalDayPayToman: rowRegPay + rowOtPay,
+          firstInTime: row.check_in || null,
+          lastOutTime: row.check_out || null,
+          statusLabel: row.note || row.title || rec.title || 'سابقه کارکرد',
+          isHistorical: true,
+          workDaysCount: Number(row.work_days_count || 1),
+        });
+      }
+    } else {
+      const normRecDate = isValidShamsiDate(rec.shamsi_date)
+        ? normalizeShamsiDate(rec.shamsi_date)
+        : rec.shamsi_date;
+      if (!normRecDate || normRecDate < normFrom || normRecDate > normTo) continue;
+      if (rec.work_days_count === 1 && coveredDates.has(normRecDate)) continue;
+      if (rec.work_days_count === 1) coveredDates.add(normRecDate);
+      activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normRecDate, 15));
+
+      const recRegMins = Math.max(0, Number(rec.net_work_minutes || 0));
+      const recOtMins = Math.max(0, Number(rec.overtime_minutes || 0));
+      const effRecSettings = resolveEffectiveSettingsForShamsiDate(
+        normRecDate,
+        settings,
+        snapshots
+      );
+      const recRates = calculateSalaryAndOvertimeRates(effRecSettings, recOtMins);
+      const recRegPay = Math.round((recRegMins / 60) * recRates.effectiveHourlyRateToman);
+      const recOtPay = recRates.totalOvertimePayToman;
+
+      workDaysCount += Number(rec.work_days_count || 1);
+      regularWorkMinutes += recRegMins;
+      overtimeMinutes += recOtMins;
+      totalNetWorkMinutes += recRegMins;
+      hourlyAccumRegularSalaryToman += recRegPay;
+      earnedOvertimePayToman += recOtPay;
+
+      dayDetails.push({
+        shamsiDate: normRecDate,
+        dayName: '',
+        regularWorkMinutes: recRegMins,
+        overtimeMinutes: recOtMins,
+        totalWorkMinutes: recRegMins + recOtMins,
+        regularPayToman: recRegPay,
+        overtimePayToman: recOtPay,
+        totalDayPayToman: recRegPay + recOtPay,
+        firstInTime: null,
+        lastOutTime: null,
+        statusLabel: rec.title || rec.note || 'سابقه کارکرد تجمیعی',
+        isHistorical: true,
+        workDaysCount: Number(rec.work_days_count || 1),
+      });
+    }
+  }
+
+  dayDetails.sort((a, b) => b.shamsiDate.localeCompare(a.shamsiDate));
+
+  // اگر حقوق پایه ماهانه تنظیم شده باشد و نرخ ساعتی دستی جداگانه وارد نشده باشد،
+  // محاسبه حقوق به صورت ماهانه (مبلغ کامل حقوق پایه ماهانه برای هر دوره ماهانه فعال) انجام می‌شود.
+  const isMonthlyFixedSalaryMode =
+    refRates.baseSalaryToman > 0 &&
+    (!refSettings.hourly_rate_toman || refSettings.hourly_rate_toman <= 0);
+
+  let earnedRegularSalaryToman = 0;
+  if (workDaysCount > 0) {
+    if (isMonthlyFixedSalaryMode) {
+      const cyclesCount = Math.max(1, activeMonthlyCycles.size);
+      earnedRegularSalaryToman = refRates.baseSalaryToman * cyclesCount;
+    } else {
+      earnedRegularSalaryToman = hourlyAccumRegularSalaryToman;
+    }
+  }
+
+  // فیلتر تراکنش‌های مالی در این بازه زمانی
+  const periodTransactions = transactions
+    .filter((tx) => {
+      if (!tx.shamsi_date) return false;
+      const normTxDate = isValidShamsiDate(tx.shamsi_date)
+        ? normalizeShamsiDate(tx.shamsi_date)
+        : tx.shamsi_date;
+      return normTxDate >= normTxFrom && normTxDate <= normTxTo;
+    })
+    .sort((a, b) => b.shamsi_date.localeCompare(a.shamsi_date) || b.id - a.id);
+
+  let approvedPettyCashToman = 0;
+  let approvedTotalPaidOrReceivedToman = 0;
+  let salaryPaidToman = 0;
+  let advanceAndOnAccountPaidToman = 0;
+  let otherPaidForWorkerToman = 0;
+  let pendingAmountToman = 0;
+  let pendingCount = 0;
+
+  for (const tx of periodTransactions) {
+    const amt = Math.max(0, Math.round(Number(tx.amount_toman) || 0));
+    if (tx.status === 'PENDING') {
+      pendingAmountToman += amt;
+      pendingCount += 1;
+      continue;
+    }
+    if (tx.status !== 'APPROVED') {
+      continue;
+    }
+
+    if (tx.tx_type === 'PETTY_CASH') {
+      approvedPettyCashToman += amt;
+    } else {
+      approvedTotalPaidOrReceivedToman += amt;
+      if (tx.tx_type === 'SALARY') {
+        salaryPaidToman += amt;
+      } else if (tx.tx_type === 'ADVANCE' || tx.tx_type === 'ON_ACCOUNT') {
+        advanceAndOnAccountPaidToman += amt;
+      } else {
+        otherPaidForWorkerToman += amt;
+      }
+    }
+  }
+
+  const salaryPlusOvertimeToman = earnedRegularSalaryToman + earnedOvertimePayToman;
+  const totalPeriodEntitlementToman = salaryPlusOvertimeToman + approvedPettyCashToman;
+  const periodBalanceToman = totalPeriodEntitlementToman - approvedTotalPaidOrReceivedToman;
+  const salaryAndOvertimeBalanceToman =
+    salaryPlusOvertimeToman - approvedTotalPaidOrReceivedToman;
+
+  const formattedSubtitle =
+    subtitle ||
+    `از ${toPersianDigits(normFrom)} تا ${toPersianDigits(normTo)}`;
+
+  return {
+    periodKey,
+    title,
+    subtitle: formattedSubtitle,
+    fromShamsi: normFrom,
+    toShamsi: normTo,
+    workDaysCount,
+    standardMonthlyWorkDays: STANDARD_MONTHLY_WORK_DAYS,
+    regularWorkMinutes,
+    overtimeMinutes,
+    totalNetWorkMinutes,
+    baseSalaryReferenceToman: refRates.baseSalaryToman,
+    effectiveHourlyRateToman: refRates.effectiveHourlyRateToman,
+    effectiveOvertimeHourlyRateToman: refRates.effectiveOvertimeHourlyRateToman,
+    earnedRegularSalaryToman,
+    earnedOvertimePayToman,
+    salaryPlusOvertimeToman,
+    approvedPettyCashToman,
+    totalPeriodEntitlementToman,
+    approvedTotalPaidOrReceivedToman,
+    salaryPaidToman,
+    advanceAndOnAccountPaidToman,
+    otherPaidForWorkerToman,
+    pendingAmountToman,
+    pendingCount,
+    periodBalanceToman,
+    salaryAndOvertimeBalanceToman,
+    dayDetails,
+    periodTransactions,
+  };
+}
+
+/**
+ * تولید لیست دوره‌های ماهانه (۱۵ام به ۱۵ام هر ماه، مثلاً ۱۵ شهریور تا ۱۵ مهر)
+ * بدون هم‌پوشانی روزها یا پرداختی‌ها بین دو ماه متوالی
+ */
+export function generateStatementPeriods(params: {
+  mode?: 'CONTRACT_CYCLE' | 'CALENDAR_MONTH';
+  cycleStartDay?: number;
+  inclusiveEndDay?: boolean;
+  currentShamsiDate: string;
+  collaborationStartShamsi?: string | null;
+  dailySummaries: DailyAttendanceSummary[];
+  historicalRecords?: HistoricalWorkRecord[];
+  transactions: FinancialTransaction[];
+  settings: SystemSettings;
+  snapshots?: { effective_from_shamsi: string; settings: SystemSettings }[];
+}): PeriodStatementSummary[] {
+  const {
+    mode = 'CONTRACT_CYCLE',
+    cycleStartDay = 15,
+    currentShamsiDate,
+    collaborationStartShamsi,
+    dailySummaries = [],
+    historicalRecords = [],
+    transactions = [],
+    settings,
+    snapshots = [],
+  } = params;
+
+  const safeAnchorDay = Math.min(29, Math.max(1, Math.round(Number(cycleStartDay) || 15)));
+  const rawCollabStart =
+    collaborationStartShamsi || settings.collaboration_start_shamsi || '1405/06/15';
+  const normCollabStart = isValidShamsiDate(rawCollabStart)
+    ? normalizeShamsiDate(rawCollabStart)
+    : '1405/06/15';
+
+  // جمع‌آوری تمام سال/ماه‌های شمسی موجود در داده‌ها + ماه جاری و ماه شروع همکاری
+  const yearMonthSet = new Set<string>();
+
+  const addYearMonthFromDate = (rawDate: string | null | undefined) => {
+    if (!rawDate || !isValidShamsiDate(rawDate)) return;
+    const norm = normalizeShamsiDate(rawDate);
+    const [jy, jm, jd] = norm.split('/').map(Number);
+    if (jy && jm) {
+      yearMonthSet.add(`${jy}/${pad2(jm)}`);
+      if (jd < safeAnchorDay) {
+        const prevJm = jm === 1 ? 12 : jm - 1;
+        const prevJy = jm === 1 ? jy - 1 : jy;
+        yearMonthSet.add(`${prevJy}/${pad2(prevJm)}`);
+      }
+    }
+  };
+
+  addYearMonthFromDate(currentShamsiDate);
+  addYearMonthFromDate(normCollabStart);
+
+  for (const d of dailySummaries) {
+    addYearMonthFromDate(d.shamsi_date);
+  }
+  for (const h of historicalRecords) {
+    addYearMonthFromDate(h.shamsi_date);
+    if (h.parsed_rows) {
+      for (const r of h.parsed_rows) {
+        addYearMonthFromDate(r.shamsi_date);
+      }
+    }
+  }
+  for (const t of transactions) {
+    addYearMonthFromDate(t.shamsi_date);
+  }
+
+  const sortedYearMonths = Array.from(yearMonthSet)
+    .map((ym) => {
+      const [jy, jm] = ym.split('/').map(Number);
+      return { key: ym, jy, jm };
+    })
+    .filter((item) => item.jy >= 1390 && item.jy <= 1450 && item.jm >= 1 && item.jm <= 12)
+    .sort((a, b) => (a.jy !== b.jy ? b.jy - a.jy : b.jm - a.jm));
+
+  const results: PeriodStatementSummary[] = [];
+
+  for (const { jy, jm } of sortedYearMonths) {
+    if (mode === 'CALENDAR_MONTH') {
+      const mLen = getShamsiMonthDays(jy, jm);
+      const fromShamsi = `${jy}/${pad2(jm)}/01`;
+      const toShamsi = `${jy}/${pad2(jm)}/${pad2(mLen)}`;
+      const mName = PERSIAN_MONTHS[jm - 1] || '';
+      const title = `${mName} ${toPersianDigits(jy)}`;
+      const subtitle = `۱ ${mName} تا ${toPersianDigits(mLen)} ${mName} ${toPersianDigits(jy)}`;
+
+      const stmt = calculatePeriodStatement({
+        periodKey: `cal-${jy}-${pad2(jm)}`,
+        title,
+        subtitle,
+        fromShamsi,
+        toShamsi,
+        dailySummaries,
+        historicalRecords,
+        transactions,
+        settings,
+        snapshots,
+      });
+      results.push(stmt);
+    } else {
+      // CONTRACT_CYCLE: دوره ماهانه ۱۵ام به ۱۵ام (مثلاً ۱۵ شهریور تا ۱۵ مهر)
+      const startMonthLen = getShamsiMonthDays(jy, jm);
+      const startDay = Math.min(safeAnchorDay, startMonthLen);
+      const fromShamsi = `${jy}/${pad2(jm)}/${pad2(startDay)}`;
+
+      const nextJm = jm === 12 ? 1 : jm + 1;
+      const nextJy = jm === 12 ? jy + 1 : jy;
+      const nextMonthLen = getShamsiMonthDays(nextJy, nextJm);
+
+      // روزهای کاری هر ماه از ۱۵ام ماه اول تا ۱۴ام ماه بعد است تا روز ۱۵ام در دو ماه متوالی دوبار شمارش نشود
+      const workEndDay = Math.min(Math.max(1, safeAnchorDay - 1), nextMonthLen);
+      const workToShamsi = `${nextJy}/${pad2(nextJm)}/${pad2(workEndDay)}`;
+
+      // پرداختی‌ها و تسویه حقوق در روز ۱۵ام ماه بعد (مثلاً پرداخت حقوق در ۱۵ مهر) متعلق به تسویه همان ماهِ پایان‌یافته (۱۵ شهریور تا ۱۵ مهر) است
+      const txStartDay =
+        fromShamsi <= normCollabStart ? startDay : Math.min(startMonthLen, startDay + 1);
+      const txFromShamsi = `${jy}/${pad2(jm)}/${pad2(txStartDay)}`;
+      const txEndDay = Math.min(safeAnchorDay, nextMonthLen);
+      const displayEndShamsi = `${nextJy}/${pad2(nextJm)}/${pad2(txEndDay)}`;
+
+      const startMonthName = PERSIAN_MONTHS[jm - 1] || '';
+      const nextMonthName = PERSIAN_MONTHS[nextJm - 1] || '';
+      const displayEndDayLabel = toPersianDigits(safeAnchorDay);
+      const title = `ماه ${toPersianDigits(startDay)} ${startMonthName} تا ${displayEndDayLabel} ${nextMonthName} ${toPersianDigits(nextJy)}`;
+      const subtitle = `از ${toPersianDigits(fromShamsi)} تا ${toPersianDigits(displayEndShamsi)}`;
+
+      const stmt = calculatePeriodStatement({
+        periodKey: `cycle-${fromShamsi}-${displayEndShamsi}`,
+        title,
+        subtitle,
+        fromShamsi,
+        toShamsi: workToShamsi,
+        txFromShamsi,
+        txToShamsi: displayEndShamsi,
+        dailySummaries,
+        historicalRecords,
+        transactions,
+        settings,
+        snapshots,
+      });
+      // نمایش بازه ۱۵ام به ۱۵ام برای خوانایی کاربر
+      stmt.toShamsi = displayEndShamsi;
+      results.push(stmt);
+    }
+  }
+
+  const normNow = isValidShamsiDate(currentShamsiDate)
+    ? normalizeShamsiDate(currentShamsiDate)
+    : '1405/08/01';
+
+  const filtered = results.filter((stmt, idx) => {
+    const isCurrentPeriod = normNow >= stmt.fromShamsi && normNow <= stmt.toShamsi;
+    const hasData =
+      stmt.workDaysCount > 0 ||
+      stmt.totalNetWorkMinutes > 0 ||
+      stmt.overtimeMinutes > 0 ||
+      stmt.periodTransactions.length > 0;
+    return isCurrentPeriod || hasData || idx === 0;
+  });
+
+  return filtered.length > 0 ? filtered : results.slice(0, 3);
+}
+
+
 

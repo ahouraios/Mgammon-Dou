@@ -21,6 +21,7 @@ interface HeroBannerProps {
   statusDetail?: string;
   isOvertimeActive?: boolean;
   onRefresh?: () => void;
+  loading?: boolean;
 }
 
 const LIVE_STATUS_BADGE: Record<

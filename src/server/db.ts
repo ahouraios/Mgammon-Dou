@@ -1,5 +1,6 @@
 import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { exec, spawn } from 'child_process';
@@ -9,27 +10,52 @@ import { OvertimeCalcMode, SystemSettings } from '../shared/types';
 const execAsync = promisify(exec);
 
 let pool: mysql.Pool | null = null;
+let currentPoolDbName = '';
+let dbInitialized = false;
+let dbInitializingPromise: Promise<void> | null = null;
+let lastDbError: string | null = null;
 let localMariaDbBootstrapped = false;
 let localMariaDbBootstrapPromise: Promise<void> | null = null;
+
+let simulatedDisconnect = false;
+let simulatedMidTxFailureTag: string | null = null;
 
 const PLACEHOLDER_DB_USERS = new Set(['', 'cpanel_username_mgammon', 'your_db_user']);
 const PLACEHOLDER_DB_PASSWORDS = new Set(['', 'YOUR_STRONG_MYSQL_PASSWORD', 'your_db_password']);
 const PLACEHOLDER_DB_NAMES = new Set(['', 'cpanel_username_mgammon_duo', 'your_db_name']);
 
-export function getDbConfig() {
-  const rawUser = (process.env.DB_USER || '').trim();
-  const rawPassword = process.env.DB_PASSWORD || '';
-  const rawDbName = (process.env.DB_NAME || '').trim();
+export function sanitizeDbErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err || 'Unknown database error');
+  return raw
+    .replace(/(password|passwd|pwd|token|secret|authorization|key)\s*[:=]\s*[^\s,;'"&]+/gi, '$1=[REDACTED]')
+    .replace(/using password:\s*(YES|NO)/gi, 'using password: [REDACTED]')
+    .replace(/'[^']*'@'[^']*'/g, "'[USER]'@'[HOST]'");
+}
+
+export function isCpanelOrProductionEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.NODE_ENV === 'production') return true;
+  if (env.CPANEL_ENV === 'true' || env.CPANEL === '1') return true;
+  const rawUser = (env.DB_USER || '').trim();
+  if (rawUser && !PLACEHOLDER_DB_USERS.has(rawUser) && rawUser !== 'root') {
+    return true;
+  }
+  return false;
+}
+
+export function getDbConfig(env: NodeJS.ProcessEnv = process.env) {
+  const rawUser = (env.DB_USER || '').trim();
+  const rawPassword = env.DB_PASSWORD || '';
+  const rawDbName = (env.DB_NAME || '').trim();
 
   return {
-    host: process.env.DB_HOST || '127.0.0.1',
-    port: Number(process.env.DB_PORT || 3306),
+    host: env.DB_HOST || '127.0.0.1',
+    port: Number(env.DB_PORT || 3306),
     user: PLACEHOLDER_DB_USERS.has(rawUser) ? 'root' : rawUser,
     password: PLACEHOLDER_DB_PASSWORDS.has(rawPassword) ? '' : rawPassword,
     database: PLACEHOLDER_DB_NAMES.has(rawDbName) ? 'mgammon_duo' : rawDbName,
     waitForConnections: true,
     connectionLimit: 10,
-    connectTimeout: 4000,
+    connectTimeout: 5000,
     queueLimit: 0,
     charset: 'utf8mb4',
     timezone: '+03:30',
@@ -46,24 +72,55 @@ async function hasMariadbdBinary(): Promise<boolean> {
   }
 }
 
+/**
+ * فقط در محیط توسعه/آزمایشی کانتینر (غیرعملیاتی) در صورت عدم اجرای سرویس محلی MariaDB آن را راه‌اندازی می‌کند.
+ * در محیط عملیاتی cPanel یا هر زمانی که کاربر دیتابیس غیر از root باشد یا سرویس MySQL در دسترس باشد،
+ * هیچ دستور سیستمی، نصب بسته، تغییر مالکیت پوشه یا تغییر رمز root اجرا نمی‌شود.
+ */
 async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
-  if (localMariaDbBootstrapped) return;
+  if (isCpanelOrProductionEnvironment(process.env)) {
+    localMariaDbBootstrapped = true;
+    return;
+  }
+
+  const cfg = getDbConfig();
+  const isLocalHost = cfg.host === '127.0.0.1' || cfg.host === 'localhost';
+  if (!isLocalHost || cfg.user !== 'root') {
+    localMariaDbBootstrapped = true;
+    return;
+  }
+
+  const safeDbName = cfg.database.replace(/[^a-zA-Z0-9_]/g, '');
+
+  // ۱. ابتدا بررسی می‌کنیم آیا سرویس MySQL/MariaDB همین الان در دسترس است؟
+  try {
+    const probeConn = await mysql.createConnection({
+      host: cfg.host,
+      port: cfg.port,
+      user: cfg.user,
+      password: cfg.password,
+      connectTimeout: 1500,
+    });
+    await probeConn.query(
+      `CREATE DATABASE IF NOT EXISTS \`${safeDbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+    );
+    await probeConn.end();
+    localMariaDbBootstrapped = true;
+    return;
+  } catch {
+    // سرویس محلی هنوز بالا نیامده است؛ ادامه برای راه‌اندازی سندباکس توسعه
+  }
+
   if (localMariaDbBootstrapPromise) {
     return localMariaDbBootstrapPromise;
   }
 
   localMariaDbBootstrapPromise = (async () => {
-    const cfg = getDbConfig();
-    const isLocal = cfg.host === '127.0.0.1' || cfg.host === 'localhost';
-    if (!isLocal) {
-      localMariaDbBootstrapped = true;
-      return;
-    }
-
     try {
       const persistentDataDir = path.resolve(process.cwd(), '.data/mysql');
-
-      const hasMariadbd = await hasMariadbdBinary();
+      const debCacheDir = path.resolve(process.cwd(), '.data/deb-cache');
+      fs.mkdirSync(debCacheDir, { recursive: true });
+      let hasMariadbd = await hasMariadbdBinary();
 
       if (!hasMariadbd && fs.existsSync('/etc/debian_version')) {
         try {
@@ -79,11 +136,16 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
 
         try {
           await execAsync(
-            'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" mariadb-server'
+            `DEBIAN_FRONTEND=noninteractive dpkg --configure -a && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Dir::Cache::archives="${debCacheDir}" mariadb-server`
           );
         } catch {
           // ignore
         }
+        hasMariadbd = await hasMariadbdBinary();
+      }
+
+      if (!hasMariadbd) {
+        return;
       }
 
       const isSocketReady = () =>
@@ -103,7 +165,7 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
         try {
           await execAsync(`chown -R mysql:mysql /run/mysqld "${persistentDataDir}"`);
         } catch {
-          // ignore if mysql user not present
+          // ignore
         }
 
         const child = spawn(
@@ -123,11 +185,11 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
           }
         );
         child.on('error', () => {
-          // نادیده گرفتن خطا در صورتی که باینری mariadbd روی هاست خارجی نصب نباشد
+          // ignore
         });
         child.unref();
 
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 25; i++) {
           if (isSocketReady()) {
             return true;
           }
@@ -140,10 +202,8 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
         fs.mkdirSync('/run/mysqld', { recursive: true });
         fs.mkdirSync(persistentDataDir, { recursive: true });
 
-        // اگر فایل tablespace اصلی InnoDB (ibdata1) وجود نداشته باشد، دایرکتوری ناقص است و باید بازسازی شود
         if (
           !fs.existsSync(path.join(persistentDataDir, 'mysql')) ||
-          !fs.existsSync(path.join(persistentDataDir, 'ib_logfile0')) ||
           !fs.existsSync(path.join(persistentDataDir, 'ibdata1'))
         ) {
           try {
@@ -164,12 +224,11 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
         }
       }
 
-      const safeDbName = cfg.database.replace(/[^a-zA-Z0-9_]/g, '');
       await execAsync(
         `mysql -u root -e "CREATE DATABASE IF NOT EXISTS \\\`${safeDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD(''); GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('') WITH GRANT OPTION; FLUSH PRIVILEGES;"`
       );
     } catch {
-      // در هاست اشتراکی cPanel سرویس MySQL از قبل توسط هاست اجرا شده است
+      // در محیط هاست واقعی سرویس از قبل توسط سرور مدیریت می‌شود
     } finally {
       localMariaDbBootstrapped = true;
       localMariaDbBootstrapPromise = null;
@@ -179,48 +238,121 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
   return localMariaDbBootstrapPromise;
 }
 
-let simulatedDisconnect = false;
-
 export function setSimulatedDatabaseDisconnect(disconnected: boolean): void {
   simulatedDisconnect = disconnected;
+}
+
+export function setSimulatedMidTransactionFailure(operationTag: string | null): void {
+  simulatedMidTxFailureTag = operationTag;
+}
+
+export function getSimulatedMidTransactionFailure(): string | null {
+  return simulatedMidTxFailureTag;
+}
+
+export function isDatabaseInitialized(): boolean {
+  const cfg = getDbConfig();
+  return dbInitialized && !simulatedDisconnect && currentPoolDbName === cfg.database;
+}
+
+export function setDatabaseInitializedForTest(ready: boolean): void {
+  dbInitialized = ready;
+}
+
+export async function resetPool(): Promise<void> {
+  dbInitialized = false;
+  dbInitializingPromise = null;
+  if (pool) {
+    try {
+      await pool.end();
+    } catch {
+      // ignore
+    }
+    pool = null;
+  }
+  currentPoolDbName = '';
 }
 
 export function getPool(): mysql.Pool {
   if (simulatedDisconnect) {
     throw new Error('SIMULATED_DB_DISCONNECT');
   }
-  if (!pool) {
-    pool = mysql.createPool(getDbConfig());
+  const cfg = getDbConfig();
+  if (!pool || currentPoolDbName !== cfg.database) {
+    if (pool) {
+      pool.end().catch(() => {});
+    }
+    pool = mysql.createPool(cfg);
+    currentPoolDbName = cfg.database;
   }
   return pool;
 }
 
+/**
+ * اجرای امن عملیات چندمرحله‌ای در قالب تراکنش اتمیک دیتابیس (ACID Transaction)
+ * همراه با پشتیبانی از شبیه‌سازی قطع ارتباط در میانه تراکنش برای آزمون‌های پایداری.
+ */
+export async function withTransaction<T>(
+  fn: (conn: mysql.PoolConnection) => Promise<T>,
+  operationTag?: string
+): Promise<T> {
+  const p = getPool();
+  const conn = await p.getConnection();
+  try {
+    await conn.beginTransaction();
+    const result = await fn(conn);
+    if (simulatedDisconnect || (operationTag && simulatedMidTxFailureTag === operationTag)) {
+      throw new Error('SIMULATED_DB_DISCONNECT');
+    }
+    await conn.commit();
+    return result;
+  } catch (err) {
+    try {
+      await conn.rollback();
+    } catch {
+      // ignore rollback error on dead connection
+    }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
 export async function checkDatabaseConnection(): Promise<{
   connected: boolean;
+  initialized: boolean;
   message?: string;
 }> {
   if (simulatedDisconnect) {
     return {
       connected: false,
+      initialized: false,
       message: 'ارتباط با پایگاه داده MySQL موقتاً در دسترس نیست.',
     };
   }
   if (process.env.SIMULATE_DB_DOWN === 'true') {
     return {
       connected: false,
+      initialized: false,
       message: 'ارتباط با سرور برقرار نیست.',
     };
   }
-  try {
-    if (!localMariaDbBootstrapped) {
-      await ensureLocalMariaDbRunningIfNeeded();
-    }
-    const p = getPool();
-    await p.execute('SELECT 1 AS ok');
-    return { connected: true };
-  } catch {
+  if (!isDatabaseInitialized()) {
     return {
       connected: false,
+      initialized: false,
+      message: lastDbError || 'پایگاه داده هنوز آماده بهره‌برداری نیست.',
+    };
+  }
+  try {
+    const p = getPool();
+    await p.execute('SELECT 1 AS ok');
+    return { connected: true, initialized: true };
+  } catch (err) {
+    lastDbError = sanitizeDbErrorMessage(err);
+    return {
+      connected: false,
+      initialized: false,
       message: 'ارتباط با سرور برقرار نیست. لطفاً اتصال را بررسی کنید.',
     };
   }
@@ -275,211 +407,777 @@ export function validateProductionSecurityConfig(env: NodeJS.ProcessEnv = proces
   }
 }
 
-export async function initializeDatabase(): Promise<void> {
-  validateProductionSecurityConfig(process.env);
-  await ensureLocalMariaDbRunningIfNeeded();
+// ============================================================================
+// توابع کمکی مهاجرت سازگار با هر دو موتور MySQL 5.7/8.0+ و MariaDB 10.3+
+// (استفاده از INFORMATION_SCHEMA به جای نحو غیرستاندارد ADD COLUMN IF NOT EXISTS)
+// ============================================================================
+export async function columnExists(
+  p: mysql.Pool,
+  tableName: string,
+  columnName: string
+): Promise<boolean> {
+  const [rows] = await p.execute<mysql.RowDataPacket[]>(
+    `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+     LIMIT 1`,
+    [tableName, columnName]
+  );
+  return rows.length > 0;
+}
 
-  const p = getPool();
-  const schemaPath = path.resolve(process.cwd(), 'database/schema.sql');
-  const schemaSql = fs.readFileSync(schemaPath, 'utf8');
+export async function ensureColumnExists(
+  p: mysql.Pool,
+  tableName: string,
+  columnName: string,
+  columnDefinitionSql: string
+): Promise<boolean> {
+  const exists = await columnExists(p, tableName, columnName);
+  if (exists) return false;
+  await p.query(`ALTER TABLE \`${tableName}\` ADD COLUMN \`${columnName}\` ${columnDefinitionSql}`);
+  return true;
+}
 
-  const cleanedSql = schemaSql
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('--'))
-    .join('\n');
+export async function indexExists(
+  p: mysql.Pool,
+  tableName: string,
+  indexName: string
+): Promise<boolean> {
+  const [rows] = await p.execute<mysql.RowDataPacket[]>(
+    `SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?
+     LIMIT 1`,
+    [tableName, indexName]
+  );
+  return rows.length > 0;
+}
 
-  const statements = cleanedSql
-    .split(/;\s*(?:\n|$)/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+export async function ensureIndexExists(
+  p: mysql.Pool,
+  tableName: string,
+  indexName: string,
+  indexSql: string
+): Promise<boolean> {
+  const exists = await indexExists(p, tableName, indexName);
+  if (exists) return false;
+  await p.query(`ALTER TABLE \`${tableName}\` ADD ${indexSql}`);
+  return true;
+}
 
-  for (const stmt of statements) {
-    await p.query(stmt);
+export async function foreignKeyExists(
+  p: mysql.Pool,
+  tableName: string,
+  constraintName: string
+): Promise<boolean> {
+  const [rows] = await p.execute<mysql.RowDataPacket[]>(
+    `SELECT 1 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = ? AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+     LIMIT 1`,
+    [tableName, constraintName]
+  );
+  return rows.length > 0;
+}
+
+export async function ensureForeignKeyExists(
+  p: mysql.Pool,
+  tableName: string,
+  constraintName: string,
+  fkDefinitionSql: string
+): Promise<boolean> {
+  const exists = await foreignKeyExists(p, tableName, constraintName);
+  if (exists) return false;
+  await p.query(
+    `ALTER TABLE \`${tableName}\` ADD CONSTRAINT \`${constraintName}\` ${fkDefinitionSql}`
+  );
+  return true;
+}
+
+interface SchemaMigrationSpec {
+  version: number;
+  name: string;
+  up: (p: mysql.Pool) => Promise<void>;
+}
+
+const SCHEMA_MIGRATIONS: SchemaMigrationSpec[] = [
+  {
+    version: 1,
+    name: 'v1_base_tables_and_core_constraints',
+    up: async (p) => {
+      await ensureIndexExists(p, 'users', 'uq_users_username', 'UNIQUE KEY `uq_users_username` (`username`)');
+      await ensureIndexExists(p, 'users', 'uq_users_single_role', 'UNIQUE KEY `uq_users_single_role` (`role`)');
+      await ensureIndexExists(
+        p,
+        'user_sessions',
+        'idx_sessions_user_expires',
+        'KEY `idx_sessions_user_expires` (`user_id`, `expires_at`)'
+      );
+      await ensureIndexExists(
+        p,
+        'attendance_logs',
+        'idx_attendance_user_date',
+        'KEY `idx_attendance_user_date` (`user_id`, `work_date`, `is_deleted`)'
+      );
+      await ensureIndexExists(
+        p,
+        'attendance_logs',
+        'idx_attendance_shamsi',
+        'KEY `idx_attendance_shamsi` (`shamsi_date`)'
+      );
+    },
+  },
+  {
+    version: 2,
+    name: 'v2_users_profile_biometric_and_password_policy',
+    up: async (p) => {
+      await ensureColumnExists(p, 'users', 'avatar_url', 'MEDIUMTEXT NULL DEFAULT NULL');
+      await ensureColumnExists(
+        p,
+        'users',
+        'collaboration_start_shamsi',
+        "VARCHAR(10) NULL DEFAULT '1405/06/15'"
+      );
+      await ensureColumnExists(p, 'users', 'phone_number', 'VARCHAR(20) NULL DEFAULT NULL');
+      await ensureColumnExists(
+        p,
+        'users',
+        'biometric_credential_id',
+        'VARCHAR(255) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(p, 'users', 'biometric_token_hash', 'VARCHAR(255) NULL DEFAULT NULL');
+      await ensureColumnExists(
+        p,
+        'users',
+        'must_change_password',
+        'TINYINT(1) NOT NULL DEFAULT 0'
+      );
+    },
+  },
+  {
+    version: 3,
+    name: 'v3_historical_work_and_daily_reports_attachments',
+    up: async (p) => {
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'status',
+        "ENUM('PENDING', 'APPROVED', 'REJECTED') NOT NULL DEFAULT 'APPROVED'"
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'excel_file_url',
+        'MEDIUMTEXT NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'excel_file_name',
+        'VARCHAR(255) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'parsed_rows_json',
+        'LONGTEXT NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'is_seen_by_manager',
+        'TINYINT(1) NOT NULL DEFAULT 0'
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'reviewed_by_user_id',
+        'INT UNSIGNED NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'reviewed_at',
+        'DATETIME NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'daily_work_reports',
+        'is_seen_by_manager',
+        'TINYINT(1) NOT NULL DEFAULT 0'
+      );
+      await ensureColumnExists(p, 'daily_work_reports', 'photo_url', 'MEDIUMTEXT NULL DEFAULT NULL');
+      await ensureColumnExists(
+        p,
+        'daily_work_reports',
+        'photo_name',
+        'VARCHAR(255) NULL DEFAULT NULL'
+      );
+    },
+  },
+  {
+    version: 4,
+    name: 'v4_financial_receipts_and_system_settings_extensions',
+    up: async (p) => {
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'is_seen_by_manager',
+        'TINYINT(1) NOT NULL DEFAULT 0'
+      );
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'receipt_file_url',
+        'MEDIUMTEXT NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'receipt_file_name',
+        'VARCHAR(255) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'idempotency_key',
+        'VARCHAR(64) NULL DEFAULT NULL'
+      );
+      await ensureIndexExists(
+        p,
+        'financial_transactions',
+        'uq_fin_idempotency',
+        'UNIQUE KEY `uq_fin_idempotency` (`idempotency_key`)'
+      );
+      await ensureColumnExists(p, 'system_settings', 'banner_bg_url', 'MEDIUMTEXT NULL DEFAULT NULL');
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'thursday_shift_start_time',
+        "VARCHAR(5) NOT NULL DEFAULT '07:00'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'thursday_shift_end_time',
+        "VARCHAR(5) NOT NULL DEFAULT '14:00'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'thursday_overtime_start_time',
+        "VARCHAR(5) NOT NULL DEFAULT '14:00'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'base_salary_toman',
+        'DECIMAL(15, 0) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'overtime_calc_mode',
+        "ENUM('FIXED_RATE', 'PERCENTAGE') NOT NULL DEFAULT 'PERCENTAGE'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'overtime_percentage',
+        'DECIMAL(6, 2) NOT NULL DEFAULT 140.00'
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'collaboration_start_shamsi',
+        "VARCHAR(10) NOT NULL DEFAULT '1405/06/15'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'monthly_leave_quota_days',
+        'DECIMAL(4, 1) NOT NULL DEFAULT 2.5'
+      );
+      await ensureColumnExists(p, 'system_settings', 'sms_enabled', 'TINYINT(1) NOT NULL DEFAULT 0');
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'melipayamak_username',
+        "VARCHAR(120) NOT NULL DEFAULT ''"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'melipayamak_password',
+        "VARCHAR(255) NOT NULL DEFAULT ''"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'melipayamak_from_number',
+        "VARCHAR(64) NOT NULL DEFAULT ''"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'melipayamak_is_flash',
+        'TINYINT(1) NOT NULL DEFAULT 0'
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'worker_phone_number',
+        "VARCHAR(20) NOT NULL DEFAULT ''"
+      );
+    },
+  },
+  {
+    version: 5,
+    name: 'v5_correspondence_audio_and_foreign_keys',
+    up: async (p) => {
+      await ensureColumnExists(
+        p,
+        'work_correspondences',
+        'audio_url',
+        'MEDIUMTEXT NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'work_correspondences',
+        'audio_duration_seconds',
+        'INT UNSIGNED NULL DEFAULT NULL'
+      );
+      await ensureForeignKeyExists(
+        p,
+        'historical_work_records',
+        'fk_hist_work_reviewer',
+        'FOREIGN KEY (`reviewed_by_user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL'
+      );
+      await ensureForeignKeyExists(
+        p,
+        'leave_requests',
+        'fk_leave_reviewer',
+        'FOREIGN KEY (`reviewed_by_user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL'
+      );
+    },
+  },
+  {
+    version: 6,
+    name: 'v6_idempotency_keys_and_composite_indexes',
+    up: async (p) => {
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'idempotency_key',
+        'VARCHAR(64) NULL DEFAULT NULL'
+      );
+      await ensureIndexExists(
+        p,
+        'attendance_logs',
+        'uq_attendance_idempotency',
+        'UNIQUE KEY `uq_attendance_idempotency` (`idempotency_key`)'
+      );
+      await ensureColumnExists(
+        p,
+        'historical_work_records',
+        'idempotency_key',
+        'VARCHAR(64) NULL DEFAULT NULL'
+      );
+      await ensureIndexExists(
+        p,
+        'historical_work_records',
+        'uq_hist_idempotency',
+        'UNIQUE KEY `uq_hist_idempotency` (`idempotency_key`)'
+      );
+      await ensureIndexExists(
+        p,
+        'historical_work_records',
+        'idx_hist_work_user_status',
+        'KEY `idx_hist_work_user_status` (`user_id`, `status`)'
+      );
+      await ensureColumnExists(
+        p,
+        'daily_work_reports',
+        'idempotency_key',
+        'VARCHAR(64) NULL DEFAULT NULL'
+      );
+      await ensureIndexExists(
+        p,
+        'daily_work_reports',
+        'uq_reports_idempotency',
+        'UNIQUE KEY `uq_reports_idempotency` (`idempotency_key`)'
+      );
+      await ensureColumnExists(
+        p,
+        'leave_requests',
+        'idempotency_key',
+        'VARCHAR(64) NULL DEFAULT NULL'
+      );
+      await ensureIndexExists(
+        p,
+        'leave_requests',
+        'uq_leaves_idempotency',
+        'UNIQUE KEY `uq_leaves_idempotency` (`idempotency_key`)'
+      );
+      await ensureIndexExists(
+        p,
+        'financial_transactions',
+        'idx_fin_user_status',
+        'KEY `idx_fin_user_status` (`user_id`, `status`)'
+      );
+    },
+  },
+];
+
+async function createPreMigrationSafetySnapshot(
+  p: mysql.Pool,
+  targetVersion: number
+): Promise<string | null> {
+  try {
+    const [uRows] = await p.execute<mysql.RowDataPacket[]>('SELECT COUNT(*) AS cnt FROM users');
+    const userCount = Number(uRows[0]?.cnt || 0);
+    if (userCount === 0) {
+      return null;
+    }
+
+    const backupDir = path.resolve(process.cwd(), '.data/backups');
+    fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+
+    const tablesToSnap = [
+      'users',
+      'system_settings',
+      'financial_transactions',
+      'attendance_logs',
+      'historical_work_records',
+      'leave_requests',
+      'daily_work_reports',
+    ];
+    const snapshotData: Record<string, unknown[]> = {};
+    for (const tbl of tablesToSnap) {
+      try {
+        const [rows] = await p.query<mysql.RowDataPacket[]>(`SELECT * FROM \`${tbl}\``);
+        snapshotData[tbl] = rows;
+      } catch {
+        snapshotData[tbl] = [];
+      }
+    }
+
+    const cfg = getDbConfig();
+    const fileName = `pre_migration_${cfg.database}_v${targetVersion}_${Date.now()}.json`;
+    const fullPath = path.join(backupDir, fileName);
+    const content = JSON.stringify(
+      {
+        createdAt: new Date().toISOString(),
+        database: cfg.database,
+        targetMigrationVersion: targetVersion,
+        tables: snapshotData,
+      },
+      null,
+      2
+    );
+    fs.writeFileSync(fullPath, content, { mode: 0o600 });
+    return fullPath;
+  } catch {
+    return null;
+  }
+}
+
+export async function runVersionedMigrations(p: mysql.Pool): Promise<{
+  appliedVersions: number[];
+  totalMigrations: number;
+  preMigrationSnapshotPath: string | null;
+}> {
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS \`schema_migrations\` (
+      \`version\` INT UNSIGNED NOT NULL,
+      \`name\` VARCHAR(120) NOT NULL,
+      \`checksum\` VARCHAR(64) NOT NULL,
+      \`applied_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      \`execution_ms\` INT UNSIGNED NOT NULL DEFAULT 0,
+      PRIMARY KEY (\`version\`),
+      UNIQUE KEY \`uq_schema_migrations_name\` (\`name\`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  const [appliedRows] = await p.execute<mysql.RowDataPacket[]>(
+    'SELECT version, name, checksum FROM schema_migrations ORDER BY version ASC'
+  );
+  const appliedMap = new Map<number, { name: string; checksum: string }>();
+  for (const r of appliedRows) {
+    appliedMap.set(Number(r.version), {
+      name: String(r.name),
+      checksum: String(r.checksum),
+    });
   }
 
-  // ارتقای خودکار ستون‌ها برای دیتابیس‌های موجود
-  const migrations = [
-    "ALTER TABLE `users` ADD COLUMN IF NOT EXISTS `avatar_url` MEDIUMTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `users` ADD COLUMN IF NOT EXISTS `collaboration_start_shamsi` VARCHAR(10) NULL DEFAULT '1405/06/15'",
-    "ALTER TABLE `users` ADD COLUMN IF NOT EXISTS `phone_number` VARCHAR(20) NULL DEFAULT NULL",
-    "ALTER TABLE `users` ADD COLUMN IF NOT EXISTS `biometric_credential_id` VARCHAR(255) NULL DEFAULT NULL",
-    "ALTER TABLE `users` ADD COLUMN IF NOT EXISTS `biometric_token_hash` VARCHAR(255) NULL DEFAULT NULL",
-    "ALTER TABLE `users` ADD COLUMN IF NOT EXISTS `must_change_password` TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `status` ENUM('PENDING', 'APPROVED', 'REJECTED') NOT NULL DEFAULT 'APPROVED'",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `excel_file_url` MEDIUMTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `excel_file_name` VARCHAR(255) NULL DEFAULT NULL",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `parsed_rows_json` LONGTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `is_seen_by_manager` TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `reviewed_by_user_id` INT UNSIGNED NULL DEFAULT NULL",
-    "ALTER TABLE `historical_work_records` ADD COLUMN IF NOT EXISTS `reviewed_at` DATETIME NULL DEFAULT NULL",
-    "ALTER TABLE `daily_work_reports` ADD COLUMN IF NOT EXISTS `is_seen_by_manager` TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE `daily_work_reports` ADD COLUMN IF NOT EXISTS `photo_url` MEDIUMTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `daily_work_reports` ADD COLUMN IF NOT EXISTS `photo_name` VARCHAR(255) NULL DEFAULT NULL",
-    "ALTER TABLE `financial_transactions` ADD COLUMN IF NOT EXISTS `is_seen_by_manager` TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE `financial_transactions` ADD COLUMN IF NOT EXISTS `receipt_file_url` MEDIUMTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `financial_transactions` ADD COLUMN IF NOT EXISTS `receipt_file_name` VARCHAR(255) NULL DEFAULT NULL",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `banner_bg_url` MEDIUMTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `thursday_shift_start_time` VARCHAR(5) NOT NULL DEFAULT '07:00'",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `thursday_shift_end_time` VARCHAR(5) NOT NULL DEFAULT '14:00'",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `thursday_overtime_start_time` VARCHAR(5) NOT NULL DEFAULT '14:00'",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `base_salary_toman` DECIMAL(15, 0) NULL DEFAULT NULL",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `overtime_calc_mode` ENUM('FIXED_RATE', 'PERCENTAGE') NOT NULL DEFAULT 'PERCENTAGE'",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `overtime_percentage` DECIMAL(6, 2) NOT NULL DEFAULT 140.00",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `collaboration_start_shamsi` VARCHAR(10) NOT NULL DEFAULT '1405/06/15'",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `monthly_leave_quota_days` DECIMAL(4, 1) NOT NULL DEFAULT 2.5",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `sms_enabled` TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `melipayamak_username` VARCHAR(120) NOT NULL DEFAULT ''",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `melipayamak_password` VARCHAR(255) NOT NULL DEFAULT ''",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `melipayamak_from_number` VARCHAR(64) NOT NULL DEFAULT ''",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `melipayamak_is_flash` TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE `system_settings` ADD COLUMN IF NOT EXISTS `worker_phone_number` VARCHAR(20) NOT NULL DEFAULT ''",
-    "ALTER TABLE `work_correspondences` ADD COLUMN IF NOT EXISTS `audio_url` MEDIUMTEXT NULL DEFAULT NULL",
-    "ALTER TABLE `work_correspondences` ADD COLUMN IF NOT EXISTS `audio_duration_seconds` INT UNSIGNED NULL DEFAULT NULL",
-  ];
+  let preMigrationSnapshotPath: string | null = null;
+  const pendingSpecs = SCHEMA_MIGRATIONS.filter((m) => !appliedMap.has(m.version));
+  if (pendingSpecs.length > 0) {
+    preMigrationSnapshotPath = await createPreMigrationSafetySnapshot(
+      p,
+      pendingSpecs[0].version
+    );
+  }
 
-  for (const mig of migrations) {
+  const appliedVersions: number[] = [];
+
+  for (const mig of SCHEMA_MIGRATIONS) {
+    const startMs = Date.now();
+    const checksum = crypto
+      .createHash('sha256')
+      .update(`${mig.version}:${mig.name}`)
+      .digest('hex');
+
+    // اجرای بررسی‌های Idempotent ستون‌ها و ایندکس‌ها (حتی اگر نسخه قبلاً ثبت شده باشد، کمبود ستون احتمالی را بدون خطا ترمیم می‌کند)
+    await mig.up(p);
+
+    if (!appliedMap.has(mig.version)) {
+      const execMs = Math.max(0, Date.now() - startMs);
+      await p.execute(
+        `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE checksum = VALUES(checksum), execution_ms = VALUES(execution_ms)`,
+        [mig.version, mig.name, checksum, execMs]
+      );
+      appliedVersions.push(mig.version);
+    }
+  }
+
+  return {
+    appliedVersions,
+    totalMigrations: SCHEMA_MIGRATIONS.length,
+    preMigrationSnapshotPath,
+  };
+}
+
+/**
+ * انتقال خودکار پیوست‌های قدیمی از مسیر عمومی public/assets/media به مسیر خصوصی .data/private_media
+ * تا هیچ فایل خصوصی در مسیر قابل دسترس مستقیم وب باقی نماند و هیچ فایلی از دست نرود.
+ */
+export function migrateLegacyPublicMediaToPrivate(): void {
+  const folders = ['avatars', 'attachments', 'excel', 'audio', 'receipts', 'reports'];
+  const privateBaseDir = path.resolve(process.cwd(), '.data/private_media');
+  const legacyPublicMediaDir = path.resolve(process.cwd(), 'public/assets/media');
+
+  for (const folder of folders) {
     try {
-      await p.query(mig);
+      const targetDir = path.resolve(privateBaseDir, folder);
+      fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+
+      const legacyDir = path.resolve(legacyPublicMediaDir, folder);
+      if (fs.existsSync(legacyDir)) {
+        const entries = fs.readdirSync(legacyDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isFile()) continue;
+          const srcPath = path.join(legacyDir, entry.name);
+          const dstPath = path.join(targetDir, entry.name);
+          if (!fs.existsSync(dstPath)) {
+            fs.copyFileSync(srcPath, dstPath);
+          }
+          try {
+            fs.unlinkSync(srcPath);
+          } catch {
+            // ignore
+          }
+        }
+      }
     } catch {
-      // ignore if already exists
+      // ignore
     }
   }
+}
 
-  // بررسی و ایجاد تنها دو حساب مجاز سامانه:
-  // ۱. مدیریت: مجید نورایی
-  // ۲. پرسنل: امید میثمی
-  const [existingUsers] = await p.execute<mysql.RowDataPacket[]>(
-    'SELECT id, username, role, full_name FROM users ORDER BY id ASC'
-  );
+export async function initializeDatabase(): Promise<void> {
+  if (dbInitializingPromise) {
+    return dbInitializingPromise;
+  }
 
-  const hasManager = existingUsers.some((u) => u.role === 'manager');
-  const hasWorker = existingUsers.some((u) => u.role === 'worker');
-  const isProd = process.env.NODE_ENV === 'production';
+  dbInitializingPromise = (async () => {
+    try {
+      validateProductionSecurityConfig(process.env);
+      await ensureLocalMariaDbRunningIfNeeded();
+      migrateLegacyPublicMediaToPrivate();
 
-  const rawMgrPass = (process.env.INITIAL_MANAGER_PASSWORD || '').trim();
-  const managerUsername = (process.env.INITIAL_MANAGER_USERNAME || 'manager').trim();
-  const managerPassword =
-    !rawMgrPass || (!isProd && rawMgrPass === 'CHANGE_ME_MANAGER_PASSWORD')
-      ? isProd
-        ? ''
-        : 'Mgammon@1405'
-      : rawMgrPass;
-  if (!hasManager) {
-    if (isProd && (!managerPassword || FORBIDDEN_DEFAULT_PASSWORDS.has(managerPassword) || managerPassword.length < 8)) {
-      throw new Error(
-        'SECURITY_CONFIG_ERROR: برای ایجاد حساب اولیه مدیر در محیط عملیاتی باید متغیر محیطی INITIAL_MANAGER_PASSWORD با مقدار امن و غیرپیش‌فرض تنظیم شود.'
+      const cfg = getDbConfig();
+      const safeDbName = cfg.database.replace(/[^a-zA-Z0-9_]/g, '');
+
+      // در محیط توسعه/تست، اطمینان از وجود دیتابیس هدف (مثلاً mgammon_duo یا mgammon_duo_test)
+      if (!isCpanelOrProductionEnvironment(process.env) && cfg.user === 'root') {
+        try {
+          const adminConn = await mysql.createConnection({
+            host: cfg.host,
+            port: cfg.port,
+            user: cfg.user,
+            password: cfg.password,
+            connectTimeout: 3000,
+          });
+          await adminConn.query(
+            `CREATE DATABASE IF NOT EXISTS \`${safeDbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+          );
+          await adminConn.end();
+        } catch {
+          // ignore if user lacks CREATE DATABASE privilege
+        }
+      }
+
+      const p = getPool();
+      const schemaPath = path.resolve(process.cwd(), 'database/schema.sql');
+      const schemaSql = fs.readFileSync(schemaPath, 'utf8');
+
+      const cleanedSql = schemaSql
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('--'))
+        .join('\n');
+
+      const statements = cleanedSql
+        .split(/;\s*(?:\n|$)/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+
+      for (const stmt of statements) {
+        await p.query(stmt);
+      }
+
+      // اجرای سیستم مهاجرت نسخه‌بندی‌شده و Idempotent
+      await runVersionedMigrations(p);
+
+      // بررسی و ایجاد تنها دو حساب مجاز سامانه (فقط در صورت عدم وجود! هرگز رمز یا نام کاربری موجود بازنشانی نمی‌شود):
+      // ۱. مدیریت: مجید نورایی
+      // ۲. پرسنل: امید میثمی
+      const [existingUsers] = await p.execute<mysql.RowDataPacket[]>(
+        'SELECT id, username, role, full_name, collaboration_start_shamsi FROM users ORDER BY id ASC'
       );
-    }
-    const hash = await bcrypt.hash(managerPassword, 10);
-    await p.execute(
-      'INSERT INTO users (username, full_name, role, password_hash, collaboration_start_shamsi, is_active, must_change_password) VALUES (?, ?, ?, ?, ?, 1, 1)',
-      [managerUsername, 'مجید نورایی', 'manager', hash, '1405/06/15']
-    );
-  } else if (!isProd && managerPassword) {
-    const hash = await bcrypt.hash(managerPassword, 10);
-    await p.execute(
-      "UPDATE users SET username = ?, full_name = 'مجید نورایی', password_hash = ?, is_active = 1 WHERE role = 'manager'",
-      [managerUsername, hash]
-    );
-  } else {
-    await p.execute("UPDATE users SET full_name = 'مجید نورایی' WHERE role = 'manager'");
-  }
 
-  const rawWrkPass = (process.env.INITIAL_WORKER_PASSWORD || '').trim();
-  const workerUsername = (process.env.INITIAL_WORKER_USERNAME || 'worker').trim();
-  const workerPassword =
-    !rawWrkPass || (!isProd && rawWrkPass === 'CHANGE_ME_WORKER_PASSWORD')
-      ? isProd
-        ? ''
-        : 'Worker@1405'
-      : rawWrkPass;
-  if (!hasWorker) {
-    if (isProd && (!workerPassword || FORBIDDEN_DEFAULT_PASSWORDS.has(workerPassword) || workerPassword.length < 8)) {
-      throw new Error(
-        'SECURITY_CONFIG_ERROR: برای ایجاد حساب اولیه پرسنل در محیط عملیاتی باید متغیر محیطی INITIAL_WORKER_PASSWORD با مقدار امن و غیرپیش‌فرض تنظیم شود.'
+      const hasManager = existingUsers.some((u) => u.role === 'manager');
+      const hasWorker = existingUsers.some((u) => u.role === 'worker');
+      const isProd = process.env.NODE_ENV === 'production';
+
+      const rawMgrPass = (process.env.INITIAL_MANAGER_PASSWORD || '').trim();
+      const managerUsername = (process.env.INITIAL_MANAGER_USERNAME || 'manager').trim();
+      const managerPassword =
+        !rawMgrPass || (!isProd && rawMgrPass === 'CHANGE_ME_MANAGER_PASSWORD')
+          ? isProd
+            ? ''
+            : 'Mgammon@1405'
+          : rawMgrPass;
+
+      if (!hasManager) {
+        if (
+          isProd &&
+          (!managerPassword ||
+            FORBIDDEN_DEFAULT_PASSWORDS.has(managerPassword) ||
+            managerPassword.length < 8)
+        ) {
+          throw new Error(
+            'SECURITY_CONFIG_ERROR: برای ایجاد حساب اولیه مدیر در محیط عملیاتی باید متغیر محیطی INITIAL_MANAGER_PASSWORD با مقدار امن و غیرپیش‌فرض تنظیم شود.'
+          );
+        }
+        const hash = await bcrypt.hash(managerPassword, 10);
+        await p.execute(
+          'INSERT INTO users (username, full_name, role, password_hash, collaboration_start_shamsi, is_active, must_change_password) VALUES (?, ?, ?, ?, ?, 1, 1)',
+          [managerUsername, 'مجید نورایی', 'manager', hash, '1405/06/15']
+        );
+      } else {
+        // حفظ کامل رمز عبور، نام کاربری و وضعیت حساب مدیر در راه‌اندازی‌های مجدد
+        await p.execute(
+          "UPDATE users SET full_name = 'مجید نورایی' WHERE role = 'manager' AND (full_name IS NULL OR full_name = '')"
+        );
+      }
+
+      const rawWrkPass = (process.env.INITIAL_WORKER_PASSWORD || '').trim();
+      const workerUsername = (process.env.INITIAL_WORKER_USERNAME || 'worker').trim();
+      const workerPassword =
+        !rawWrkPass || (!isProd && rawWrkPass === 'CHANGE_ME_WORKER_PASSWORD')
+          ? isProd
+            ? ''
+            : 'Worker@1405'
+          : rawWrkPass;
+
+      if (!hasWorker) {
+        if (
+          isProd &&
+          (!workerPassword ||
+            FORBIDDEN_DEFAULT_PASSWORDS.has(workerPassword) ||
+            workerPassword.length < 8)
+        ) {
+          throw new Error(
+            'SECURITY_CONFIG_ERROR: برای ایجاد حساب اولیه پرسنل در محیط عملیاتی باید متغیر محیطی INITIAL_WORKER_PASSWORD با مقدار امن و غیرپیش‌فرض تنظیم شود.'
+          );
+        }
+        const hash = await bcrypt.hash(workerPassword, 10);
+        await p.execute(
+          'INSERT INTO users (username, full_name, role, password_hash, collaboration_start_shamsi, is_active, must_change_password) VALUES (?, ?, ?, ?, ?, 1, 1)',
+          [workerUsername, 'امید میثمی', 'worker', hash, '1405/06/15']
+        );
+      } else {
+        // حفظ کامل رمز عبور، نام کاربری و تنظیمات حساب پرسنل در راه‌اندازی‌های مجدد
+        await p.execute(
+          "UPDATE users SET full_name = 'امید میثمی', collaboration_start_shamsi = COALESCE(NULLIF(collaboration_start_shamsi, ''), '1405/06/15') WHERE role = 'worker' AND (full_name IS NULL OR full_name = '' OR collaboration_start_shamsi IS NULL OR collaboration_start_shamsi = '')"
+        );
+      }
+
+      // بررسی و مقداردهی اولیه تنظیمات پایه سامانه (فقط در صورتی که هنوز رکوردی وجود ندارد)
+      const [settingsRows] = await p.execute<mysql.RowDataPacket[]>(
+        'SELECT id, banner_bg_url FROM system_settings LIMIT 1'
       );
+
+      if (settingsRows.length === 0) {
+        await p.execute(
+          `INSERT INTO system_settings (
+            shift_start_time,
+            shift_end_time,
+            thursday_shift_start_time,
+            thursday_shift_end_time,
+            thursday_overtime_start_time,
+            grace_period_minutes,
+            break_duration_minutes,
+            working_days_json,
+            overtime_start_time,
+            overtime_before_shift,
+            mission_policy,
+            friday_holiday_policy,
+            official_holidays_json,
+            timezone,
+            base_salary_toman,
+            hourly_rate_toman,
+            overtime_calc_mode,
+            overtime_percentage,
+            overtime_rate_toman,
+            collaboration_start_shamsi,
+            monthly_leave_quota_days,
+            rules_confirmed_by_manager,
+            effective_from_shamsi,
+            banner_bg_url
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'PERCENTAGE', 140.00, NULL, '1405/06/15', 2.5, 0, ?, '/assets/media/banner-bg.svg')`,
+          [
+            '07:00',
+            '15:00',
+            '07:00',
+            '14:00',
+            '14:00',
+            15,
+            30,
+            JSON.stringify([6, 0, 1, 2, 3, 4]),
+            '15:00',
+            0,
+            'PAID_AS_WORK',
+            'ALL_OVERTIME',
+            JSON.stringify([]),
+            process.env.APP_TIMEZONE || 'Asia/Tehran',
+            '1405/06/15',
+          ]
+        );
+      }
+
+      dbInitialized = true;
+      lastDbError = null;
+    } catch (err) {
+      dbInitialized = false;
+      lastDbError = sanitizeDbErrorMessage(err);
+      throw err;
+    } finally {
+      dbInitializingPromise = null;
     }
-    const hash = await bcrypt.hash(workerPassword, 10);
-    await p.execute(
-      'INSERT INTO users (username, full_name, role, password_hash, collaboration_start_shamsi, is_active, must_change_password) VALUES (?, ?, ?, ?, ?, 1, 1)',
-      [workerUsername, 'امید میثمی', 'worker', hash, '1405/06/15']
-    );
-  } else if (!isProd && workerPassword) {
-    const hash = await bcrypt.hash(workerPassword, 10);
-    await p.execute(
-      "UPDATE users SET username = ?, full_name = 'امید میثمی', password_hash = ?, is_active = 1, collaboration_start_shamsi = CASE WHEN collaboration_start_shamsi IS NULL OR collaboration_start_shamsi = '1405/01/01' THEN '1405/06/15' ELSE collaboration_start_shamsi END WHERE role = 'worker'",
-      [workerUsername, hash]
-    );
-  } else {
-    await p.execute(
-      "UPDATE users SET full_name = 'امید میثمی', collaboration_start_shamsi = '1405/06/15' WHERE role = 'worker' AND (collaboration_start_shamsi IS NULL OR collaboration_start_shamsi = '1405/01/01')"
-    );
-  }
+  })();
 
-  // بررسی و مقداردهی اولیه تنظیمات پایه سامانه
-  const [settingsRows] = await p.execute<mysql.RowDataPacket[]>(
-    'SELECT id, shift_start_time, shift_end_time, thursday_shift_end_time, collaboration_start_shamsi FROM system_settings LIMIT 1'
-  );
-
-  if (settingsRows.length === 0) {
-    await p.execute(
-      `INSERT INTO system_settings (
-        shift_start_time,
-        shift_end_time,
-        thursday_shift_start_time,
-        thursday_shift_end_time,
-        thursday_overtime_start_time,
-        grace_period_minutes,
-        break_duration_minutes,
-        working_days_json,
-        overtime_start_time,
-        overtime_before_shift,
-        mission_policy,
-        friday_holiday_policy,
-        official_holidays_json,
-        timezone,
-        base_salary_toman,
-        hourly_rate_toman,
-        overtime_calc_mode,
-        overtime_percentage,
-        overtime_rate_toman,
-        collaboration_start_shamsi,
-        monthly_leave_quota_days,
-        rules_confirmed_by_manager,
-        effective_from_shamsi,
-        banner_bg_url
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'PERCENTAGE', 140.00, NULL, '1405/06/15', 2.5, 0, ?, '/assets/media/banner-bg.svg')`,
-      [
-        '07:00',
-        '15:00',
-        '07:00',
-        '14:00',
-        '14:00',
-        15,
-        30,
-        JSON.stringify([6, 0, 1, 2, 3, 4]),
-        '15:00',
-        0,
-        'PAID_AS_WORK',
-        'ALL_OVERTIME',
-        JSON.stringify([]),
-        process.env.APP_TIMEZONE || 'Asia/Tehran',
-        '1405/06/15',
-      ]
-    );
-  } else {
-    await p.execute(
-      `UPDATE system_settings
-       SET banner_bg_url = '/assets/media/banner-bg.svg',
-           shift_start_time = CASE WHEN shift_start_time = '08:30' THEN '07:00' ELSE shift_start_time END,
-           shift_end_time = CASE WHEN shift_end_time = '17:00' THEN '15:00' ELSE shift_end_time END,
-           overtime_start_time = CASE WHEN overtime_start_time = '17:00' THEN '15:00' ELSE overtime_start_time END,
-           thursday_shift_start_time = CASE WHEN thursday_shift_start_time = '08:30' THEN '07:00' ELSE thursday_shift_start_time END,
-           thursday_shift_end_time = CASE WHEN thursday_shift_end_time = '13:00' THEN '14:00' ELSE thursday_shift_end_time END,
-           thursday_overtime_start_time = CASE WHEN thursday_overtime_start_time = '13:00' THEN '14:00' ELSE thursday_overtime_start_time END,
-           collaboration_start_shamsi = CASE WHEN collaboration_start_shamsi = '1405/01/01' OR collaboration_start_shamsi IS NULL THEN '1405/06/15' ELSE collaboration_start_shamsi END`
-    );
-  }
+  return dbInitializingPromise;
 }
 
 export async function getSystemSettingsFromDb(targetShamsiDate?: string): Promise<SystemSettings> {
@@ -516,15 +1214,27 @@ export async function getSystemSettingsFromDb(targetShamsiDate?: string): Promis
     }
 
     if (chosenJson) {
-      const parsed =
+      const parsed = (
         typeof chosenJson === 'string'
           ? JSON.parse(chosenJson)
-          : chosenJson;
-      return {
+          : chosenJson
+      ) as Partial<SystemSettings>;
+      const merged: SystemSettings = {
         ...currentMapped,
-        ...(parsed as SystemSettings),
+        ...parsed,
         banner_bg_url: currentMapped.banner_bg_url,
       };
+      if (
+        (merged.base_salary_toman === null || merged.base_salary_toman === undefined || merged.base_salary_toman <= 0) &&
+        (merged.hourly_rate_toman === null || merged.hourly_rate_toman === undefined || merged.hourly_rate_toman <= 0)
+      ) {
+        merged.base_salary_toman = currentMapped.base_salary_toman;
+        merged.hourly_rate_toman = currentMapped.hourly_rate_toman;
+        merged.overtime_calc_mode = currentMapped.overtime_calc_mode;
+        merged.overtime_percentage = currentMapped.overtime_percentage;
+        merged.overtime_rate_toman = currentMapped.overtime_rate_toman;
+      }
+      return merged;
     }
   }
 

@@ -31,6 +31,7 @@ import { WorkCorrespondenceSection } from './WorkCorrespondenceSection';
 import { AccountSettingsPanel } from './AccountSettingsPanel';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
 import { CameraCaptureModal } from './CameraCaptureModal';
+import { MonthlyStatementSection } from './MonthlyStatementSection';
 import {
   Play,
   Briefcase,
@@ -1472,6 +1473,22 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                   </div>
                 </div>
               </div>
+
+              {/* صورتحساب تفصیلی هر ماه / دوره در تب امور مالی پرسنل */}
+              <MonthlyStatementSection
+                role="worker"
+                currentShamsiDate={serverShamsiDate}
+                collaborationStartShamsi={
+                  liveState?.worker_profile?.collaboration_start_shamsi ||
+                  settings?.collaboration_start_shamsi ||
+                  user.collaboration_start_shamsi
+                }
+                dailySummaries={historySummaries}
+                historicalRecords={historicalRecords}
+                transactions={transactions}
+                settings={settings}
+                cumulativeBalanceToman={workerKpis.accountBalanceToman}
+              />
 
               <form
                 onSubmit={handleFinanceSubmit}

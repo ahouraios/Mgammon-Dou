@@ -9,9 +9,16 @@ import {
   checkDatabaseConnection,
   FORBIDDEN_DEFAULT_PASSWORDS,
   getPool,
+  getSimulatedMidTransactionFailure,
   getSystemSettingsFromDb,
   mapRowToSystemSettings,
+  withTransaction,
 } from './db';
+import {
+  createFullBackup,
+  listAvailableBackups,
+  verifyBackupArchive,
+} from './backup';
 import {
   AuthenticatedRequest,
   checkLoginRateLimit,
@@ -66,6 +73,7 @@ import {
   calculateDailyAttendance,
   calculateSalaryAndOvertimeRates,
   evaluateWorkerLiveState,
+  getMonthlyCycleKeyForShamsiDate,
   validateAttendanceSequence,
   validateFullDayLogSequence,
 } from '../shared/calculationEngine';
@@ -273,10 +281,13 @@ function saveBase64MediaFile(
     .replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_')
     .slice(0, 40) || 'file';
   const fileName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${safeBase}${ext}`;
-  const targetDir = path.resolve(process.cwd(), '.data/private_media', subFolder);
-  fs.mkdirSync(targetDir, { recursive: true });
+  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR
+    ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
+    : path.resolve(process.cwd(), '.data/private_media');
+  const targetDir = path.resolve(baseMediaDir, subFolder);
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
   const fullPath = path.join(targetDir, fileName);
-  fs.writeFileSync(fullPath, buffer);
+  fs.writeFileSync(fullPath, buffer, { mode: 0o600 });
   return {
     publicUrl: `/assets/media/${subFolder}/${fileName}`,
     sizeBytes: buffer.length,
@@ -1588,9 +1599,10 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
     let totalConfirmedNetWorkMinutes = 0;
     let totalConfirmedOvertimeMinutes = 0;
     let totalRecordedWorkDays = 0;
-    let earnedRegularWorkToman = 0;
+    let hourlyEarnedRegularWorkToman = 0;
     let earnedOvertimeToman = 0;
     const confirmedAttendanceShamsiDates = new Set<string>();
+    const activeMonthlyCycles = new Set<string>();
 
     for (const [workDate, dayLogs] of byDate.entries()) {
       const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
@@ -1601,6 +1613,9 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       });
       if (!summary.is_incomplete && summary.logs.length > 0) {
         confirmedAttendanceShamsiDates.add(shamsiDate);
+        if (summary.net_work_minutes > 0 || summary.overtime_minutes > 0) {
+          activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(shamsiDate, 15));
+        }
         totalRecordedWorkDays += 1;
         totalConfirmedNetWorkMinutes += summary.net_work_minutes;
         totalConfirmedOvertimeMinutes += summary.overtime_minutes;
@@ -1610,7 +1625,7 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
           effectiveSettings,
           summary.overtime_minutes
         );
-        earnedRegularWorkToman += Math.round(
+        hourlyEarnedRegularWorkToman += Math.round(
           (dayRegularMinutes / 60) * daySalaryCalc.effectiveHourlyRateToman
         );
         earnedOvertimeToman += daySalaryCalc.totalOvertimePayToman;
@@ -1635,13 +1650,16 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
 
           const rowNetMins = Number(row.net_work_minutes || 0);
           const rowOtMins = Number(row.overtime_minutes || 0);
+          if (rowNetMins > 0 || rowOtMins > 0) {
+            activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
+          }
           totalRecordedWorkDays += 1;
           totalConfirmedNetWorkMinutes += rowNetMins;
           totalConfirmedOvertimeMinutes += rowOtMins;
 
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
-          earnedRegularWorkToman += Math.round(
+          hourlyEarnedRegularWorkToman += Math.round(
             (rowNetMins / 60) * rowCalc.effectiveHourlyRateToman
           );
           earnedOvertimeToman += rowCalc.totalOvertimePayToman;
@@ -1656,6 +1674,9 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
         if (rec.work_days_count === 1 && normShamsi) {
           confirmedAttendanceShamsiDates.add(normShamsi);
         }
+        if ((rec.net_work_minutes > 0 || rec.overtime_minutes > 0) && normShamsi && isValidShamsiDate(normShamsi)) {
+          activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
+        }
 
         totalRecordedWorkDays += rec.work_days_count;
         totalConfirmedNetWorkMinutes += rec.net_work_minutes;
@@ -1663,12 +1684,24 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
 
         const effSet = await getSystemSettingsFromDb(normShamsi);
         const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
-        earnedRegularWorkToman += Math.round(
+        hourlyEarnedRegularWorkToman += Math.round(
           (rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman
         );
         earnedOvertimeToman += recCalc.totalOvertimePayToman;
       }
     }
+
+    const hasMonthlyFixedSalary =
+      settings.base_salary_toman !== null &&
+      settings.base_salary_toman !== undefined &&
+      Number(settings.base_salary_toman) > 0 &&
+      (settings.hourly_rate_toman === null ||
+        settings.hourly_rate_toman === undefined ||
+        Number(settings.hourly_rate_toman) <= 0);
+
+    const earnedRegularWorkToman = hasMonthlyFixedSalary
+      ? activeMonthlyCycles.size * Math.round(Number(settings.base_salary_toman))
+      : hourlyEarnedRegularWorkToman;
 
     const [finTotals] = await pool.execute<mysql.RowDataPacket[]>(
       `SELECT
@@ -1723,6 +1756,11 @@ apiRouter.post(
     try {
       const eventType = String(req.body?.event_type || '').trim() as AttendanceEventType;
       const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
+      const rawIdempotency =
+        req.body?.idempotency_key || req.headers['x-idempotency-key'] || null;
+      const idempotencyKey = rawIdempotency
+        ? String(rawIdempotency).trim().slice(0, 64)
+        : null;
       const validEvents: AttendanceEventType[] = [
         'WORK_START',
         'MISSION_START',
@@ -1752,6 +1790,22 @@ apiRouter.post(
         [workerId]
       );
 
+      if (idempotencyKey) {
+        const [dupKeyRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id FROM attendance_logs WHERE idempotency_key = ? LIMIT 1`,
+          [idempotencyKey]
+        );
+        if (dupKeyRows.length > 0) {
+          await conn.rollback();
+          res.status(409).json({
+            ok: false,
+            code: 'DUPLICATE_REQUEST',
+            message: 'این درخواست تردد قبلاً ثبت شده است.',
+          });
+          return;
+        }
+      }
+
       const [existingRows] = await conn.execute<mysql.RowDataPacket[]>(
         `SELECT * FROM attendance_logs
          WHERE user_id = ? AND work_date = ? AND is_deleted = 0
@@ -1776,10 +1830,37 @@ apiRouter.post(
       const recordedAt = `${nowInfo.workDate} ${nowInfo.timeHHMMSS}`;
       const [insertResult] = await conn.execute<mysql.ResultSetHeader>(
         `INSERT INTO attendance_logs
-          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, is_deleted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-        [workerId, nowInfo.workDate, nowInfo.shamsiDate, eventType, recordedAt, nowInfo.timeHHMMSS, note]
+          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, is_deleted, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)`,
+        [
+          workerId,
+          nowInfo.workDate,
+          nowInfo.shamsiDate,
+          eventType,
+          recordedAt,
+          nowInfo.timeHHMMSS,
+          note,
+          idempotencyKey,
+        ]
       );
+
+      await recordAuditLog({
+        actorUserId: workerId,
+        actionType: 'ATTENDANCE_CLOCK',
+        targetEntity: 'attendance_logs',
+        targetId: insertResult.insertId,
+        afterState: {
+          shamsi_date: nowInfo.shamsiDate,
+          event_type: eventType,
+          recorded_time: nowInfo.timeHHMMSS,
+        },
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      if (getSimulatedMidTransactionFailure() === 'attendance_clock') {
+        throw new Error('SIMULATED_DB_DISCONNECT');
+      }
 
       await conn.commit();
 
@@ -1815,6 +1896,15 @@ apiRouter.post(
         } catch {
           // ignore
         }
+      }
+      const errObj = err as { code?: string };
+      if (errObj?.code === 'ER_DUP_ENTRY') {
+        res.status(409).json({
+          ok: false,
+          code: 'DUPLICATE_REQUEST',
+          message: 'این درخواست تردد قبلاً ثبت شده است.',
+        });
+        return;
       }
       handleServerError(res, err);
     } finally {
@@ -2582,13 +2672,23 @@ apiRouter.post(
         return;
       }
 
-      const pool = getPool();
-      await pool.execute(
-        `UPDATE historical_work_records
-         SET status = ?, is_seen_by_manager = 1, reviewed_by_user_id = ?, reviewed_at = NOW()
-         WHERE id = ?`,
-        [decision, req.user!.id, recordId]
-      );
+      await withTransaction(async (conn) => {
+        await conn.execute(
+          `UPDATE historical_work_records
+           SET status = ?, is_seen_by_manager = 1, reviewed_by_user_id = ?, reviewed_at = NOW()
+           WHERE id = ?`,
+          [decision, req.user!.id, recordId]
+        );
+        await recordAuditLog({
+          actorUserId: req.user!.id,
+          actionType: 'HISTORICAL_WORK_REVIEW',
+          targetEntity: 'historical_work_records',
+          targetId: recordId,
+          afterState: { status: decision },
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
+      });
 
       res.json({
         ok: true,
@@ -2666,32 +2766,35 @@ apiRouter.put(
             : null
           : existing.note;
 
-      await pool.execute(
-        `UPDATE historical_work_records
-         SET shamsi_date = ?, work_date = ?, title = ?, work_days_count = ?, net_work_minutes = ?, overtime_minutes = ?, note = ?
-         WHERE id = ?`,
-        [shamsiDate, workDate, title, workDaysCount, netWorkMinutes, overtimeMinutes, note, recordId]
-      );
+      await withTransaction(async (conn) => {
+        await conn.execute(
+          `UPDATE historical_work_records
+           SET shamsi_date = ?, work_date = ?, title = ?, work_days_count = ?, net_work_minutes = ?, overtime_minutes = ?, note = ?
+           WHERE id = ?`,
+          [shamsiDate, workDate, title, workDaysCount, netWorkMinutes, overtimeMinutes, note, recordId]
+        );
 
-      await recordAuditLog({
-        actorUserId: req.user!.id,
-        actionType: 'HISTORICAL_WORK_UPDATE',
-        targetEntity: 'historical_work_records',
-        targetId: recordId,
-        beforeState: {
-          shamsi_date: existing.shamsi_date,
-          work_days_count: existing.work_days_count,
-          net_work_minutes: existing.net_work_minutes,
-          overtime_minutes: existing.overtime_minutes,
-        },
-        afterState: {
-          shamsi_date: shamsiDate,
-          work_days_count: workDaysCount,
-          net_work_minutes: netWorkMinutes,
-          overtime_minutes: overtimeMinutes,
-        },
-        reason: String(req.body?.reason || 'اصلاح سابقه کارکرد قبلی توسط مدیریت'),
-        ipAddress: req.ip || null,
+        await recordAuditLog({
+          actorUserId: req.user!.id,
+          actionType: 'HISTORICAL_WORK_UPDATE',
+          targetEntity: 'historical_work_records',
+          targetId: recordId,
+          beforeState: {
+            shamsi_date: existing.shamsi_date,
+            work_days_count: existing.work_days_count,
+            net_work_minutes: existing.net_work_minutes,
+            overtime_minutes: existing.overtime_minutes,
+          },
+          afterState: {
+            shamsi_date: shamsiDate,
+            work_days_count: workDaysCount,
+            net_work_minutes: netWorkMinutes,
+            overtime_minutes: overtimeMinutes,
+          },
+          reason: String(req.body?.reason || 'اصلاح سابقه کارکرد قبلی توسط مدیریت'),
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
       });
 
       res.json({
@@ -2709,14 +2812,36 @@ apiRouter.delete(
   requireAuth,
   requireRole('manager'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const pool = getPool();
     try {
       const recordId = Number(req.params.id);
       if (!recordId) {
         res.status(400).json({ ok: false, message: 'شناسه رکورد نامعتبر است.' });
         return;
       }
-      await pool.execute('DELETE FROM historical_work_records WHERE id = ?', [recordId]);
+      await withTransaction(async (conn) => {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          'SELECT * FROM historical_work_records WHERE id = ? FOR UPDATE',
+          [recordId]
+        );
+        if (rows.length > 0) {
+          const existing = mapRowToHistoricalWork(rows[0]);
+          await conn.execute('DELETE FROM historical_work_records WHERE id = ?', [recordId]);
+          await recordAuditLog({
+            actorUserId: req.user!.id,
+            actionType: 'HISTORICAL_WORK_DELETE',
+            targetEntity: 'historical_work_records',
+            targetId: recordId,
+            beforeState: {
+              shamsi_date: existing.shamsi_date,
+              title: existing.title,
+              net_work_minutes: existing.net_work_minutes,
+              overtime_minutes: existing.overtime_minutes,
+            },
+            ipAddress: req.ip || null,
+            connection: conn,
+          });
+        }
+      });
       res.json({ ok: true, message: 'سابقه کارکرد قبلی حذف شد.' });
     } catch (err) {
       handleServerError(res, err);
@@ -3328,6 +3453,8 @@ apiRouter.post(
   requireAuth,
   requireRole('worker'),
   async (req: AuthenticatedRequest, res: Response) => {
+    const pool = getPool();
+    let conn: mysql.PoolConnection | null = null;
     try {
       const rawAmount = toEnglishDigits(String(req.body?.amount_toman || '')).replace(/,/g, '').trim();
       const amountToman = Number(rawAmount);
@@ -3336,8 +3463,10 @@ apiRouter.post(
       const shamsiDateInput = req.body?.shamsi_date ? String(req.body.shamsi_date).trim() : '';
       const receiptBase64 = req.body?.receipt_base64 ? String(req.body.receipt_base64) : null;
       const receiptFileName = req.body?.receipt_file_name ? String(req.body.receipt_file_name) : 'receipt.jpg';
-      const idempotencyKey = req.body?.idempotency_key
-        ? String(req.body.idempotency_key).trim().slice(0, 64)
+      const rawIdempotency =
+        req.body?.idempotency_key || req.headers['x-idempotency-key'] || null;
+      const idempotencyKey = rawIdempotency
+        ? String(rawIdempotency).trim().slice(0, 64)
         : null;
 
       if (!Number.isInteger(amountToman) || amountToman <= 0) {
@@ -3375,11 +3504,34 @@ apiRouter.post(
       const nowInfo = getNowInTimezone(settings.timezone);
       const shamsiDate = shamsiDateInput ? normalizeShamsiDate(shamsiDateInput) : nowInfo.shamsiDate;
       const txDate = shamsiToGregorian(shamsiDate);
-
-      const pool = getPool();
       const workerId = req.user!.id;
 
-      const [result] = await pool.execute<mysql.ResultSetHeader>(
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      // قفل ردیف کاربر برای جلوگیری از ثبت هم‌زمان یا تکراری
+      await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM users WHERE id = ? FOR UPDATE`,
+        [workerId]
+      );
+
+      if (idempotencyKey) {
+        const [dupRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id FROM financial_transactions WHERE idempotency_key = ? LIMIT 1`,
+          [idempotencyKey]
+        );
+        if (dupRows.length > 0) {
+          await conn.rollback();
+          res.status(409).json({
+            ok: false,
+            code: 'DUPLICATE_REQUEST',
+            message: 'این درخواست قبلاً ثبت شده است.',
+          });
+          return;
+        }
+      }
+
+      const [result] = await conn.execute<mysql.ResultSetHeader>(
         `INSERT INTO financial_transactions
           (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, receipt_file_url, receipt_file_name, status, is_seen_by_manager, idempotency_key)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?)`,
@@ -3397,6 +3549,27 @@ apiRouter.post(
         ]
       );
 
+      await recordAuditLog({
+        actorUserId: workerId,
+        actionType: 'FINANCE_WORKER_REQUEST',
+        targetEntity: 'financial_transactions',
+        targetId: result.insertId,
+        afterState: {
+          amount_toman: amountToman,
+          tx_type: txType,
+          shamsi_date: shamsiDate,
+          status: 'PENDING',
+        },
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      if (getSimulatedMidTransactionFailure() === 'finance_payment') {
+        throw new Error('SIMULATED_DB_DISCONNECT');
+      }
+
+      await conn.commit();
+
       res.status(201).json({
         ok: true,
         transactionId: result.insertId,
@@ -3406,15 +3579,25 @@ apiRouter.post(
             : 'درخواست مالی ثبت شد و در انتظار تأیید مدیریت قرار گرفت.',
       });
     } catch (err) {
+      if (conn) {
+        try {
+          await conn.rollback();
+        } catch {
+          // ignore
+        }
+      }
       const errObj = err as { code?: string };
       if (errObj?.code === 'ER_DUP_ENTRY') {
         res.status(409).json({
           ok: false,
+          code: 'DUPLICATE_REQUEST',
           message: 'این درخواست قبلاً ثبت شده است.',
         });
         return;
       }
       handleServerError(res, err);
+    } finally {
+      if (conn) conn.release();
     }
   }
 );
@@ -3434,8 +3617,10 @@ apiRouter.post(
       const shamsiDateInput = req.body?.shamsi_date ? String(req.body.shamsi_date).trim() : '';
       const receiptBase64 = req.body?.receipt_base64 ? String(req.body.receipt_base64) : null;
       const receiptFileName = req.body?.receipt_file_name ? String(req.body.receipt_file_name) : 'receipt.jpg';
-      const idempotencyKey = req.body?.idempotency_key
-        ? String(req.body.idempotency_key).trim().slice(0, 64)
+      const rawIdempotency =
+        req.body?.idempotency_key || req.headers['x-idempotency-key'] || null;
+      const idempotencyKey = rawIdempotency
+        ? String(rawIdempotency).trim().slice(0, 64)
         : null;
 
       if (!Number.isInteger(amountToman) || amountToman <= 0) {
@@ -3471,6 +3656,28 @@ apiRouter.post(
       conn = await pool.getConnection();
       await conn.beginTransaction();
 
+      // قفل ردیف کاربر برای جلوگیری از ثبت هم‌زمان پرداخت تکراری
+      await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM users WHERE id = ? FOR UPDATE`,
+        [workerId]
+      );
+
+      if (idempotencyKey) {
+        const [dupRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id FROM financial_transactions WHERE idempotency_key = ? LIMIT 1`,
+          [idempotencyKey]
+        );
+        if (dupRows.length > 0) {
+          await conn.rollback();
+          res.status(409).json({
+            ok: false,
+            code: 'DUPLICATE_REQUEST',
+            message: 'این پرداخت قبلاً ثبت شده است.',
+          });
+          return;
+        }
+      }
+
       const managerNoteInput = req.body?.manager_note
         ? String(req.body.manager_note).trim().slice(0, 500)
         : 'ثبت مستقیم توسط مدیریت';
@@ -3495,6 +3702,25 @@ apiRouter.post(
         ]
       );
 
+      await recordAuditLog({
+        actorUserId: managerId,
+        actionType: 'FINANCE_MANAGER_DIRECT',
+        targetEntity: 'financial_transactions',
+        targetId: result.insertId,
+        afterState: {
+          amount_toman: amountToman,
+          tx_type: txType,
+          shamsi_date: shamsiDate,
+          status: 'APPROVED',
+        },
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      if (getSimulatedMidTransactionFailure() === 'finance_payment') {
+        throw new Error('SIMULATED_DB_DISCONNECT');
+      }
+
       await conn.commit();
 
       res.status(201).json({
@@ -3514,6 +3740,7 @@ apiRouter.post(
       if (errObj?.code === 'ER_DUP_ENTRY') {
         res.status(409).json({
           ok: false,
+          code: 'DUPLICATE_REQUEST',
           message: 'این پرداخت قبلاً ثبت شده است.',
         });
         return;
@@ -3577,6 +3804,21 @@ apiRouter.post(
          WHERE id = ? AND status = 'PENDING'`,
         [decision, managerId, managerNote, txId]
       );
+
+      await recordAuditLog({
+        actorUserId: managerId,
+        actionType: 'FINANCE_REVIEW',
+        targetEntity: 'financial_transactions',
+        targetId: txId,
+        beforeState: { status: tx.status, amount_toman: tx.amount_toman },
+        afterState: { status: decision, manager_note: managerNote },
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      if (getSimulatedMidTransactionFailure() === 'finance_payment') {
+        throw new Error('SIMULATED_DB_DISCONNECT');
+      }
 
       await conn.commit();
 
@@ -3718,6 +3960,27 @@ apiRouter.put(
         ]
       );
 
+      await recordAuditLog({
+        actorUserId: req.user!.id,
+        actionType: 'FINANCE_UPDATE',
+        targetEntity: 'financial_transactions',
+        targetId: txId,
+        beforeState: {
+          amount_toman: existing.amount_toman,
+          tx_type: existing.tx_type,
+          shamsi_date: existing.shamsi_date,
+          status: existing.status,
+        },
+        afterState: {
+          amount_toman: amountToman,
+          tx_type: txType,
+          shamsi_date: shamsiDate,
+          status: nextStatus,
+        },
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
       await conn.commit();
 
       res.json({
@@ -3746,6 +4009,8 @@ apiRouter.delete(
   '/finance/:id',
   requireAuth,
   async (req: AuthenticatedRequest, res: Response) => {
+    const pool = getPool();
+    let conn: mysql.PoolConnection | null = null;
     try {
       const txId = Number(req.params.id);
       if (!txId) {
@@ -3753,13 +4018,16 @@ apiRouter.delete(
         return;
       }
 
-      const pool = getPool();
-      const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-        'SELECT * FROM financial_transactions WHERE id = ? LIMIT 1',
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        'SELECT * FROM financial_transactions WHERE id = ? FOR UPDATE',
         [txId]
       );
 
       if (rows.length === 0) {
+        await conn.rollback();
         res.status(404).json({ ok: false, message: 'مورد مالی یافت نشد.' });
         return;
       }
@@ -3769,6 +4037,7 @@ apiRouter.delete(
         req.user!.role !== 'manager' &&
         (existing.user_id !== req.user!.id || existing.created_by_user_id !== req.user!.id)
       ) {
+        await conn.rollback();
         res.status(403).json({
           ok: false,
           code: 'FORBIDDEN',
@@ -3778,6 +4047,7 @@ apiRouter.delete(
       }
 
       if (req.user!.role !== 'manager' && existing.status !== 'PENDING') {
+        await conn.rollback();
         res.status(403).json({
           ok: false,
           message: 'فقط مدیریت امکان حذف موارد پرداخت‌شده یا بررسی‌شده را دارد.',
@@ -3785,14 +4055,41 @@ apiRouter.delete(
         return;
       }
 
-      await pool.execute('DELETE FROM financial_transactions WHERE id = ?', [txId]);
+      await conn.execute('DELETE FROM financial_transactions WHERE id = ?', [txId]);
+
+      await recordAuditLog({
+        actorUserId: req.user!.id,
+        actionType: 'FINANCE_DELETE',
+        targetEntity: 'financial_transactions',
+        targetId: txId,
+        beforeState: {
+          amount_toman: existing.amount_toman,
+          tx_type: existing.tx_type,
+          shamsi_date: existing.shamsi_date,
+          status: existing.status,
+          description: existing.description,
+        },
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      await conn.commit();
 
       res.json({
         ok: true,
         message: 'مورد مالی حذف شد و مانده حساب به‌روزرسانی گردید.',
       });
     } catch (err) {
+      if (conn) {
+        try {
+          await conn.rollback();
+        } catch {
+          // ignore
+        }
+      }
       handleServerError(res, err);
+    } finally {
+      if (conn) conn.release();
     }
   }
 );
@@ -4098,8 +4395,10 @@ apiRouter.get(
       let totalConfirmedOvertimeMinutes = 0;
       let totalRecordedWorkDays = 0;
       let incompleteDaysCount = 0;
+      let hourlyEarnedRegularWorkToman = 0;
       let totalOvertimePayTomanAccum = 0;
       const confirmedAttendanceShamsiDates = new Set<string>();
+      const activeMonthlyCycles = new Set<string>();
 
       const dailySummaries: DailyAttendanceSummary[] = [];
 
@@ -4116,13 +4415,20 @@ apiRouter.get(
           incompleteDaysCount += 1;
         } else if (summary.logs.length > 0) {
           confirmedAttendanceShamsiDates.add(shamsiDate);
+          if (summary.net_work_minutes > 0 || summary.overtime_minutes > 0) {
+            activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(shamsiDate, 15));
+          }
           totalRecordedWorkDays += 1;
           totalConfirmedNetWorkMinutes += summary.net_work_minutes;
           totalConfirmedOvertimeMinutes += summary.overtime_minutes;
 
+          const dayRegularMinutes = Math.max(0, summary.net_work_minutes - summary.overtime_minutes);
           const daySalaryCalc = calculateSalaryAndOvertimeRates(
             effectiveSettings,
             summary.overtime_minutes
+          );
+          hourlyEarnedRegularWorkToman += Math.round(
+            (dayRegularMinutes / 60) * daySalaryCalc.effectiveHourlyRateToman
           );
           totalOvertimePayTomanAccum += daySalaryCalc.totalOvertimePayToman;
         }
@@ -4158,12 +4464,18 @@ apiRouter.get(
 
             const rowNetMins = Number(row.net_work_minutes || 0);
             const rowOtMins = Number(row.overtime_minutes || 0);
+            if (rowNetMins > 0 || rowOtMins > 0) {
+              activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
+            }
             totalRecordedWorkDays += 1;
             totalConfirmedNetWorkMinutes += rowNetMins;
             totalConfirmedOvertimeMinutes += rowOtMins;
 
             const effSet = await getSystemSettingsFromDb(normShamsi);
             const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+            hourlyEarnedRegularWorkToman += Math.round(
+              (rowNetMins / 60) * rowCalc.effectiveHourlyRateToman
+            );
             totalOvertimePayTomanAccum += rowCalc.totalOvertimePayToman;
           }
         } else {
@@ -4176,6 +4488,9 @@ apiRouter.get(
           if (rec.work_days_count === 1 && normShamsi) {
             confirmedAttendanceShamsiDates.add(normShamsi);
           }
+          if ((rec.net_work_minutes > 0 || rec.overtime_minutes > 0) && normShamsi && isValidShamsiDate(normShamsi)) {
+            activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
+          }
 
           totalRecordedWorkDays += rec.work_days_count;
           totalConfirmedNetWorkMinutes += rec.net_work_minutes;
@@ -4183,9 +4498,25 @@ apiRouter.get(
 
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
+          hourlyEarnedRegularWorkToman += Math.round(
+            (rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman
+          );
           totalOvertimePayTomanAccum += recCalc.totalOvertimePayToman;
         }
       }
+
+      const hasMonthlyFixedSalary =
+        currentSettings.base_salary_toman !== null &&
+        currentSettings.base_salary_toman !== undefined &&
+        Number(currentSettings.base_salary_toman) > 0 &&
+        (currentSettings.hourly_rate_toman === null ||
+          currentSettings.hourly_rate_toman === undefined ||
+          Number(currentSettings.hourly_rate_toman) <= 0);
+
+      const earnedRegularWorkToman = hasMonthlyFixedSalary
+        ? activeMonthlyCycles.size * Math.round(Number(currentSettings.base_salary_toman))
+        : hourlyEarnedRegularWorkToman;
+      const totalSalaryPlusOvertimeToman = earnedRegularWorkToman + totalOvertimePayTomanAccum;
 
       const [finRows] = await pool.execute<mysql.RowDataPacket[]>(
         `SELECT
@@ -4264,7 +4595,9 @@ apiRouter.get(
           baseSalaryToman: salaryCalc.baseSalaryToman,
           effectiveHourlyRateToman: salaryCalc.effectiveHourlyRateToman,
           effectiveOvertimeHourlyRateToman: salaryCalc.effectiveOvertimeHourlyRateToman,
+          earnedRegularWorkToman,
           totalOvertimePayToman: totalOvertimePayTomanAccum,
+          totalSalaryPlusOvertimeToman,
         },
         unseenAlerts: {
           financeAlert: Number(finRows[0]?.unseen_or_pending_fin || 0) > 0,
@@ -4467,6 +4800,93 @@ apiRouter.get(
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="mgammon-backup.json"');
       res.send(JSON.stringify(backupPayload, null, 2));
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
+apiRouter.post(
+  '/manager/backup/create',
+  requireAuth,
+  requireRole('manager'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const result = await createFullBackup();
+      await recordAuditLog({
+        actorUserId: req.user!.id,
+        actionType: 'FULL_BACKUP_CREATE',
+        targetEntity: 'system_backups',
+        afterState: {
+          backupId: result.manifest.backupId,
+          sizeBytes: result.sizeBytes,
+          checksum: result.manifest.payloadChecksum,
+          mediaFilesCount: result.manifest.mediaFilesCount,
+        },
+        ipAddress: req.ip || null,
+      });
+      res.status(201).json({
+        ok: true,
+        backupId: result.manifest.backupId,
+        sizeBytes: result.sizeBytes,
+        manifest: result.manifest,
+        message: 'نسخه پشتیبان کامل (دیتابیس و فایل‌های خصوصی) با موفقیت ایجاد و راستی‌آزمایی شد.',
+      });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
+apiRouter.get(
+  '/manager/backup/list',
+  requireAuth,
+  requireRole('manager'),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const backups = listAvailableBackups().map((b) => ({
+        fileName: b.fileName,
+        sizeBytes: b.sizeBytes,
+        valid: b.valid,
+        manifest: b.manifest,
+        error: b.error,
+      }));
+      res.json({ ok: true, backups });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
+apiRouter.post(
+  '/manager/backup/verify',
+  requireAuth,
+  requireRole('manager'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const fileName = path.basename(String(req.body?.fileName || '').trim());
+      if (!fileName || !fileName.endsWith('.mgbackup.json')) {
+        res.status(400).json({ ok: false, message: 'نام فایل پشتیبان معتبر نیست.' });
+        return;
+      }
+      const backupDir =
+        process.env.BACKUP_DIR || path.resolve(process.cwd(), '.data/backups');
+      const fullPath = path.join(backupDir, fileName);
+      const verification = verifyBackupArchive(fullPath);
+      if (!verification.valid) {
+        res.status(422).json({
+          ok: false,
+          valid: false,
+          message: verification.reason || 'نسخه پشتیبان نامعتبر است.',
+        });
+        return;
+      }
+      res.json({
+        ok: true,
+        valid: true,
+        manifest: verification.manifest,
+        message: 'صحت ساختار و امضای دیجیتال (SHA-256) نسخه پشتیبان تأیید شد.',
+      });
     } catch (err) {
       handleServerError(res, err);
     }

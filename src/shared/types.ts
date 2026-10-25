@@ -287,3 +287,13 @@ export interface AuditLogItem {
   ip_address: string | null;
   created_at: string;
 }
+
+export interface SystemSettingsSnapshot {
+  id?: number;
+  effective_from_shamsi: string;
+  settings: SystemSettings;
+  changed_by_user_id?: number | null;
+  change_reason?: string | null;
+  created_at?: string;
+}
+

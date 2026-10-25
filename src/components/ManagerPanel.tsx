@@ -40,6 +40,7 @@ import { MonthlyAttendanceCalendar } from './MonthlyAttendanceCalendar';
 import { LeaveManagementSection } from './LeaveManagementSection';
 import { DailyTasksChecklist } from './DailyTasksChecklist';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
+import { MonthlyStatementSection } from './MonthlyStatementSection';
 import {
   LayoutDashboard,
   Clock,
@@ -94,7 +95,9 @@ interface DashboardResponse {
     baseSalaryToman: number;
     effectiveHourlyRateToman: number;
     effectiveOvertimeHourlyRateToman: number;
+    earnedRegularWorkToman?: number;
     totalOvertimePayToman: number;
+    totalSalaryPlusOvertimeToman?: number;
   };
   unseenAlerts: {
     financeAlert: boolean;
@@ -1744,6 +1747,17 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 })()}
               </div>
 
+              {/* ۳-ب. صورتحساب دقیق هر ماه / دوره کاری (حقوق + اضافه‌کاری و جمع پرداختی مدیر به تفکیک ماه) */}
+              <MonthlyStatementSection
+                role="manager"
+                currentShamsiDate={currentShamsi}
+                collaborationStartShamsi={dashboard.settings.collaboration_start_shamsi}
+                dailySummaries={attendanceSummaries}
+                historicalRecords={historicalRecords}
+                transactions={transactions}
+                settings={dashboard.settings}
+              />
+
               {/* ۴. نمودار زیبای روند کلی فعالیت با حالات هفتگی، ماهانه و سالانه و تفکیک رنگی در یک نگاه */}
               <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3.5 shadow-2xs">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
@@ -1794,8 +1808,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 </div>
 
-                {/* راهنمای رنگ‌ها و خلاصه مجموع دوره انتخاب‌شده در یک نگاه */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                {/* راهنمای رنگ‌ها و خلاصه مجموع دوره انتخاب‌شده + مجموع کارکرد و پرداختی کل تا تاریخ روز */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
                   <div className="rounded-xl bg-emerald-50/80 border border-emerald-200 px-3 py-2 flex items-center justify-between">
                     <div className="flex items-center gap-1.5">
                       <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 shrink-0" />
@@ -1833,6 +1847,34 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     </div>
                     <strong className="text-purple-800 font-extrabold tabular-nums">
                       {toPersianDigits(periodTotals.leavesCount)} مورد
+                    </strong>
+                  </div>
+
+                  <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/70 px-3 py-2 flex items-center justify-between gap-1.5">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="w-2.5 h-2.5 rounded-full bg-[#C5A059] shrink-0" />
+                      <span className="text-[11px] font-bold text-[#0B192C] truncate">
+                        مجموع کارکرد تا تاریخ روز (حقوق + اضافه‌کاری)
+                      </span>
+                    </div>
+                    <strong className="text-[#0B192C] font-extrabold tabular-nums whitespace-nowrap">
+                      {formatToman(
+                        dashboard.kpis.totalSalaryPlusOvertimeToman ??
+                          (dashboard.kpis.earnedRegularWorkToman ?? 0) +
+                            dashboard.kpis.totalOvertimePayToman
+                      )}
+                    </strong>
+                  </div>
+
+                  <div className="rounded-xl bg-teal-50/85 border border-teal-200 px-3 py-2 flex items-center justify-between gap-1.5">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="w-2.5 h-2.5 rounded-full bg-teal-600 shrink-0" />
+                      <span className="text-[11px] font-bold text-teal-950 truncate">
+                        جمع کل پرداختی تا تاریخ روز
+                      </span>
+                    </div>
+                    <strong className="text-teal-800 font-extrabold tabular-nums whitespace-nowrap">
+                      {formatToman(dashboard.kpis.approvedPaymentsToman)}
                     </strong>
                   </div>
                 </div>
@@ -2804,6 +2846,17 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           {/* ================= تب ۴: امور مالی، مساعده، هزینه‌های متفرقه (اسنپ/وسیله) و تنخواه ================= */}
           {activeTab === 'finance' && (
             <div className="space-y-4">
+              {/* صورتحساب تفصیلی هر ماه / دوره کاری (مبلغ حقوق + اضافه‌کاری، تنخواه و جمع کل پرداختی مدیر در هر ماه) */}
+              <MonthlyStatementSection
+                role="manager"
+                currentShamsiDate={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                collaborationStartShamsi={dashboard?.settings.collaboration_start_shamsi}
+                dailySummaries={attendanceSummaries}
+                historicalRecords={historicalRecords}
+                transactions={transactions}
+                settings={dashboard?.settings || null}
+              />
+
               <form
                 onSubmit={handleManagerAddPayment}
                 className="rounded-2xl bg-white border border-[#C5A059]/50 p-4 space-y-3"

@@ -1,11 +1,22 @@
 -- ============================================================================
 -- MGAMMON Duo — سامانه سبک حضور، غیاب، کارکرد و امور مالی
 -- مدیریت: مجید نورایی | پرسنل: امید میثمی
--- ساختار جداول پایگاه داده MySQL / MariaDB (قابل ایمپورت در phpMyAdmin سی‌پنل)
+-- ساختار جداول پایگاه داده MySQL 5.7/8.0+ و MariaDB 10.3+ (قابل ایمپورت در phpMyAdmin سی‌پنل)
 -- ============================================================================
 
 SET NAMES utf8mb4;
 SET time_zone = '+03:30';
+
+-- ۰. جدول نسخه‌بندی مهاجرت‌های ساختار پایگاه داده (Idempotent Schema Migrations)
+CREATE TABLE IF NOT EXISTS `schema_migrations` (
+  `version` INT UNSIGNED NOT NULL,
+  `name` VARCHAR(120) NOT NULL,
+  `checksum` VARCHAR(64) NOT NULL,
+  `applied_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `execution_ms` INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (`version`),
+  UNIQUE KEY `uq_schema_migrations_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ۱. جدول کاربران (فقط دو نقش: مدیر [مجید نورایی] و پرسنل [امید میثمی])
 CREATE TABLE IF NOT EXISTS `users` (
@@ -19,6 +30,7 @@ CREATE TABLE IF NOT EXISTS `users` (
   `phone_number` VARCHAR(20) NULL DEFAULT NULL COMMENT 'شماره همراه جهت دریافت پیامک',
   `biometric_credential_id` VARCHAR(255) NULL DEFAULT NULL COMMENT 'شناسه اثر انگشت / تشخیص چهره دستگاه',
   `biometric_token_hash` VARCHAR(255) NULL DEFAULT NULL COMMENT 'هش کلید ورود سریع بیومتریک',
+  `must_change_password` TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'الزام تغییر رمز عبور اولیه',
   `is_active` TINYINT(1) NOT NULL DEFAULT 1,
   `last_login_at` DATETIME NULL DEFAULT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -55,9 +67,11 @@ CREATE TABLE IF NOT EXISTS `attendance_logs` (
   `modified_by_user_id` INT UNSIGNED NULL DEFAULT NULL,
   `modification_reason` VARCHAR(500) NULL DEFAULT NULL,
   `is_deleted` TINYINT(1) NOT NULL DEFAULT 0,
+  `idempotency_key` VARCHAR(64) NULL DEFAULT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_attendance_idempotency` (`idempotency_key`),
   KEY `idx_attendance_user_date` (`user_id`, `work_date`, `is_deleted`),
   KEY `idx_attendance_shamsi` (`shamsi_date`),
   CONSTRAINT `fk_attendance_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`),
@@ -83,11 +97,15 @@ CREATE TABLE IF NOT EXISTS `historical_work_records` (
   `created_by_user_id` INT UNSIGNED NOT NULL,
   `reviewed_by_user_id` INT UNSIGNED NULL DEFAULT NULL,
   `reviewed_at` DATETIME NULL DEFAULT NULL,
+  `idempotency_key` VARCHAR(64) NULL DEFAULT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_hist_idempotency` (`idempotency_key`),
   KEY `idx_hist_work_shamsi` (`shamsi_date`),
+  KEY `idx_hist_work_user_status` (`user_id`, `status`),
   CONSTRAINT `fk_hist_work_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`),
-  CONSTRAINT `fk_hist_work_creator` FOREIGN KEY (`created_by_user_id`) REFERENCES `users` (`id`)
+  CONSTRAINT `fk_hist_work_creator` FOREIGN KEY (`created_by_user_id`) REFERENCES `users` (`id`),
+  CONSTRAINT `fk_hist_work_reviewer` FOREIGN KEY (`reviewed_by_user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ۵. جدول گزارش‌های کار روزانه (همراه با تصویر کار انجام‌شده)
@@ -102,9 +120,11 @@ CREATE TABLE IF NOT EXISTS `daily_work_reports` (
   `photo_name` VARCHAR(255) NULL DEFAULT NULL COMMENT 'نام فایل تصویر گزارش',
   `recorded_time` VARCHAR(8) NOT NULL,
   `is_seen_by_manager` TINYINT(1) NOT NULL DEFAULT 0,
+  `idempotency_key` VARCHAR(64) NULL DEFAULT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_reports_idempotency` (`idempotency_key`),
   KEY `idx_reports_user_date` (`user_id`, `report_date`),
   KEY `idx_reports_shamsi` (`shamsi_date`),
   CONSTRAINT `fk_reports_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
@@ -132,6 +152,7 @@ CREATE TABLE IF NOT EXISTS `financial_transactions` (
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_fin_idempotency` (`idempotency_key`),
+  KEY `idx_fin_user_status` (`user_id`, `status`),
   KEY `idx_fin_status_date` (`status`, `tx_date`),
   KEY `idx_fin_shamsi` (`shamsi_date`),
   KEY `idx_fin_type` (`tx_type`),
@@ -233,11 +254,14 @@ CREATE TABLE IF NOT EXISTS `leave_requests` (
   `manager_note` VARCHAR(500) NULL DEFAULT NULL,
   `reviewed_by_user_id` INT UNSIGNED NULL DEFAULT NULL,
   `reviewed_at` DATETIME NULL DEFAULT NULL,
+  `idempotency_key` VARCHAR(64) NULL DEFAULT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_leaves_idempotency` (`idempotency_key`),
   KEY `idx_leave_shamsi` (`shamsi_date`),
   KEY `idx_leave_status` (`status`),
-  CONSTRAINT `fk_leave_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+  CONSTRAINT `fk_leave_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`),
+  CONSTRAINT `fk_leave_reviewer` FOREIGN KEY (`reviewed_by_user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ۱۱. جدول چک‌لیست کارها و وظایف روزانه محول‌شده به پرسنل

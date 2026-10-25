@@ -7,6 +7,9 @@ import mysql from 'mysql2/promise';
 import {
   getPool,
   initializeDatabase,
+  isDatabaseInitialized,
+  migrateLegacyPublicMediaToPrivate,
+  sanitizeDbErrorMessage,
   validateProductionSecurityConfig,
 } from './src/server/db';
 import { getSessionUser, requireCsrfProtection } from './src/server/auth';
@@ -40,17 +43,54 @@ export async function createApp() {
     next();
   });
 
-  // اطمینان از وجود پوشه‌های ذخیره فایل خصوصی و رسانه
+  // مسدودسازی کامل دسترسی وب به مسیرهای مخفی، پشتیبان‌ها و اسکریپت‌های دیتابیس
+  app.use((req, res, next) => {
+    const cleanPath = decodeURIComponent(req.path || '').toLowerCase();
+    if (
+      cleanPath.startsWith('/.data') ||
+      cleanPath.startsWith('/backups') ||
+      cleanPath.startsWith('/database') ||
+      cleanPath.includes('/.env')
+    ) {
+      res.status(403).json({
+        ok: false,
+        code: 'FORBIDDEN',
+        message: 'دسترسی مستقیم به فایل‌های سیستمی و پشتیبان مجاز نیست.',
+      });
+      return;
+    }
+    next();
+  });
+
+  // اطمینان از وجود پوشه‌های ذخیره فایل خصوصی خارج از مسیر عمومی وب (.data/private_media)
   const privateBaseDir = path.resolve(process.cwd(), '.data/private_media');
   const legacyPublicMediaDir = path.resolve(process.cwd(), 'public/assets/media');
   for (const folder of PRIVATE_MEDIA_FOLDERS) {
     try {
-      fs.mkdirSync(path.join(privateBaseDir, folder), { recursive: true });
-      fs.mkdirSync(path.join(legacyPublicMediaDir, folder), { recursive: true });
+      fs.mkdirSync(path.join(privateBaseDir, folder), { recursive: true, mode: 0o700 });
     } catch {
       // ignore
     }
   }
+  migrateLegacyPublicMediaToPrivate();
+
+  // گیت آمادگی دیتابیس: هیچ درخواست وابسته به دیتابیس پیش از تکمیل initializeDatabase پذیرفته نمی‌شود
+  app.use('/api', (req, res, next) => {
+    if (req.path === '/health') {
+      next();
+      return;
+    }
+    if (!isDatabaseInitialized()) {
+      res.status(503).json({
+        ok: false,
+        dbConnected: false,
+        code: 'DB_UNAVAILABLE',
+        message: 'پایگاه داده هنوز آماده بهره‌برداری نیست یا ارتباط با سرور برقرار نشد.',
+      });
+      return;
+    }
+    next();
+  });
 
   // محافظت CSRF روی مسیرهای تغییردهنده API
   app.use('/api', requireCsrfProtection, apiRouter);
@@ -70,6 +110,15 @@ export async function createApp() {
         filename.includes('\0')
       ) {
         res.status(400).json({ ok: false, message: 'مسیر فایل معتبر نیست.' });
+        return;
+      }
+
+      if (!isDatabaseInitialized()) {
+        res.status(503).json({
+          ok: false,
+          code: 'DB_UNAVAILABLE',
+          message: 'ارتباط با پایگاه داده برقرار نیست.',
+        });
         return;
       }
 
@@ -138,11 +187,15 @@ export async function createApp() {
         }
       }
 
-      const candidatePrivate = path.resolve(privateBaseDir, folder, filename);
+      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR
+        ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
+        : privateBaseDir;
+
+      const candidatePrivate = path.resolve(activePrivateBase, folder, filename);
       const candidateLegacy = path.resolve(legacyPublicMediaDir, folder, filename);
 
       if (
-        !candidatePrivate.startsWith(path.resolve(privateBaseDir, folder)) ||
+        !candidatePrivate.startsWith(path.resolve(activePrivateBase, folder)) ||
         !candidateLegacy.startsWith(path.resolve(legacyPublicMediaDir, folder))
       ) {
         res.status(400).json({ ok: false, message: 'مسیر فایل نامعتبر است.' });
@@ -186,8 +239,20 @@ export async function createApp() {
   return app;
 }
 
-async function startServer() {
+export async function startServer() {
   validateProductionSecurityConfig(process.env);
+
+  // ۱. اجرای کامل initializeDatabase پیش از پذیرش درخواست‌های وابسته به دیتابیس
+  try {
+    await initializeDatabase();
+    console.log('[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests.');
+  } catch (err) {
+    console.error(
+      '[MGAMMON Duo] Database initialization failed during startup:',
+      sanitizeDbErrorMessage(err)
+    );
+  }
+
   const app = await createApp();
   const PORT = Number(process.env.PORT || 3000);
 
@@ -211,24 +276,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${PORT}`);
   });
 
-  initializeDatabase()
-    .then(() => {
-      console.log('[MGAMMON Duo] MySQL/MariaDB database initialized and verified.');
-    })
-    .catch((err) => {
-      console.error(
-        '[MGAMMON Duo] Warning: Initial MySQL connection failed:',
-        (err as Error).message
-      );
-    });
+  return server;
 }
 
 // اجرا در صورتی که مستقیماً فراخوانی شده باشد (و نه در حین ایمپورت تست‌ها)
 if (process.env.VITEST !== 'true') {
   startServer();
 }
-
