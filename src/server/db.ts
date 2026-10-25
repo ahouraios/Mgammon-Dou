@@ -822,6 +822,78 @@ const SCHEMA_MIGRATIONS: SchemaMigrationSpec[] = [
         'idx_fin_user_status',
         'KEY `idx_fin_user_status` (`user_id`, `status`)'
       );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'late_status',
+        "ENUM('NONE', 'PENDING', 'EXCUSED', 'APPROVED_DELAY', 'ABSENCE', 'DEDUCT_LEAVE', 'CUSTOM') NOT NULL DEFAULT 'NONE'"
+      );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'late_reason',
+        'VARCHAR(500) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'manager_late_note',
+        'VARCHAR(500) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'custom_deduction_toman',
+        'DECIMAL(15, 0) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'late_reviewed_by_user_id',
+        'INT UNSIGNED NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'late_reviewed_at',
+        'DATETIME NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'attendance_logs',
+        'is_late_seen_by_worker',
+        'TINYINT(1) NOT NULL DEFAULT 1'
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'late_deduction_unit',
+        "ENUM('MINUTE', 'HOUR') NOT NULL DEFAULT 'MINUTE'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'late_deduction_rate_toman',
+        'DECIMAL(15, 0) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'absence_deduction_unit',
+        "ENUM('DAY', 'HOUR') NOT NULL DEFAULT 'DAY'"
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'absence_deduction_rate_toman',
+        'DECIMAL(15, 0) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'system_settings',
+        'sms_on_task_and_message',
+        'TINYINT(1) NOT NULL DEFAULT 0'
+      );
     },
   },
 ];
@@ -1289,12 +1361,27 @@ export function mapRowToSystemSettings(row: mysql.RowDataPacket): SystemSettings
       row.overtime_rate_toman !== null && row.overtime_rate_toman !== undefined
         ? Number(row.overtime_rate_toman)
         : null,
+    late_deduction_unit: row.late_deduction_unit === 'HOUR' ? 'HOUR' : 'MINUTE',
+    late_deduction_rate_toman:
+      row.late_deduction_rate_toman !== null &&
+      row.late_deduction_rate_toman !== undefined &&
+      Number(row.late_deduction_rate_toman) > 0
+        ? Number(row.late_deduction_rate_toman)
+        : null,
+    absence_deduction_unit: row.absence_deduction_unit === 'HOUR' ? 'HOUR' : 'DAY',
+    absence_deduction_rate_toman:
+      row.absence_deduction_rate_toman !== null &&
+      row.absence_deduction_rate_toman !== undefined &&
+      Number(row.absence_deduction_rate_toman) > 0
+        ? Number(row.absence_deduction_rate_toman)
+        : null,
     collaboration_start_shamsi: String(row.collaboration_start_shamsi || '1405/06/15'),
     monthly_leave_quota_days:
       row.monthly_leave_quota_days !== null && row.monthly_leave_quota_days !== undefined
         ? Number(row.monthly_leave_quota_days)
         : 2.5,
     sms_enabled: Boolean(row.sms_enabled),
+    sms_on_task_and_message: Boolean(row.sms_on_task_and_message),
     melipayamak_username: String(row.melipayamak_username || ''),
     melipayamak_password: String(row.melipayamak_password || ''),
     melipayamak_from_number: String(row.melipayamak_from_number || ''),

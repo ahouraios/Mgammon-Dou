@@ -1,9 +1,12 @@
 import {
+  AbsenceDeductionUnit,
   AttendanceEventType,
   AttendanceLog,
   DailyAttendanceSummary,
   FinancialTransaction,
   HistoricalWorkRecord,
+  LateArrivalDisposition,
+  LateDeductionUnit,
   SystemSettings,
   WorkerLiveState,
   WorkerLiveStatus,
@@ -300,14 +303,25 @@ export function calculateDailyAttendance(
   const firstLog = activeLogs[0];
   const lastLog = activeLogs[activeLogs.length - 1];
   const firstInMin = parseTimeToMinutes(firstLog.recorded_time);
+  const firstWorkStartLog =
+    activeLogs.find((l) => l.event_type === 'WORK_START') || firstLog;
 
-  // تشخیص تأخیر در روز کاری عادی (در صورتی که شروع روز با مأموریت نباشد یا سیاست مأموریت جزء کار باشد)
-  let isLate = false;
-  let lateMinutes = 0;
+  // تشخیص تأخیر خام در روز کاری عادی (نسبت به ساعت شروع شیفت + حد مجاز تأخیر)
+  let rawLateMinutes = 0;
   if (isWorkingDay && firstInMin > shiftStartMin + graceMin) {
-    isLate = true;
-    lateMinutes = firstInMin - shiftStartMin;
+    rawLateMinutes = firstInMin - shiftStartMin;
   }
+
+  const rawLateStatus = firstWorkStartLog.late_status;
+  const effectiveLateStatus: LateArrivalDisposition =
+    rawLateStatus && rawLateStatus !== 'NONE'
+      ? rawLateStatus
+      : rawLateMinutes > 0
+        ? 'PENDING'
+        : 'NONE';
+
+  let isLate = rawLateMinutes > 0;
+  let lateMinutes = rawLateMinutes;
 
   // بررسی اینکه آیا آخرین رکورد بسته شده است (WORK_END)
   const isClosed = lastLog.event_type === 'WORK_END';
@@ -417,31 +431,75 @@ export function calculateDailyAttendance(
       ? Math.min(settings.break_duration_minutes, effectiveGrossConfirmed)
       : 0;
 
-  const netWorkMinutes =
+  let netWorkMinutes =
     isClosed && !isHolidayWorkDisabled ? Math.max(0, effectiveGrossConfirmed - breakDeducted) : 0;
 
-  const confirmedOvertimeMinutes =
+  let confirmedOvertimeMinutes =
     isClosed && !isHolidayWorkDisabled
       ? isHolidayOrFriday && settings.friday_holiday_policy === 'ALL_OVERTIME'
         ? Math.min(overtimeRawMinutes, netWorkMinutes)
         : overtimeRawMinutes
       : 0;
 
+  let lateDeductionToman = 0;
+  const deductionRates = calculateLateAndAbsenceRates(settings);
+
+  if (effectiveLateStatus === 'EXCUSED') {
+    isLate = false;
+    lateMinutes = 0;
+    lateDeductionToman = 0;
+  } else if (effectiveLateStatus === 'DEDUCT_LEAVE') {
+    isLate = false;
+    lateMinutes = rawLateMinutes;
+    lateDeductionToman = 0;
+  } else if (effectiveLateStatus === 'APPROVED_DELAY') {
+    isLate = true;
+    lateMinutes = rawLateMinutes;
+    lateDeductionToman =
+      deductionRates.lateUnit === 'HOUR'
+        ? Math.round((rawLateMinutes / 60) * deductionRates.effectiveLateRatePerUnitToman)
+        : Math.round(rawLateMinutes * deductionRates.effectiveLateRatePerUnitToman);
+  } else if (effectiveLateStatus === 'ABSENCE') {
+    isLate = true;
+    lateMinutes = rawLateMinutes;
+    netWorkMinutes = 0;
+    confirmedOvertimeMinutes = 0;
+    lateDeductionToman = deductionRates.effectiveDailyAbsenceRateToman;
+  } else if (effectiveLateStatus === 'CUSTOM') {
+    isLate = true;
+    lateMinutes = rawLateMinutes;
+    lateDeductionToman = Math.max(
+      0,
+      Math.round(Number(firstWorkStartLog.custom_deduction_toman || 0))
+    );
+  }
+
   const provisionalGross = effectiveGrossConfirmed + provisionalExtraMinutes;
-  const provisionalTotalMinutes = isHolidayWorkDisabled
-    ? 0
-    : Math.max(
-        0,
-        provisionalGross - (provisionalGross > 240 ? settings.break_duration_minutes : 0)
-      );
+  const provisionalTotalMinutes =
+    isHolidayWorkDisabled || effectiveLateStatus === 'ABSENCE'
+      ? 0
+      : Math.max(
+          0,
+          provisionalGross - (provisionalGross > 240 ? settings.break_duration_minutes : 0)
+        );
 
   let statusLabel = 'ثبت قطعی';
-  if (isIncomplete) {
+  if (effectiveLateStatus === 'ABSENCE') {
+    statusLabel = 'ثبت غیبت (تصمیم مدیر)';
+  } else if (isIncomplete) {
     statusLabel = isToday ? 'در حال کار (جاری)' : 'رکورد ناقص (نیازمند ثبت پایان کار)';
   } else if (isHolidayWorkDisabled) {
     statusLabel = 'تعطیل (کار در تعطیلات غیرفعال)';
   } else if (isHolidayOrFriday) {
     statusLabel = 'کار در روز تعطیل';
+  } else if (effectiveLateStatus === 'EXCUSED') {
+    statusLabel = 'ثبت بدون تأخیر (تأیید مدیر)';
+  } else if (effectiveLateStatus === 'DEDUCT_LEAVE') {
+    statusLabel = 'کسر از مرخصی (بابت تأخیر)';
+  } else if (effectiveLateStatus === 'APPROVED_DELAY') {
+    statusLabel = 'حضور با تأخیر (کسر تأخیر)';
+  } else if (effectiveLateStatus === 'CUSTOM') {
+    statusLabel = 'حضور با تأخیر (تعیین تکلیف مدیر)';
   } else if (isLate) {
     statusLabel = 'حضور با تأخیر';
   }
@@ -457,7 +515,22 @@ export function calculateDailyAttendance(
     last_out_time: isClosed ? lastLog.recorded_time.slice(0, 5) : null,
     is_incomplete: isIncomplete,
     is_late: isLate,
+    raw_late_minutes: rawLateMinutes,
     late_minutes: lateMinutes,
+    late_status: effectiveLateStatus,
+    late_reason: firstWorkStartLog.late_reason || firstWorkStartLog.note || null,
+    manager_late_note: firstWorkStartLog.manager_late_note || null,
+    late_deduction_toman: lateDeductionToman,
+    custom_deduction_toman:
+      firstWorkStartLog.custom_deduction_toman != null
+        ? Number(firstWorkStartLog.custom_deduction_toman)
+        : null,
+    late_reviewed_at: firstWorkStartLog.late_reviewed_at || null,
+    is_late_seen_by_worker:
+      firstWorkStartLog.is_late_seen_by_worker !== undefined
+        ? Boolean(firstWorkStartLog.is_late_seen_by_worker)
+        : true,
+    first_in_log_id: firstWorkStartLog.id || null,
     gross_presence_minutes: isClosed ? effectiveGrossConfirmed : 0,
     mission_minutes: missionMinutes,
     break_deducted_minutes: breakDeducted,
@@ -658,6 +731,102 @@ export function calculateSalaryAndOvertimeRates(
     effectiveHourlyRateToman,
     effectiveOvertimeHourlyRateToman,
     totalOvertimePayToman,
+  };
+}
+
+/**
+ * محاسبه نرخ‌های کسر بابت تأخیر در ورود و غیبت روزانه/ساعتی
+ * پیش‌فرض بر اساس قانون کار (ماه کاری ۲۶ روزه = ۲۰۸ ساعت در ماه):
+ * - نرخ پیش‌فرض هر ساعت تأخیر یا غیبت ساعتی: مزد یک ساعت کاری عادی (حقوق پایه تقسیم بر ۲۰۸)
+ * - نرخ پیش‌فرض هر دقیقه تأخیر: مزد یک دقیقه کاری عادی (نرخ ساعتی تقسیم بر ۶۰)
+ * - نرخ پیش‌فرض یک روز غیبت: مزد یک روز کاری (حقوق پایه تقسیم بر ۲۶)
+ */
+export function calculateLateAndAbsenceRates(settings: SystemSettings): {
+  lateUnit: LateDeductionUnit;
+  absenceUnit: AbsenceDeductionUnit;
+  legalHourlyRateToman: number;
+  legalMinuteRateToman: number;
+  legalDailyAbsenceRateToman: number;
+  effectiveLateRatePerUnitToman: number;
+  effectiveLateMinuteRateToman: number;
+  effectiveLateHourlyRateToman: number;
+  effectiveAbsenceRatePerUnitToman: number;
+  effectiveDailyAbsenceRateToman: number;
+  effectiveHourlyAbsenceRateToman: number;
+  isCustomLateRate: boolean;
+  isCustomAbsenceRate: boolean;
+} {
+  const baseRates = calculateSalaryAndOvertimeRates(settings, 0);
+  const legalHourlyRateToman = baseRates.effectiveHourlyRateToman;
+  const legalMinuteRateToman =
+    legalHourlyRateToman > 0 ? Math.round(legalHourlyRateToman / 60) : 0;
+  const legalDailyAbsenceRateToman =
+    baseRates.dailyBaseRateToman > 0
+      ? baseRates.dailyBaseRateToman
+      : legalHourlyRateToman * STANDARD_DAILY_WORK_HOURS;
+
+  const lateUnit: LateDeductionUnit =
+    settings.late_deduction_unit === 'HOUR' ? 'HOUR' : 'MINUTE';
+  const customLateRate =
+    settings.late_deduction_rate_toman != null &&
+    Number(settings.late_deduction_rate_toman) > 0
+      ? Math.round(Number(settings.late_deduction_rate_toman))
+      : null;
+
+  const effectiveLateRatePerUnitToman =
+    customLateRate !== null
+      ? customLateRate
+      : lateUnit === 'HOUR'
+        ? legalHourlyRateToman
+        : legalMinuteRateToman;
+
+  const effectiveLateMinuteRateToman =
+    lateUnit === 'HOUR'
+      ? Math.round(effectiveLateRatePerUnitToman / 60)
+      : effectiveLateRatePerUnitToman;
+  const effectiveLateHourlyRateToman =
+    lateUnit === 'HOUR'
+      ? effectiveLateRatePerUnitToman
+      : effectiveLateRatePerUnitToman * 60;
+
+  const absenceUnit: AbsenceDeductionUnit =
+    settings.absence_deduction_unit === 'HOUR' ? 'HOUR' : 'DAY';
+  const customAbsenceRate =
+    settings.absence_deduction_rate_toman != null &&
+    Number(settings.absence_deduction_rate_toman) > 0
+      ? Math.round(Number(settings.absence_deduction_rate_toman))
+      : null;
+
+  const effectiveAbsenceRatePerUnitToman =
+    customAbsenceRate !== null
+      ? customAbsenceRate
+      : absenceUnit === 'HOUR'
+        ? legalHourlyRateToman
+        : legalDailyAbsenceRateToman;
+
+  const effectiveDailyAbsenceRateToman =
+    absenceUnit === 'HOUR'
+      ? effectiveAbsenceRatePerUnitToman * STANDARD_DAILY_WORK_HOURS
+      : effectiveAbsenceRatePerUnitToman;
+  const effectiveHourlyAbsenceRateToman =
+    absenceUnit === 'HOUR'
+      ? effectiveAbsenceRatePerUnitToman
+      : Math.round(effectiveAbsenceRatePerUnitToman / STANDARD_DAILY_WORK_HOURS);
+
+  return {
+    lateUnit,
+    absenceUnit,
+    legalHourlyRateToman,
+    legalMinuteRateToman,
+    legalDailyAbsenceRateToman,
+    effectiveLateRatePerUnitToman,
+    effectiveLateMinuteRateToman,
+    effectiveLateHourlyRateToman,
+    effectiveAbsenceRatePerUnitToman,
+    effectiveDailyAbsenceRateToman,
+    effectiveHourlyAbsenceRateToman,
+    isCustomLateRate: customLateRate !== null,
+    isCustomAbsenceRate: customAbsenceRate !== null,
   };
 }
 
@@ -911,6 +1080,7 @@ export interface StatementDayDetail {
   totalWorkMinutes: number;
   regularPayToman: number;
   overtimePayToman: number;
+  lateDeductionToman?: number;
   totalDayPayToman: number;
   firstInTime: string | null;
   lastOutTime: string | null;
@@ -935,6 +1105,9 @@ export interface PeriodStatementSummary {
   effectiveOvertimeHourlyRateToman: number;
   earnedRegularSalaryToman: number;
   earnedOvertimePayToman: number;
+  lateAndAbsenceDeductionToman: number;
+  approvedLateMinutes: number;
+  absenceDaysCount: number;
   salaryPlusOvertimeToman: number;
   approvedPettyCashToman: number;
   totalPeriodEntitlementToman: number;
@@ -999,6 +1172,9 @@ export function calculatePeriodStatement(params: {
   let totalNetWorkMinutes = 0;
   let hourlyAccumRegularSalaryToman = 0;
   let earnedOvertimePayToman = 0;
+  let lateAndAbsenceDeductionToman = 0;
+  let approvedLateMinutes = 0;
+  let absenceDaysCount = 0;
 
   const dayDetails: StatementDayDetail[] = [];
   const coveredDates = new Set<string>();
@@ -1014,7 +1190,10 @@ export function calculatePeriodStatement(params: {
       continue;
     }
 
-    if (day.is_incomplete) {
+    const dayLateDeduction = Math.max(0, Math.round(Number(day.late_deduction_toman || 0)));
+    const isManagerAbsenceDay = day.late_status === 'ABSENCE';
+
+    if (day.is_incomplete && !isManagerAbsenceDay && dayLateDeduction === 0) {
       continue;
     }
 
@@ -1022,7 +1201,7 @@ export function calculatePeriodStatement(params: {
     const hasHistoricalWork =
       !isLiveLogDay && (day.net_work_minutes > 0 || day.overtime_minutes > 0);
 
-    if (!isLiveLogDay && !hasHistoricalWork) {
+    if (!isLiveLogDay && !hasHistoricalWork && dayLateDeduction === 0) {
       continue;
     }
 
@@ -1042,12 +1221,23 @@ export function calculatePeriodStatement(params: {
     const dayRegPay = Math.round((dayRegMins / 60) * dayRates.effectiveHourlyRateToman);
     const dayOtPay = dayRates.totalOvertimePayToman;
 
-    workDaysCount += 1;
+    if (!isManagerAbsenceDay) {
+      workDaysCount += 1;
+    } else {
+      absenceDaysCount += 1;
+    }
     regularWorkMinutes += dayRegMins;
     overtimeMinutes += dayOtMins;
     totalNetWorkMinutes += dayTotalMins;
     hourlyAccumRegularSalaryToman += dayRegPay;
     earnedOvertimePayToman += dayOtPay;
+    lateAndAbsenceDeductionToman += dayLateDeduction;
+    if (
+      day.late_status === 'APPROVED_DELAY' ||
+      day.late_status === 'CUSTOM'
+    ) {
+      approvedLateMinutes += Math.max(0, Number(day.late_minutes || 0));
+    }
 
     dayDetails.push({
       shamsiDate: normDate,
@@ -1057,12 +1247,13 @@ export function calculatePeriodStatement(params: {
       totalWorkMinutes: dayTotalMins,
       regularPayToman: dayRegPay,
       overtimePayToman: dayOtPay,
-      totalDayPayToman: dayRegPay + dayOtPay,
+      lateDeductionToman: dayLateDeduction,
+      totalDayPayToman: Math.max(0, dayRegPay + dayOtPay - dayLateDeduction),
       firstInTime: day.first_in_time,
       lastOutTime: day.last_out_time,
       statusLabel: day.status_label || 'ثبت قطعی',
       isHistorical: !isLiveLogDay,
-      workDaysCount: 1,
+      workDaysCount: isManagerAbsenceDay ? 0 : 1,
     });
   }
 
@@ -1218,7 +1409,10 @@ export function calculatePeriodStatement(params: {
     }
   }
 
-  const salaryPlusOvertimeToman = earnedRegularSalaryToman + earnedOvertimePayToman;
+  const salaryPlusOvertimeToman = Math.max(
+    0,
+    earnedRegularSalaryToman + earnedOvertimePayToman - lateAndAbsenceDeductionToman
+  );
   const totalPeriodEntitlementToman = salaryPlusOvertimeToman + approvedPettyCashToman;
   const periodBalanceToman = totalPeriodEntitlementToman - approvedTotalPaidOrReceivedToman;
   const salaryAndOvertimeBalanceToman =
@@ -1244,6 +1438,9 @@ export function calculatePeriodStatement(params: {
     effectiveOvertimeHourlyRateToman: refRates.effectiveOvertimeHourlyRateToman,
     earnedRegularSalaryToman,
     earnedOvertimePayToman,
+    lateAndAbsenceDeductionToman,
+    approvedLateMinutes,
+    absenceDaysCount,
     salaryPlusOvertimeToman,
     approvedPettyCashToman,
     totalPeriodEntitlementToman,

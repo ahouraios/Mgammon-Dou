@@ -36,6 +36,7 @@ import {
   setSessionCookie,
 } from './auth';
 import {
+  AbsenceDeductionUnit,
   AttendanceEventType,
   AttendanceLog,
   CorrespondenceAttachment,
@@ -47,6 +48,8 @@ import {
   FinancialTxType,
   HistoricalWorkRecord,
   HistoricalWorkRowItem,
+  LateArrivalDisposition,
+  LateDeductionUnit,
   LeaveQuotaSummary,
   LeaveRequestItem,
   LeaveType,
@@ -58,6 +61,7 @@ import {
 } from '../shared/types';
 import {
   formatDurationPersian,
+  getDayOfWeekFromGregorian,
   getNowInTimezone,
   getShamsiDayOfWeekName,
   gregorianToShamsi,
@@ -71,8 +75,10 @@ import {
 } from '../shared/jalali';
 import {
   calculateDailyAttendance,
+  calculateLateAndAbsenceRates,
   calculateSalaryAndOvertimeRates,
   evaluateWorkerLiveState,
+  getDayShiftSchedule,
   getMonthlyCycleKeyForShamsiDate,
   validateAttendanceSequence,
   validateFullDayLogSequence,
@@ -323,6 +329,21 @@ function mapRowToAttendanceLog(row: mysql.RowDataPacket): AttendanceLog {
     modified_by_user_id: row.modified_by_user_id ? Number(row.modified_by_user_id) : null,
     modification_reason: row.modification_reason ? String(row.modification_reason) : null,
     is_deleted: Boolean(row.is_deleted),
+    late_status: (row.late_status as LateArrivalDisposition) || 'NONE',
+    late_reason: row.late_reason ? String(row.late_reason) : null,
+    manager_late_note: row.manager_late_note ? String(row.manager_late_note) : null,
+    custom_deduction_toman:
+      row.custom_deduction_toman !== null && row.custom_deduction_toman !== undefined
+        ? Number(row.custom_deduction_toman)
+        : null,
+    late_reviewed_by_user_id: row.late_reviewed_by_user_id
+      ? Number(row.late_reviewed_by_user_id)
+      : null,
+    late_reviewed_at: row.late_reviewed_at ? new Date(row.late_reviewed_at).toISOString() : null,
+    is_late_seen_by_worker:
+      row.is_late_seen_by_worker !== undefined && row.is_late_seen_by_worker !== null
+        ? Boolean(row.is_late_seen_by_worker)
+        : true,
     created_at: row.created_at ? new Date(row.created_at).toISOString() : '',
   };
 }
@@ -1601,8 +1622,10 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
     let totalRecordedWorkDays = 0;
     let hourlyEarnedRegularWorkToman = 0;
     let earnedOvertimeToman = 0;
+    let totalLateAndAbsenceDeductionToman = 0;
     const confirmedAttendanceShamsiDates = new Set<string>();
     const activeMonthlyCycles = new Set<string>();
+    const recentLateDecisions: DailyAttendanceSummary[] = [];
 
     for (const [workDate, dayLogs] of byDate.entries()) {
       const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
@@ -1611,12 +1634,29 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
         isToday: workDate === nowInfo.workDate,
         currentTimeHHMM: nowInfo.timeHHMM,
       });
+      if (
+        summary.late_status &&
+        summary.late_status !== 'NONE' &&
+        (summary.raw_late_minutes || 0) > 0 &&
+        recentLateDecisions.length < 15
+      ) {
+        recentLateDecisions.push(summary);
+      }
+      if (summary.late_deduction_toman && summary.late_deduction_toman > 0) {
+        totalLateAndAbsenceDeductionToman += summary.late_deduction_toman;
+      }
       if (!summary.is_incomplete && summary.logs.length > 0) {
         confirmedAttendanceShamsiDates.add(shamsiDate);
-        if (summary.net_work_minutes > 0 || summary.overtime_minutes > 0) {
+        if (
+          summary.net_work_minutes > 0 ||
+          summary.overtime_minutes > 0 ||
+          summary.late_status === 'ABSENCE'
+        ) {
           activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(shamsiDate, 15));
         }
-        totalRecordedWorkDays += 1;
+        if (summary.late_status !== 'ABSENCE') {
+          totalRecordedWorkDays += 1;
+        }
         totalConfirmedNetWorkMinutes += summary.net_work_minutes;
         totalConfirmedOvertimeMinutes += summary.overtime_minutes;
 
@@ -1716,9 +1756,44 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
     const approvedTotalToman = Number(finTotals[0]?.approved_total || 0);
     const approvedReceivedToman = Number(finTotals[0]?.approved_received_salary_advance || 0);
     const approvedPettyCashToman = Number(finTotals[0]?.approved_petty_cash || 0);
-    const totalEntitlementToman =
-      earnedRegularWorkToman + earnedOvertimeToman + approvedPettyCashToman;
+    const netSalaryPlusOvertimeToman = Math.max(
+      0,
+      earnedRegularWorkToman + earnedOvertimeToman - totalLateAndAbsenceDeductionToman
+    );
+    const totalEntitlementToman = netSalaryPlusOvertimeToman + approvedPettyCashToman;
     const accountBalanceToman = totalEntitlementToman - approvedReceivedToman;
+
+    // آخرین تسک/وظیفه انجام‌نشده برای نوتیفیکیشن لحظه‌ای در گوشی پرسنل
+    const [pendingTaskRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT id, title, description, shamsi_date, created_at
+       FROM work_tasks
+       WHERE user_id = ? AND is_completed = 0
+       ORDER BY id DESC
+       LIMIT 1`,
+      [workerInfo.id]
+    );
+    const latestPendingTask =
+      pendingTaskRows.length > 0
+        ? {
+            id: Number(pendingTaskRows[0].id),
+            title: String(pendingTaskRows[0].title || ''),
+            description: pendingTaskRows[0].description
+              ? String(pendingTaskRows[0].description)
+              : null,
+            shamsi_date: String(pendingTaskRows[0].shamsi_date || ''),
+            created_at: pendingTaskRows[0].created_at
+              ? new Date(pendingTaskRows[0].created_at).toISOString()
+              : '',
+          }
+        : null;
+
+    const unseenLateDecisions = recentLateDecisions.filter(
+      (d) =>
+        d.late_status &&
+        d.late_status !== 'NONE' &&
+        d.late_status !== 'PENDING' &&
+        d.is_late_seen_by_worker === false
+    );
 
     res.json({
       ok: true,
@@ -1727,6 +1802,9 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       settings: sanitizeSettingsForRole(settings, req.user!.role),
       unreadMessagesCount,
       latestUnreadMessage,
+      latestPendingTask,
+      unseenLateDecisions,
+      recentLateDecisions,
       workerKpis: {
         totalWorkDays: totalRecordedWorkDays,
         totalNetWorkMinutes: totalConfirmedNetWorkMinutes,
@@ -1736,6 +1814,7 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
         approvedPettyCashToman,
         earnedRegularWorkToman,
         earnedOvertimeToman,
+        lateAndAbsenceDeductionToman: totalLateAndAbsenceDeductionToman,
         totalEntitlementToman,
         accountBalanceToman,
       },
@@ -1828,10 +1907,33 @@ apiRouter.post(
       }
 
       const recordedAt = `${nowInfo.workDate} ${nowInfo.timeHHMMSS}`;
+      const rawLateReason = req.body?.late_reason
+        ? String(req.body.late_reason).trim().slice(0, 500)
+        : null;
+
+      let lateStatus: LateArrivalDisposition = 'NONE';
+      let lateReasonToSave: string | null = null;
+
+      if (eventType === 'WORK_START' && existingLogs.length === 0) {
+        const dayOfWeek = getDayOfWeekFromGregorian(nowInfo.workDate);
+        const normShamsi = normalizeShamsiDate(nowInfo.shamsiDate);
+        const isHoliday = settings.official_holidays.some(
+          (h) => (isValidShamsiDate(h) ? normalizeShamsiDate(h) : h) === normShamsi
+        );
+        const isWorkingDay = settings.working_days.includes(dayOfWeek) && !isHoliday;
+        const { shiftStartMin } = getDayShiftSchedule(dayOfWeek, settings);
+        const nowMin = parseTimeToMinutes(nowInfo.timeHHMM);
+
+        if (isWorkingDay && nowMin > shiftStartMin + settings.grace_period_minutes) {
+          lateStatus = 'PENDING';
+          lateReasonToSave = rawLateReason || note || 'ورود با تأخیر (در انتظار بررسی مدیریت)';
+        }
+      }
+
       const [insertResult] = await conn.execute<mysql.ResultSetHeader>(
         `INSERT INTO attendance_logs
-          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, is_deleted, idempotency_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)`,
+          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, is_deleted, late_status, late_reason, is_late_seen_by_worker, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, ?)`,
         [
           workerId,
           nowInfo.workDate,
@@ -1839,7 +1941,9 @@ apiRouter.post(
           eventType,
           recordedAt,
           nowInfo.timeHHMMSS,
-          note,
+          note || lateReasonToSave,
+          lateStatus,
+          lateReasonToSave,
           idempotencyKey,
         ]
       );
@@ -3089,6 +3193,241 @@ apiRouter.post(
   }
 );
 
+/**
+ * تعیین تکلیف تأخیر در ورود پرسنل توسط مدیر (بخشش بدون تأخیر، ثبت با تأخیر و کسر از حقوق، ثبت غیبت، کسر از مرخصی، یا تصمیم سفارشی)
+ */
+apiRouter.post(
+  '/attendance/review-late',
+  requireAuth,
+  requireRole('manager'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const pool = getPool();
+    let conn: mysql.PoolConnection | null = null;
+    try {
+      const logId = req.body?.log_id ? Number(req.body.log_id) : 0;
+      const shamsiRaw = req.body?.shamsi_date ? String(req.body.shamsi_date).trim() : '';
+      const decision = String(req.body?.decision || '').trim() as LateArrivalDisposition;
+      const managerNote = req.body?.manager_note
+        ? String(req.body.manager_note).trim().slice(0, 500)
+        : null;
+      const customDeductionRaw = req.body?.custom_deduction_toman;
+      const customDeductionToman =
+        customDeductionRaw !== undefined &&
+        customDeductionRaw !== null &&
+        String(customDeductionRaw).trim() !== ''
+          ? Math.max(
+              0,
+              Math.round(
+                Number(toEnglishDigits(String(customDeductionRaw)).replace(/,/g, '').trim()) || 0
+              )
+            )
+          : null;
+
+      const validDecisions: LateArrivalDisposition[] = [
+        'EXCUSED',
+        'APPROVED_DELAY',
+        'ABSENCE',
+        'DEDUCT_LEAVE',
+        'CUSTOM',
+      ];
+      if (!validDecisions.includes(decision)) {
+        res.status(400).json({
+          ok: false,
+          message: 'نوع تصمیم مدیریت برای تعیین تکلیف تأخیر معتبر نیست.',
+        });
+        return;
+      }
+
+      const workerId = await getWorkerUserId(pool);
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      let targetRow: mysql.RowDataPacket | null = null;
+      if (logId > 0) {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT * FROM attendance_logs WHERE id = ? AND user_id = ? AND is_deleted = 0 FOR UPDATE`,
+          [logId, workerId]
+        );
+        if (rows.length > 0) {
+          targetRow = rows[0];
+        }
+      } else if (shamsiRaw && isValidShamsiDate(shamsiRaw)) {
+        const normShamsi = normalizeShamsiDate(shamsiRaw);
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT * FROM attendance_logs
+           WHERE user_id = ? AND shamsi_date = ? AND is_deleted = 0
+           ORDER BY recorded_time ASC, id ASC
+           LIMIT 1 FOR UPDATE`,
+          [workerId, normShamsi]
+        );
+        if (rows.length > 0) {
+          targetRow = rows[0];
+        }
+      }
+
+      if (!targetRow) {
+        await conn.rollback();
+        res.status(404).json({
+          ok: false,
+          message: 'رکورد ورود پرسنل برای این تاریخ یافت نشد.',
+        });
+        return;
+      }
+
+      const targetLog = mapRowToAttendanceLog(targetRow);
+      const effectiveSettings = await getSystemSettingsFromDb(targetLog.shamsi_date);
+      const dayOfWeek = getDayOfWeekFromGregorian(targetLog.work_date);
+      const { shiftStartHHMM, shiftStartMin } = getDayShiftSchedule(dayOfWeek, effectiveSettings);
+      const firstInMin = parseTimeToMinutes(targetLog.recorded_time);
+      const rawLateMins = Math.max(0, firstInMin - shiftStartMin);
+
+      await conn.execute(
+        `UPDATE attendance_logs
+         SET late_status = ?,
+             manager_late_note = ?,
+             custom_deduction_toman = ?,
+             late_reviewed_by_user_id = ?,
+             late_reviewed_at = NOW(),
+             is_late_seen_by_worker = 0
+         WHERE id = ?`,
+        [
+          decision,
+          managerNote,
+          decision === 'CUSTOM' ? customDeductionToman : null,
+          req.user!.id,
+          targetLog.id,
+        ]
+      );
+
+      // اگر تصمیم مدیر «کسر از مرخصی» (DEDUCT_LEAVE) باشد، یک مرخصی ساعتی تأییدشده معادل مدت تأخیر ثبت می‌شود
+      const leaveIdempotencyKey = `late_leave_log_${targetLog.id}`;
+      if (decision === 'DEDUCT_LEAVE' && rawLateMins > 0) {
+        const [existingLeave] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id FROM leave_requests WHERE idempotency_key = ? LIMIT 1`,
+          [leaveIdempotencyKey]
+        );
+        const leaveReasonText = `کسر از مرخصی بابت ${toPersianDigits(rawLateMins)} دقیقه تأخیر در ورود (${targetLog.late_reason || 'با تصمیم مدیریت'})`;
+        if (existingLeave.length > 0) {
+          await conn.execute(
+            `UPDATE leave_requests
+             SET duration_minutes = ?, start_time = ?, end_time = ?, reason = ?, manager_note = ?, status = 'APPROVED', reviewed_by_user_id = ?, reviewed_at = NOW()
+             WHERE id = ?`,
+            [
+              rawLateMins,
+              shiftStartHHMM,
+              targetLog.recorded_time.slice(0, 5),
+              leaveReasonText,
+              managerNote,
+              req.user!.id,
+              existingLeave[0].id,
+            ]
+          );
+        } else {
+          await conn.execute(
+            `INSERT INTO leave_requests
+              (user_id, shamsi_date, work_date, leave_type, start_time, end_time, duration_minutes, reason, status, is_seen_by_manager, manager_note, reviewed_by_user_id, reviewed_at, idempotency_key)
+             VALUES (?, ?, ?, 'HOURLY', ?, ?, ?, ?, 'APPROVED', 1, ?, ?, NOW(), ?)`,
+            [
+              workerId,
+              targetLog.shamsi_date,
+              targetLog.work_date,
+              shiftStartHHMM,
+              targetLog.recorded_time.slice(0, 5),
+              rawLateMins,
+              leaveReasonText,
+              managerNote,
+              req.user!.id,
+              leaveIdempotencyKey,
+            ]
+          );
+        }
+      } else {
+        // در صورتی که قبلاً کسر از مرخصی بوده و اکنون تصمیم تغییر کرده، مرخصی خودکار قبلی حذف شود
+        await conn.execute(`DELETE FROM leave_requests WHERE idempotency_key = ?`, [
+          leaveIdempotencyKey,
+        ]);
+      }
+
+      await recordAuditLog({
+        actorUserId: req.user!.id,
+        actionType: 'ATTENDANCE_LATE_REVIEW',
+        targetEntity: 'attendance_logs',
+        targetId: targetLog.id,
+        beforeState: {
+          late_status: targetLog.late_status,
+          manager_late_note: targetLog.manager_late_note,
+        },
+        afterState: {
+          shamsi_date: targetLog.shamsi_date,
+          late_status: decision,
+          manager_late_note: managerNote,
+          custom_deduction_toman: decision === 'CUSTOM' ? customDeductionToman : null,
+        },
+        reason: managerNote || 'تعیین تکلیف تأخیر در ورود توسط مدیریت',
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      await conn.commit();
+
+      const decisionLabels: Record<LateArrivalDisposition, string> = {
+        NONE: 'عادی',
+        PENDING: 'در انتظار بررسی',
+        EXCUSED: 'ثبت بدون تأخیر (بخشش تأخیر)',
+        APPROVED_DELAY: 'ثبت با تأخیر (کسر از حقوق طبق تعرفه)',
+        ABSENCE: 'ثبت غیبت روزانه',
+        DEDUCT_LEAVE: 'کسر مدت تأخیر از سهمیه مرخصی',
+        CUSTOM: 'تعیین تکلیف و جریمه سفارشی',
+      };
+
+      res.json({
+        ok: true,
+        decision,
+        message: `تصمیم مدیریت («${decisionLabels[decision]}») ثبت شد و نتیجه به همراه یادداشت برای پرسنل ارسال گردید.`,
+      });
+    } catch (err) {
+      if (conn) {
+        try {
+          await conn.rollback();
+        } catch {
+          // ignore
+        }
+      }
+      handleServerError(res, err);
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+
+/**
+ * تأیید مشاهده نتیجه تصمیم مدیر درباره تأخیر توسط پرسنل
+ */
+apiRouter.post(
+  '/attendance/ack-late-decision',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const pool = getPool();
+      const logId = req.body?.log_id ? Number(req.body.log_id) : null;
+      if (logId) {
+        await pool.execute(
+          `UPDATE attendance_logs SET is_late_seen_by_worker = 1 WHERE id = ? AND user_id = ?`,
+          [logId, req.user!.id]
+        );
+      } else {
+        await pool.execute(
+          `UPDATE attendance_logs SET is_late_seen_by_worker = 1 WHERE user_id = ? AND is_late_seen_by_worker = 0`,
+          [req.user!.id]
+        );
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
 // ============================================================================
 // ۵. گزارش‌های کار روزانه (همراه با تصویر کار انجام‌شده) + چک‌لیست وظایف روزانه
 // ============================================================================
@@ -3258,6 +3597,7 @@ apiRouter.post('/tasks', requireAuth, requireRole('manager'), async (req: Authen
     const title = String(req.body?.title || '').trim();
     const description = req.body?.description ? String(req.body.description).trim().slice(0, 500) : null;
     const shamsiRaw = String(req.body?.shamsi_date || '').trim();
+    const sendSmsOverride = Boolean(req.body?.send_sms);
 
     if (!title) {
       res.status(400).json({ ok: false, message: 'عنوان وظیفه / کار الزامی است.' });
@@ -3269,7 +3609,8 @@ apiRouter.post('/tasks', requireAuth, requireRole('manager'), async (req: Authen
     const shamsiDate = shamsiRaw && isValidShamsiDate(shamsiRaw) ? normalizeShamsiDate(shamsiRaw) : nowInfo.shamsiDate;
 
     const pool = getPool();
-    const workerId = await getWorkerUserId(pool);
+    const workerInfo = await getWorkerInfo(pool);
+    const workerId = workerInfo.id;
 
     const [ins] = await pool.execute<mysql.ResultSetHeader>(
       `INSERT INTO work_tasks (user_id, created_by_user_id, shamsi_date, title, description, is_completed, added_to_report)
@@ -3277,10 +3618,26 @@ apiRouter.post('/tasks', requireAuth, requireRole('manager'), async (req: Authen
       [workerId, req.user!.id, shamsiDate, title, description]
     );
 
+    let smsSent = false;
+    const targetPhone = settings.worker_phone_number || workerInfo.phone_number || '';
+    if (
+      targetPhone &&
+      settings.melipayamak_username &&
+      settings.melipayamak_password &&
+      (sendSmsOverride || (settings.sms_enabled && settings.sms_on_task_and_message))
+    ) {
+      const smsText = `وظیفه جدید از طرف مدیریت (مجید نورایی):\n${title}${description ? `\n${description}` : ''}`;
+      const smsRes = await sendMelipayamakSms(settings, targetPhone, smsText);
+      smsSent = smsRes.sent;
+    }
+
     res.status(201).json({
       ok: true,
       id: ins.insertId,
-      message: 'وظیفه کاری جدید به چک‌لیست پرسنل اضافه شد.',
+      smsSent,
+      message: smsSent
+        ? 'وظیفه کاری جدید به چک‌لیست پرسنل اضافه شد و نوتیفیکیشن + پیامک ارسال گردید.'
+        : 'وظیفه کاری جدید ثبت شد و اعلان آن در گوشی پرسنل نمایش داده می‌شود.',
     });
   } catch (err) {
     handleServerError(res, err);
@@ -4397,10 +4754,13 @@ apiRouter.get(
       let incompleteDaysCount = 0;
       let hourlyEarnedRegularWorkToman = 0;
       let totalOvertimePayTomanAccum = 0;
+      let totalLateDeductionTomanAccum = 0;
       const confirmedAttendanceShamsiDates = new Set<string>();
       const activeMonthlyCycles = new Set<string>();
 
       const dailySummaries: DailyAttendanceSummary[] = [];
+      const pendingLateReviews: DailyAttendanceSummary[] = [];
+      const reviewedLateSummaries: DailyAttendanceSummary[] = [];
 
       for (const [workDate, dayLogs] of byDate.entries()) {
         const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
@@ -4411,14 +4771,32 @@ apiRouter.get(
         });
         dailySummaries.push(summary);
 
+        if ((summary.raw_late_minutes || 0) > 0 || (summary.late_status && summary.late_status !== 'NONE')) {
+          if (!summary.late_status || summary.late_status === 'PENDING') {
+            pendingLateReviews.push(summary);
+          } else if (reviewedLateSummaries.length < 20) {
+            reviewedLateSummaries.push(summary);
+          }
+        }
+
+        if (summary.late_deduction_toman && summary.late_deduction_toman > 0) {
+          totalLateDeductionTomanAccum += summary.late_deduction_toman;
+        }
+
         if (summary.is_incomplete) {
           incompleteDaysCount += 1;
         } else if (summary.logs.length > 0) {
           confirmedAttendanceShamsiDates.add(shamsiDate);
-          if (summary.net_work_minutes > 0 || summary.overtime_minutes > 0) {
+          if (
+            summary.net_work_minutes > 0 ||
+            summary.overtime_minutes > 0 ||
+            summary.late_status === 'ABSENCE'
+          ) {
             activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(shamsiDate, 15));
           }
-          totalRecordedWorkDays += 1;
+          if (summary.late_status !== 'ABSENCE') {
+            totalRecordedWorkDays += 1;
+          }
           totalConfirmedNetWorkMinutes += summary.net_work_minutes;
           totalConfirmedOvertimeMinutes += summary.overtime_minutes;
 
@@ -4516,7 +4894,10 @@ apiRouter.get(
       const earnedRegularWorkToman = hasMonthlyFixedSalary
         ? activeMonthlyCycles.size * Math.round(Number(currentSettings.base_salary_toman))
         : hourlyEarnedRegularWorkToman;
-      const totalSalaryPlusOvertimeToman = earnedRegularWorkToman + totalOvertimePayTomanAccum;
+      const totalSalaryPlusOvertimeToman = Math.max(
+        0,
+        earnedRegularWorkToman + totalOvertimePayTomanAccum - totalLateDeductionTomanAccum
+      );
 
       const [finRows] = await pool.execute<mysql.RowDataPacket[]>(
         `SELECT
@@ -4552,6 +4933,7 @@ apiRouter.get(
         currentSettings,
         totalConfirmedOvertimeMinutes
       );
+      const deductionRates = calculateLateAndAbsenceRates(currentSettings);
 
       const mergedDailySummaries = mergeApprovedHistoricalIntoDailySummaries(
         dailySummaries,
@@ -4597,8 +4979,12 @@ apiRouter.get(
           effectiveOvertimeHourlyRateToman: salaryCalc.effectiveOvertimeHourlyRateToman,
           earnedRegularWorkToman,
           totalOvertimePayToman: totalOvertimePayTomanAccum,
+          totalLateDeductionToman: totalLateDeductionTomanAccum,
           totalSalaryPlusOvertimeToman,
+          deductionRates,
         },
+        pendingLateReviews,
+        reviewedLateSummaries,
         unseenAlerts: {
           financeAlert: Number(finRows[0]?.unseen_or_pending_fin || 0) > 0,
           pendingFinanceCount: Number(finRows[0]?.pending_count || 0),
@@ -4607,10 +4993,13 @@ apiRouter.get(
           historicalAlert:
             Number(histTotals[0]?.pending_hist_count || 0) > 0 ||
             Number(histTotals[0]?.unseen_hist_count || 0) > 0 ||
-            Number(leavePendingRows[0]?.unseen_or_pending_leaves || 0) > 0,
+            Number(leavePendingRows[0]?.unseen_or_pending_leaves || 0) > 0 ||
+            pendingLateReviews.length > 0,
           pendingHistoricalCount:
             Number(histTotals[0]?.pending_hist_count || 0) +
-            Number(leavePendingRows[0]?.pending_leaves || 0),
+            Number(leavePendingRows[0]?.pending_leaves || 0) +
+            pendingLateReviews.length,
+          pendingLateCount: pendingLateReviews.length,
           correspondenceAlert: Number(corrUnreadRows[0]?.unread_corr || 0) > 0,
           unreadCorrespondenceCount: Number(corrUnreadRows[0]?.unread_corr || 0),
         },
@@ -5017,6 +5406,12 @@ apiRouter.put(
       const baseSalaryToman = parseOptionalToman(req.body?.base_salary_toman);
       const hourlyRate = parseOptionalToman(req.body?.hourly_rate_toman);
       const overtimeRate = parseOptionalToman(req.body?.overtime_rate_toman);
+      const lateDeductionUnit: LateDeductionUnit =
+        req.body?.late_deduction_unit === 'HOUR' ? 'HOUR' : 'MINUTE';
+      const lateDeductionRateToman = parseOptionalToman(req.body?.late_deduction_rate_toman);
+      const absenceDeductionUnit: AbsenceDeductionUnit =
+        req.body?.absence_deduction_unit === 'HOUR' ? 'HOUR' : 'DAY';
+      const absenceDeductionRateToman = parseOptionalToman(req.body?.absence_deduction_rate_toman);
 
       const overtimeCalcMode: OvertimeCalcMode =
         req.body?.overtime_calc_mode === 'FIXED_RATE' ? 'FIXED_RATE' : 'PERCENTAGE';
@@ -5045,6 +5440,10 @@ apiRouter.put(
       );
 
       const smsEnabled = Boolean(req.body?.sms_enabled);
+      const smsOnTaskAndMessage =
+        req.body?.sms_on_task_and_message !== undefined
+          ? Boolean(req.body.sms_on_task_and_message)
+          : Boolean(currentSettings.sms_on_task_and_message);
       const melipayamakUsername = String(req.body?.melipayamak_username ?? currentSettings.melipayamak_username).trim();
       const rawInputSmsPass = String(req.body?.melipayamak_password ?? '').trim();
       const melipayamakPassword =
@@ -5101,9 +5500,14 @@ apiRouter.put(
           overtime_calc_mode = ?,
           overtime_percentage = ?,
           overtime_rate_toman = ?,
+          late_deduction_unit = ?,
+          late_deduction_rate_toman = ?,
+          absence_deduction_unit = ?,
+          absence_deduction_rate_toman = ?,
           collaboration_start_shamsi = ?,
           monthly_leave_quota_days = ?,
           sms_enabled = ?,
+          sms_on_task_and_message = ?,
           melipayamak_username = ?,
           melipayamak_password = ?,
           melipayamak_from_number = ?,
@@ -5132,9 +5536,14 @@ apiRouter.put(
           overtimeCalcMode,
           overtimePercentage,
           overtimeRate,
+          lateDeductionUnit,
+          lateDeductionRateToman,
+          absenceDeductionUnit,
+          absenceDeductionRateToman,
           collaborationStartShamsi,
           monthlyLeaveQuotaDays,
           smsEnabled ? 1 : 0,
+          smsOnTaskAndMessage ? 1 : 0,
           melipayamakUsername,
           melipayamakPassword,
           melipayamakFromNumber,

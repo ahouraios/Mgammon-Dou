@@ -338,6 +338,16 @@ export function MonthlyStatementSection({
                 {formatToman(activeStatement.earnedOvertimePayToman)}
               </strong>
             </div>
+            {activeStatement.lateAndAbsenceDeductionToman > 0 && (
+              <div className="flex items-center justify-between text-red-700 pt-1 border-t border-dashed border-red-200">
+                <span>
+                  ۳. کسر تأخیر و غیبت تأییدشده مدیر:
+                </span>
+                <strong className="font-extrabold">
+                  - {formatToman(activeStatement.lateAndAbsenceDeductionToman)}
+                </strong>
+              </div>
+            )}
             {activeStatement.approvedPettyCashToman > 0 && (
               <div className="flex items-center justify-between text-emerald-800 pt-1 border-t border-dashed border-[#C5A059]/30">
                 <span>+ تنخواه / خرید کارگاهی تأییدشده ماه:</span>

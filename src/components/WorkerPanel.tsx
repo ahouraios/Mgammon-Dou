@@ -19,8 +19,10 @@ import {
   formatMinutesToDurationPersian,
   formatMinutesToHHMM,
   formatToman,
+  parseTimeToMinutes,
   toPersianDigits,
 } from '../shared/jalali';
+import { getDayShiftSchedule } from '../shared/calculationEngine';
 import { ShamsiDatePicker } from './ShamsiDatePicker';
 import { TomanInput } from './TomanInput';
 import { HeroBanner } from './HeroBanner';
@@ -32,6 +34,10 @@ import { AccountSettingsPanel } from './AccountSettingsPanel';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
 import { CameraCaptureModal } from './CameraCaptureModal';
 import { MonthlyStatementSection } from './MonthlyStatementSection';
+import {
+  MobileNotificationBannerAndModal,
+  triggerNativePhoneNotification,
+} from './MobileNotificationHelper';
 import {
   Play,
   Briefcase,
@@ -86,6 +92,7 @@ interface WorkerSummaryKpis {
   approvedPettyCashToman: number;
   earnedRegularWorkToman: number;
   earnedOvertimeToman: number;
+  lateAndAbsenceDeductionToman?: number;
   totalEntitlementToman: number;
   accountBalanceToman: number;
 }
@@ -98,6 +105,36 @@ interface LatestUnreadMessageInfo {
   shamsi_date: string;
   recorded_time: string;
 }
+
+const LATE_STATUS_BADGE_INFO: Record<
+  string,
+  { label: string; className: string }
+> = {
+  PENDING: {
+    label: 'در انتظار بررسی و تأیید تأخیر توسط مدیر',
+    className: 'bg-amber-100 text-amber-900 border-amber-300',
+  },
+  EXCUSED: {
+    label: 'ثبت بدون تأخیر (بخشش تأخیر توسط مدیر)',
+    className: 'bg-emerald-100 text-emerald-900 border-emerald-300',
+  },
+  APPROVED_DELAY: {
+    label: 'ثبت با تأخیر (کسر مبلغ تأخیر طبق تعرفه)',
+    className: 'bg-orange-100 text-orange-900 border-orange-300',
+  },
+  ABSENCE: {
+    label: 'ثبت غیبت روزانه (با تصمیم مدیر)',
+    className: 'bg-red-100 text-red-900 border-red-300',
+  },
+  DEDUCT_LEAVE: {
+    label: 'کسر مدت تأخیر از سهمیه مرخصی',
+    className: 'bg-sky-100 text-sky-900 border-sky-300',
+  },
+  CUSTOM: {
+    label: 'تعیین تکلیف سفارشی توسط مدیر',
+    className: 'bg-purple-100 text-purple-900 border-purple-300',
+  },
+};
 
 type WorkerTab = 'attendance' | 'reports' | 'finance' | 'correspondence' | 'settings';
 
@@ -291,6 +328,13 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   );
 
   const [clockNote, setClockNote] = useState('');
+  const [showLateReasonModal, setShowLateReasonModal] = useState(false);
+  const [lateReasonInput, setLateReasonInput] = useState('');
+  const [pendingLateMinutesPreview, setPendingLateMinutesPreview] = useState(0);
+  const [unseenLateDecisions, setUnseenLateDecisions] = useState<DailyAttendanceSummary[]>([]);
+  const [recentLateDecisions, setRecentLateDecisions] = useState<DailyAttendanceSummary[]>([]);
+  const notifiedKeysRef = useRef<Set<string>>(new Set());
+  const isFirstPollDoneRef = useRef(false);
   const [externalLeaveRequestType, setExternalLeaveRequestType] = useState<LeaveType | null>(null);
 
   // ثبت سابقه کارکرد و اضافه‌کاری قبلی توسط پرسنل (در تب تنظیمات)
@@ -351,6 +395,14 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
           settings: SystemSettings;
           unreadMessagesCount: number;
           latestUnreadMessage?: LatestUnreadMessageInfo | null;
+          latestPendingTask?: {
+            id: number;
+            title: string;
+            description: string | null;
+            shamsi_date: string;
+          } | null;
+          unseenLateDecisions?: DailyAttendanceSummary[];
+          recentLateDecisions?: DailyAttendanceSummary[];
           workerKpis?: WorkerSummaryKpis;
           bannerBgUrl: string;
         }>('/api/attendance/live-status'),
@@ -383,6 +435,8 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
       setServerTimeHHMM(liveRes.serverTime.timeHHMM);
       setUnreadMessagesCount(liveRes.unreadMessagesCount);
       setLatestUnreadMessage(liveRes.latestUnreadMessage || null);
+      setUnseenLateDecisions(liveRes.unseenLateDecisions || []);
+      setRecentLateDecisions(liveRes.recentLateDecisions || []);
       if (liveRes.workerKpis) {
         setWorkerKpis(liveRes.workerKpis);
       }
@@ -399,6 +453,68 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
         approvedPettyCashToman: finRes.summary?.approvedPettyCashToman ?? 0,
         pendingCount: finRes.summary?.pendingCount ?? 0,
       });
+
+      // ارسال نوتیفیکیشن گوشی (اندروید / شیائومی) هنگام دریافت تسک جدید، پیام جدید یا تعیین تکلیف تأخیر از سمت مدیر
+      const msgKey = liveRes.latestUnreadMessage ? `msg_${liveRes.latestUnreadMessage.id}` : null;
+      const taskKey = liveRes.latestPendingTask ? `task_${liveRes.latestPendingTask.id}` : null;
+      const lateDecisionItem = (liveRes.unseenLateDecisions || [])[0];
+      const lateKey = lateDecisionItem
+        ? `late_${lateDecisionItem.work_date}_${lateDecisionItem.late_status}`
+        : null;
+
+      if (!isFirstPollDoneRef.current) {
+        isFirstPollDoneRef.current = true;
+        if (msgKey) notifiedKeysRef.current.add(msgKey);
+        for (const t of taskRes.tasks || []) {
+          if (!t.is_completed) notifiedKeysRef.current.add(`task_${t.id}`);
+        }
+        for (const d of liveRes.unseenLateDecisions || []) {
+          notifiedKeysRef.current.add(`late_${d.work_date}_${d.late_status}`);
+        }
+      } else {
+        if (msgKey && !notifiedKeysRef.current.has(msgKey) && liveRes.latestUnreadMessage) {
+          notifiedKeysRef.current.add(msgKey);
+          triggerNativePhoneNotification({
+            tag: msgKey,
+            title: `پیام جدید از مدیریت (${liveRes.latestUnreadMessage.sender_name})`,
+            body: liveRes.latestUnreadMessage.subject
+              ? `${liveRes.latestUnreadMessage.subject}: ${liveRes.latestUnreadMessage.message_text}`
+              : liveRes.latestUnreadMessage.message_text,
+            tab: 'correspondence',
+          });
+        }
+
+        if (taskKey && !notifiedKeysRef.current.has(taskKey) && liveRes.latestPendingTask) {
+          notifiedKeysRef.current.add(taskKey);
+          triggerNativePhoneNotification({
+            tag: taskKey,
+            title: 'تسک / وظیفه کاری جدید از طرف مدیر',
+            body: `${liveRes.latestPendingTask.title}${
+              liveRes.latestPendingTask.description
+                ? ` — ${liveRes.latestPendingTask.description}`
+                : ''
+            }`,
+            tab: 'reports',
+          });
+        }
+
+        if (lateKey && !notifiedKeysRef.current.has(lateKey) && lateDecisionItem) {
+          notifiedKeysRef.current.add(lateKey);
+          const badge =
+            LATE_STATUS_BADGE_INFO[lateDecisionItem.late_status || '']?.label ||
+            'تعیین تکلیف تأخیر';
+          triggerNativePhoneNotification({
+            tag: lateKey,
+            title: `نتیجه بررسی تأخیر تاریخ ${toPersianDigits(lateDecisionItem.shamsi_date)}`,
+            body: `${badge}${
+              lateDecisionItem.manager_late_note
+                ? ` — یادداشت مدیر: ${lateDecisionItem.manager_late_note}`
+                : ''
+            }`,
+            tab: 'attendance',
+          });
+        }
+      }
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     } finally {
@@ -410,11 +526,11 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     loadAllWorkerData();
   }, [loadAllWorkerData]);
 
-  // بروزرسانی خودکار وضعیت پنل پرسنل (هر ۱۲ ثانیه و هنگام بازگشت به صفحه) برای دریافت آنی تأییدیه‌ها، تسک‌ها و نامه‌های مدیر
+  // بروزرسانی خودکار وضعیت پنل پرسنل (هر ۱۰ ثانیه و هنگام بازگشت به صفحه) برای دریافت آنی تأییدیه‌ها، تسک‌ها و نامه‌های مدیر
   useEffect(() => {
     const interval = window.setInterval(() => {
       loadAllWorkerData();
-    }, 12000);
+    }, 10000);
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
         loadAllWorkerData();
@@ -441,7 +557,10 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleClockEvent = async (eventType: AttendanceEventType) => {
+  const executeClockRequest = async (
+    eventType: AttendanceEventType,
+    explicitLateReason?: string
+  ) => {
     setActionLoading(true);
     setFeedback(null);
     try {
@@ -453,17 +572,56 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
         method: 'POST',
         body: JSON.stringify({
           event_type: eventType,
-          note: clockNote.trim() || null,
+          note: (explicitLateReason || clockNote).trim() || null,
+          late_reason: explicitLateReason ? explicitLateReason.trim() : clockNote.trim() || null,
         }),
       });
       setLiveState(res.liveState);
       setClockNote('');
+      setLateReasonInput('');
+      setShowLateReasonModal(false);
       setFeedback({ type: 'success', text: res.message });
       await loadAllWorkerData();
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  const handleClockEvent = async (eventType: AttendanceEventType) => {
+    // اگر شروع کار در روز کاری دیرتر از ساعت شروع شیفت + حد مجاز تأخیر باشد، ابتدا علت تأخیر را از پرسنل می‌پرسیم تا به تأیید مدیر برسد
+    if (
+      eventType === 'WORK_START' &&
+      settings &&
+      (!liveState?.today_summary?.logs || liveState.today_summary.logs.length === 0) &&
+      liveState?.today_summary?.is_working_day &&
+      serverTimeHHMM
+    ) {
+      const todayDow = new Date().getDay();
+      const { shiftStartMin } = getDayShiftSchedule(todayDow, settings);
+      const nowMin = parseTimeToMinutes(serverTimeHHMM);
+      const graceMin = settings.grace_period_minutes ?? 15;
+      if (nowMin > shiftStartMin + graceMin) {
+        const calcLate = nowMin - shiftStartMin;
+        setPendingLateMinutesPreview(calcLate);
+        setLateReasonInput(clockNote.trim());
+        setShowLateReasonModal(true);
+        return;
+      }
+    }
+    await executeClockRequest(eventType);
+  };
+
+  const handleAckLateDecision = async (logId?: number | null) => {
+    try {
+      await apiRequest('/api/attendance/ack-late-decision', {
+        method: 'POST',
+        body: JSON.stringify({ log_id: logId || null }),
+      });
+      await loadAllWorkerData();
+    } catch {
+      // ignore
     }
   };
 
@@ -747,6 +905,9 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
         onRefresh={loadAllWorkerData}
       />
 
+      {/* ۱-ب. نوار فعال‌سازی نوتیفیکیشن گوشی (اندروید و شیائومی) */}
+      <MobileNotificationBannerAndModal />
+
       {/* ۲. اعلان فوری پیام جدید یا تسک جدید از سمت مدیریت (با دکمه مستقیم مشاهده) */}
       {unreadMessagesCount > 0 && activeTab !== 'correspondence' && (
         <div
@@ -829,6 +990,84 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             <span>مشاهده تسک‌ها</span>
             <ArrowLeft className="w-3.5 h-3.5" />
           </button>
+        </div>
+      )}
+
+      {/* ۲-ب. نمایش تصمیم و یادداشت مدیر درباره تأخیر در ورود پرسنل */}
+      {unseenLateDecisions.length > 0 && (
+        <div className="space-y-2">
+          {unseenLateDecisions.map((dec) => {
+            const badge = LATE_STATUS_BADGE_INFO[dec.late_status || ''] || {
+              label: dec.status_label,
+              className: 'bg-slate-100 text-slate-800 border-slate-300',
+            };
+            return (
+              <div
+                key={dec.work_date}
+                role="alert"
+                className="rounded-2xl bg-[#FCF9F2] border-2 border-[#C5A059] p-3 space-y-2 shadow-xs"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-[#9A7428] shrink-0" />
+                    <span className="text-xs font-extrabold text-[#0B192C]">
+                      نتیجه تصمیم مدیریت درباره تأخیر ورود تاریخ {toPersianDigits(dec.shamsi_date)}
+                    </span>
+                  </div>
+                  <span
+                    className={`px-2 py-0.5 rounded-lg border text-[10.5px] font-extrabold ${badge.className}`}
+                  >
+                    {badge.label}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] text-slate-700 bg-white rounded-xl p-2.5 border border-slate-200/80">
+                  <div>
+                    <span className="text-slate-500">ساعت ورود و میزان تأخیر: </span>
+                    <strong className="text-[#0B192C] tabular-nums">
+                      ساعت {toPersianDigits(dec.first_in_time || '—')} (
+                      {toPersianDigits(dec.raw_late_minutes || dec.late_minutes || 0)} دقیقه تأخیر)
+                    </strong>
+                  </div>
+                  {dec.late_deduction_toman && dec.late_deduction_toman > 0 ? (
+                    <div>
+                      <span className="text-slate-500">مبلغ کسرشده از حقوق: </span>
+                      <strong className="text-red-700 tabular-nums">
+                        {formatToman(dec.late_deduction_toman)}
+                      </strong>
+                    </div>
+                  ) : (
+                    <div>
+                      <span className="text-slate-500">کسر مالی: </span>
+                      <strong className="text-emerald-700">بدون کسر مالی (۰ تومان)</strong>
+                    </div>
+                  )}
+                  {dec.late_reason && (
+                    <div className="sm:col-span-2">
+                      <span className="text-slate-500">علت ثبت‌شده توسط شما: </span>
+                      <span className="font-medium text-slate-800">{dec.late_reason}</span>
+                    </div>
+                  )}
+                  {dec.manager_late_note && (
+                    <div className="sm:col-span-2 pt-1 border-t border-slate-100">
+                      <span className="font-bold text-[#9A7428]">یادداشت مدیریت (مجید نورایی): </span>
+                      <strong className="text-[#0B192C]">{dec.manager_late_note}</strong>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => handleAckLateDecision(dec.first_in_log_id)}
+                    className="min-h-[32px] px-3 rounded-xl bg-[#0B192C] hover:bg-[#162a45] text-[#C5A059] text-[11px] font-bold cursor-pointer"
+                  >
+                    متوجه شدم (ثبت رؤیت تصمیم مدیر)
+                  </button>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -1195,6 +1434,40 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                               </>
                             )}
                           </div>
+
+                          {/* نمایش وضعیت بررسی تأخیر، علت تأخیر و یادداشت مدیر در سابقه روزانه */}
+                          {day.late_status && day.late_status !== 'NONE' && (
+                            <div className="mt-1 rounded-xl bg-slate-50 border border-slate-200/80 px-2.5 py-1.5 text-[10px] space-y-0.5">
+                              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                <span className="font-bold text-[#0B192C]">
+                                  وضعیت تأخیر ورود ({toPersianDigits(day.raw_late_minutes || day.late_minutes || 0)} دقیقه):
+                                </span>
+                                <span
+                                  className={`px-2 py-0.5 rounded border font-bold ${
+                                    LATE_STATUS_BADGE_INFO[day.late_status]?.className ||
+                                    'bg-slate-100 text-slate-700'
+                                  }`}
+                                >
+                                  {LATE_STATUS_BADGE_INFO[day.late_status]?.label || day.status_label}
+                                </span>
+                              </div>
+                              {day.late_reason && (
+                                <div className="text-slate-600">
+                                  علت اعلام‌شده: <span className="font-semibold">{day.late_reason}</span>
+                                </div>
+                              )}
+                              {day.manager_late_note && (
+                                <div className="text-[#9A7428] font-bold">
+                                  یادداشت مدیر: <span className="text-[#0B192C]">{day.manager_late_note}</span>
+                                </div>
+                              )}
+                              {day.late_deduction_toman && day.late_deduction_toman > 0 ? (
+                                <div className="text-red-700 font-bold tabular-nums">
+                                  مبلغ کسرشده بابت این روز: {formatToman(day.late_deduction_toman)}
+                                </div>
+                              ) : null}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -2246,6 +2519,101 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* پاپ‌آپ ثبت علت تأخیر ورود پیش از ثبت ساعت ورود (در صورت ورود دیرتر از حد مجاز) */}
+      {showLateReasonModal && (
+        <div
+          onClick={() => setShowLateReasonModal(false)}
+          className="fixed inset-0 z-50 bg-[#0B192C]/55 backdrop-blur-md flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-2xl bg-white border-2 border-[#C5A059] shadow-2xl p-4 sm:p-5 space-y-3.5"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <h3 className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
+                  ورود دیرتر از ساعت مقرر — ثبت علت تأخیر جهت تأیید مدیر
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowLateReasonModal(false)}
+                aria-label="بستن"
+                className="w-6 h-6 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-amber-50 border border-amber-200 p-3 text-xs text-amber-950 space-y-1">
+              <div className="font-bold">
+                میزان تأخیر ورود شما امروز ({toPersianDigits(serverShamsiDate)}):{' '}
+                <span className="text-red-700 font-extrabold tabular-nums">
+                  {toPersianDigits(pendingLateMinutesPreview)} دقیقه
+                </span>
+              </div>
+              <p className="text-[11px] text-amber-900 leading-5">
+                با توجه به ورود پس از ساعت مقرر و فرجه مجاز، پیش از قطعی‌شدن سابقه ورود و خروج، علت تأخیر شما برای مدیریت ارسال می‌شود تا مدیر درباره نحوه ثبت آن (بخشش تأخیر، ثبت با تأخیر، کسر از مرخصی یا ثبت غیبت) تصمیم‌گیری نماید.
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-xs font-bold text-[#0B192C]">
+                علت تأخیر خود را بنویسید (الزامی):
+              </label>
+              <div className="flex flex-wrap gap-1.5 pb-1">
+                {[
+                  'ترافیک سنگین مسیر',
+                  'مأموریت / خرید وسایل کارگاه در مسیر',
+                  'مشکل خودرو / سرویس حمل‌ونقل',
+                  'کار اداری / بانکی با اطلاع قبلی',
+                  'کسالت / مراجعه درمانی',
+                ].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setLateReasonInput(preset)}
+                    className="px-2 py-0.5 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059]/60 text-[10px] font-semibold text-[#0B192C] cursor-pointer"
+                  >
+                    + {preset}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                rows={3}
+                value={lateReasonInput}
+                onChange={(e) => setLateReasonInput(e.target.value)}
+                placeholder="توضیح کوتاه درباره علت تأخیر امروز..."
+                className="w-full rounded-xl border border-slate-300 p-2.5 text-xs leading-6 focus:outline-none focus:border-[#0B192C]"
+              />
+            </div>
+
+            <div className="pt-1 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowLateReasonModal(false)}
+                className="min-h-[38px] px-3.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer"
+              >
+                انصراف
+              </button>
+              <button
+                type="button"
+                disabled={actionLoading}
+                onClick={() => {
+                  const reasonToSend =
+                    lateReasonInput.trim() || 'ورود با تأخیر (در انتظار بررسی و تعیین تکلیف مدیریت)';
+                  executeClockRequest('WORK_START', reasonToSend);
+                }}
+                className="min-h-[38px] px-4 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
+              >
+                {actionLoading ? 'در حال ثبت...' : 'ثبت شروع کار و ارسال علت تأخیر برای مدیر'}
+              </button>
+            </div>
           </div>
         </div>
       )}

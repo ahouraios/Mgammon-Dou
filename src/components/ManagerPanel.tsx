@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AbsenceDeductionUnit,
   AttendanceEventType,
   DailyAttendanceSummary,
   DailyWorkReport,
@@ -8,6 +9,8 @@ import {
   FinancialTxType,
   FridayHolidayPolicy,
   HistoricalWorkRecord,
+  LateArrivalDisposition,
+  LateDeductionUnit,
   LeaveQuotaSummary,
   LeaveRequestItem,
   MissionPolicy,
@@ -16,6 +19,7 @@ import {
   UserProfile,
   WorkerLiveState,
 } from '../shared/types';
+import { calculateLateAndAbsenceRates } from '../shared/calculationEngine';
 import {
   apiRequest,
   EVENT_TYPE_LABELS,
@@ -97,6 +101,7 @@ interface DashboardResponse {
     effectiveOvertimeHourlyRateToman: number;
     earnedRegularWorkToman?: number;
     totalOvertimePayToman: number;
+    totalLateDeductionToman?: number;
     totalSalaryPlusOvertimeToman?: number;
   };
   unseenAlerts: {
@@ -106,6 +111,8 @@ interface DashboardResponse {
     unseenReportsCount: number;
     historicalAlert: boolean;
     pendingHistoricalCount: number;
+    lateAlert?: boolean;
+    pendingLateCount?: number;
     correspondenceAlert: boolean;
     unreadCorrespondenceCount: number;
   };
@@ -128,8 +135,73 @@ interface DashboardResponse {
     }[];
   };
   recentSummaries: DailyAttendanceSummary[];
+  pendingLateReviews?: DailyAttendanceSummary[];
+  reviewedLateSummaries?: DailyAttendanceSummary[];
   settings: SystemSettings;
 }
+
+const LATE_DISPOSITION_OPTIONS: {
+  value: Exclude<LateArrivalDisposition, 'NONE' | 'PENDING'>;
+  label: string;
+  desc: string;
+}[] = [
+  {
+    value: 'EXCUSED',
+    label: 'ثبت بدون تأخیر (بخشش تأخیر / موجه)',
+    desc: 'این روز بدون تأخیر و بدون کسر جریمه ثبت می‌شود.',
+  },
+  {
+    value: 'APPROVED_DELAY',
+    label: 'ثبت با تأخیر (کسر مبلغ تأخیر طبق نرخ مصوب)',
+    desc: 'تأخیر در سابقه درج شده و مبلغ جریمه تأخیر بر اساس نرخ تعیین‌شده کسر می‌گردد.',
+  },
+  {
+    value: 'DEDUCT_LEAVE',
+    label: 'کسر از مرخصی (ثبت مرخصی ساعتی به میزان تأخیر)',
+    desc: 'مدت تأخیر به‌صورت خودکار از سهمیه مرخصی استحقاقی پرسنل کسر شده و جریمه نقدی اعمال نمی‌شود.',
+  },
+  {
+    value: 'ABSENCE',
+    label: 'ثبت غیبت روزانه (کسر مبلغ غیبت)',
+    desc: 'این روز به‌عنوان غیبت ثبت شده و مبلغ کسر غیبت روزانه اعمال می‌شود.',
+  },
+  {
+    value: 'CUSTOM',
+    label: 'سایر موارد / تعیین مبلغ کسر توافقی',
+    desc: 'امکان ثبت یادداشت اختصاصی و مبلغ کسر دلخواه توسط مدیریت.',
+  },
+];
+
+const LATE_STATUS_BADGE_MAP: Record<
+  LateArrivalDisposition,
+  { label: string; className: string }
+> = {
+  NONE: { label: 'عادی', className: 'bg-slate-100 text-slate-700 border-slate-200' },
+  PENDING: {
+    label: 'در انتظار تصمیم مدیر',
+    className: 'bg-amber-100 text-amber-950 border-amber-300',
+  },
+  EXCUSED: {
+    label: 'بخشش تأخیر (ثبت بدون تأخیر)',
+    className: 'bg-emerald-100 text-emerald-900 border-emerald-300',
+  },
+  APPROVED_DELAY: {
+    label: 'ثبت با تأخیر (کسر جریمه)',
+    className: 'bg-orange-100 text-orange-950 border-orange-300',
+  },
+  ABSENCE: {
+    label: 'ثبت غیبت روزانه',
+    className: 'bg-red-100 text-red-900 border-red-300',
+  },
+  DEDUCT_LEAVE: {
+    label: 'کسر از مرخصی استحقاقی',
+    className: 'bg-sky-100 text-sky-900 border-sky-300',
+  },
+  CUSTOM: {
+    label: 'تصمیم اختصاصی مدیریت',
+    className: 'bg-purple-100 text-purple-900 border-purple-300',
+  },
+};
 
 const WEEKDAY_CHECKBOXES = [
   { day: 6, label: 'شنبه' },
@@ -172,7 +244,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   );
   const [showAllDashReports, setShowAllDashReports] = useState(false);
   const [dashClaimFilter, setDashClaimFilter] = useState<
-    'all' | 'pending' | 'leaves' | 'petty_cash' | 'advance'
+    'all' | 'pending' | 'late' | 'leaves' | 'petty_cash' | 'advance'
   >('all');
   const [showAllDashClaims, setShowAllDashClaims] = useState(false);
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
@@ -246,6 +318,65 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [newHolidayShamsi, setNewHolidayShamsi] = useState('');
   const [testingSms, setTestingSms] = useState(false);
   const [showSmsHelpModal, setShowSmsHelpModal] = useState(false);
+
+  // پاپ‌آپ بررسی و تعیین تکلیف تأخیر ورود پرسنل توسط مدیر
+  const [reviewingLateDay, setReviewingLateDay] = useState<DailyAttendanceSummary | null>(null);
+  const [lateDecisionChoice, setLateDecisionChoice] =
+    useState<Exclude<LateArrivalDisposition, 'NONE' | 'PENDING'>>('EXCUSED');
+  const [lateManagerNote, setLateManagerNote] = useState('');
+  const [lateCustomDeduction, setLateCustomDeduction] = useState('');
+
+  const openReviewLateModal = (
+    day: DailyAttendanceSummary,
+    presetDecision?: Exclude<LateArrivalDisposition, 'NONE' | 'PENDING'>
+  ) => {
+    setReviewingLateDay(day);
+    const currentStatus = day.late_status;
+    if (presetDecision) {
+      setLateDecisionChoice(presetDecision);
+    } else if (currentStatus && currentStatus !== 'NONE' && currentStatus !== 'PENDING') {
+      setLateDecisionChoice(currentStatus);
+    } else {
+      setLateDecisionChoice('EXCUSED');
+    }
+    setLateManagerNote(day.manager_late_note || '');
+    setLateCustomDeduction(
+      day.late_deduction_toman && day.late_deduction_toman > 0
+        ? String(day.late_deduction_toman)
+        : ''
+    );
+  };
+
+  const handleSubmitLateReview = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reviewingLateDay) return;
+    setFeedback(null);
+    setActionLoading(true);
+    try {
+      const res = await apiRequest<{ ok: boolean; message: string }>(
+        '/api/attendance/review-late',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            shamsi_date: reviewingLateDay.shamsi_date,
+            decision: lateDecisionChoice,
+            manager_note: lateManagerNote,
+            custom_deduction_toman:
+              lateDecisionChoice === 'CUSTOM' && lateCustomDeduction
+                ? Number(lateCustomDeduction)
+                : null,
+          }),
+        }
+      );
+      setReviewingLateDay(null);
+      setFeedback({ type: 'success', text: res.message });
+      await Promise.all([loadDashboardAndSettings(), loadAttendanceList()]);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      setActionLoading(false);
+    }
+  };
 
   const loadDashboardAndSettings = useCallback(async (syncSettings = false) => {
     try {
@@ -937,6 +1068,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     unseen?.financeAlert ||
     unseen?.reportsAlert ||
     unseen?.historicalAlert ||
+    unseen?.lateAlert ||
     unseen?.correspondenceAlert;
 
   const currentShamsi = dashboard?.serverTime.shamsiDate || initialShamsiDate;
@@ -956,7 +1088,26 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     return showAllDashReports ? dashboardFilteredReports : dashboardFilteredReports.slice(0, 3);
   }, [dashboardFilteredReports, showAllDashReports]);
 
-  // شمارش مطالبات در انتظار تأیید (مرخصی، تنخواه، مساعده، سوابق)
+  // شمارش مطالبات در انتظار تأیید (مرخصی، تنخواه، مساعده، سوابق، تأخیر ورود)
+  const pendingLateDays = React.useMemo(
+    () =>
+      attendanceSummaries.filter(
+        (d) =>
+          d.late_status === 'PENDING' ||
+          (d.is_late && (!d.late_status || d.late_status === 'NONE'))
+      ),
+    [attendanceSummaries]
+  );
+  const allLateDays = React.useMemo(
+    () =>
+      attendanceSummaries.filter(
+        (d) =>
+          (d.late_status && d.late_status !== 'NONE') ||
+          d.is_late ||
+          (d.raw_late_minutes && d.raw_late_minutes > 0)
+      ),
+    [attendanceSummaries]
+  );
   const pendingLeavesCount = React.useMemo(
     () => leaveRequests.filter((l) => l.status === 'PENDING').length,
     [leaveRequests]
@@ -970,7 +1121,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     [historicalRecords]
   );
   const totalPendingClaimsCount =
-    pendingLeavesCount + pendingFinanceCount + pendingHistoricalCount;
+    pendingLeavesCount +
+    pendingFinanceCount +
+    pendingHistoricalCount +
+    pendingLateDays.length;
 
   // استخراج ماه‌های موجود در جدول تردد برای فیلتر ماهانه در پنل مدیر
   const availableMgrHistoryMonths = React.useMemo(() => {
@@ -1091,6 +1245,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               >
                 <GoldenBlinkDot />
                 <span>مرخصی / سوابق ({toPersianDigits(unseen.pendingHistoricalCount)})</span>
+              </button>
+            )}
+            {pendingLateDays.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('dashboard');
+                  setDashClaimFilter('late');
+                }}
+                className="px-2.5 py-1 rounded-lg bg-orange-50 border border-orange-300 text-orange-950 font-semibold flex items-center gap-1 cursor-pointer"
+              >
+                <GoldenBlinkDot />
+                <span>
+                  تأخیر ورود در انتظار تعیین تکلیف ({toPersianDigits(pendingLateDays.length)})
+                </span>
               </button>
             )}
             {unseen?.correspondenceAlert && (
@@ -1387,12 +1556,20 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       id: 'all' as const,
                       label: 'همه مطالبات و سوابق اخیر',
                       count:
-                        leaveRequests.length + transactions.length + historicalRecords.length,
+                        leaveRequests.length +
+                        transactions.length +
+                        historicalRecords.length +
+                        allLateDays.length,
                     },
                     {
                       id: 'pending' as const,
                       label: 'در انتظار تأیید',
                       count: totalPendingClaimsCount,
+                    },
+                    {
+                      id: 'late' as const,
+                      label: 'تأخیرهای ورود پرسنل',
+                      count: allLateDays.length,
                     },
                     {
                       id: 'leaves' as const,
@@ -1427,7 +1604,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                           : 'bg-slate-100 text-slate-700 hover:bg-slate-200/70'
                       }`}
                     >
-                      {tab.id === 'pending' && tab.count > 0 && <GoldenBlinkDot />}
+                      {(tab.id === 'pending' || tab.id === 'late') &&
+                        ((tab.id === 'pending' && tab.count > 0) ||
+                          (tab.id === 'late' && pendingLateDays.length > 0)) && (
+                          <GoldenBlinkDot />
+                        )}
                       <span>{tab.label}</span>
                       <span className="opacity-80 tabular-nums">
                         ({toPersianDigits(tab.count)})
@@ -1438,6 +1619,23 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                 {/* لیست یکپارچه مطالبات بر اساس فیلتر انتخاب‌شده */}
                 {(() => {
+                  const filteredLateDays = allLateDays
+                    .filter((day) => {
+                      if (dashClaimFilter === 'pending') {
+                        return (
+                          day.late_status === 'PENDING' ||
+                          (day.is_late && (!day.late_status || day.late_status === 'NONE'))
+                        );
+                      }
+                      if (dashClaimFilter === 'late' || dashClaimFilter === 'all') return true;
+                      return false;
+                    })
+                    .sort(
+                      (a, b) =>
+                        (a.late_status === 'PENDING' ? 0 : 1) -
+                        (b.late_status === 'PENDING' ? 0 : 1)
+                    );
+
                   const filteredLeaves = leaveRequests
                     .filter((lv) => {
                       if (dashClaimFilter === 'pending') return lv.status === 'PENDING';
@@ -1449,7 +1647,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   const filteredTxs = transactions
                     .filter((tx) => {
                       if (dashClaimFilter === 'pending') return tx.status === 'PENDING';
-                      if (dashClaimFilter === 'leaves') return false;
+                      if (dashClaimFilter === 'leaves' || dashClaimFilter === 'late') return false;
                       if (dashClaimFilter === 'petty_cash')
                         return tx.tx_type === 'PETTY_CASH' || tx.tx_type === 'OTHER';
                       if (dashClaimFilter === 'advance')
@@ -1469,7 +1667,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   });
 
                   const totalItems =
-                    filteredLeaves.length + filteredTxs.length + filteredHistorical.length;
+                    filteredLateDays.length +
+                    filteredLeaves.length +
+                    filteredTxs.length +
+                    filteredHistorical.length;
 
                   if (totalItems === 0) {
                     return (
@@ -1479,6 +1680,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     );
                   }
 
+                  const displayedLateDays = showAllDashClaims
+                    ? filteredLateDays
+                    : filteredLateDays.slice(0, 3);
                   const displayedLeaves = showAllDashClaims
                     ? filteredLeaves
                     : filteredLeaves.slice(0, 2);
@@ -1488,6 +1692,88 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                   return (
                     <div className="space-y-2.5">
+                      {/* الف-۰) تأخیرهای ورود پرسنل و تعیین تکلیف توسط مدیر */}
+                      {displayedLateDays.length > 0 && (
+                        <div className="space-y-2">
+                          {displayedLateDays.map((day) => {
+                            const isPendingLate =
+                              day.late_status === 'PENDING' ||
+                              (day.is_late && (!day.late_status || day.late_status === 'NONE'));
+                            const lateMins = day.raw_late_minutes || day.late_minutes || 0;
+                            const badge =
+                              LATE_STATUS_BADGE_MAP[day.late_status || 'PENDING'] ||
+                              LATE_STATUS_BADGE_MAP.PENDING;
+                            return (
+                              <div
+                                key={`late-${day.shamsi_date}`}
+                                className={`rounded-xl border p-3 flex flex-wrap items-center justify-between gap-2 text-xs ${
+                                  isPendingLate
+                                    ? 'bg-orange-50/80 border-orange-300'
+                                    : 'bg-slate-50/70 border-slate-200'
+                                }`}
+                              >
+                                <div className="space-y-1 min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    {isPendingLate && <GoldenBlinkDot />}
+                                    <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-orange-600 text-white">
+                                      تأخیر در ورود ({toPersianDigits(lateMins)} دقیقه)
+                                    </span>
+                                    <span className="font-bold text-[#0B192C] tabular-nums">
+                                      {toPersianDigits(day.shamsi_date)} ({day.day_name})
+                                    </span>
+                                    {day.first_in_time && (
+                                      <span className="text-slate-600 tabular-nums">
+                                        ورود ثبت‌شده: {toPersianDigits(day.first_in_time)}
+                                      </span>
+                                    )}
+                                    <span
+                                      className={`px-2 py-0.5 rounded border text-[10px] font-bold ${badge.className}`}
+                                    >
+                                      {badge.label}
+                                    </span>
+                                  </div>
+                                  {day.late_reason ? (
+                                    <p className="text-[11px] text-slate-800">
+                                      علت تأخیر اعلام‌شده توسط پرسنل:{' '}
+                                      <strong className="text-[#0B192C]">{day.late_reason}</strong>
+                                    </p>
+                                  ) : (
+                                    <p className="text-[11px] text-slate-500">
+                                      بدون توضیحات ثبت‌شده از طرف پرسنل
+                                    </p>
+                                  )}
+                                  {day.manager_late_note && (
+                                    <p className="text-[11px] text-[#9A7428] font-bold">
+                                      یادداشت مدیر: {day.manager_late_note}
+                                    </p>
+                                  )}
+                                  {day.late_deduction_toman && day.late_deduction_toman > 0 ? (
+                                    <p className="text-[11px] text-red-700 font-bold tabular-nums">
+                                      مبلغ کسرشده: {formatToman(day.late_deduction_toman)}
+                                    </p>
+                                  ) : null}
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => openReviewLateModal(day)}
+                                    className="min-h-[30px] px-3 rounded-lg bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <Edit3 className="w-3 h-3" />
+                                    <span>
+                                      {isPendingLate
+                                        ? 'تعیین تکلیف تأخیر و ارسال نظر'
+                                        : 'ویرایش تصمیم مدیر'}
+                                    </span>
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
                       {/* الف) درخواست‌های مرخصی */}
                       {displayedLeaves.length > 0 && (
                         <div className="space-y-2">
@@ -2701,6 +2987,57 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                               </div>
                             )}
                           </div>
+
+                          {/* نمایش وضعیت تأخیر ورود، علت تأخیر پرسنل و دکمه تعیین تکلیف مدیر در جدول تردد */}
+                          {(day.is_late ||
+                            (day.late_status && day.late_status !== 'NONE') ||
+                            (day.raw_late_minutes && day.raw_late_minutes > 0)) && (
+                            <div className="mt-1 rounded-xl bg-orange-50/60 border border-orange-200/90 px-2.5 py-2 text-[10.5px] flex flex-wrap items-center justify-between gap-2">
+                              <div className="space-y-0.5">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="font-bold text-[#0B192C]">
+                                    تأخیر ورود:{' '}
+                                    {toPersianDigits(day.raw_late_minutes || day.late_minutes || 0)}{' '}
+                                    دقیقه
+                                  </span>
+                                  {day.late_status && day.late_status !== 'NONE' && (
+                                    <span
+                                      className={`px-2 py-0.5 rounded border text-[10px] font-bold ${
+                                        LATE_STATUS_BADGE_MAP[day.late_status]?.className || ''
+                                      }`}
+                                    >
+                                      {LATE_STATUS_BADGE_MAP[day.late_status]?.label}
+                                    </span>
+                                  )}
+                                </div>
+                                {day.late_reason && (
+                                  <div className="text-slate-700">
+                                    علت اعلام‌شده پرسنل:{' '}
+                                    <strong className="text-[#0B192C]">{day.late_reason}</strong>
+                                  </div>
+                                )}
+                                {day.manager_late_note && (
+                                  <div className="text-[#9A7428] font-bold">
+                                    یادداشت مدیر: {day.manager_late_note}
+                                  </div>
+                                )}
+                                {day.late_deduction_toman && day.late_deduction_toman > 0 ? (
+                                  <div className="text-red-700 font-bold tabular-nums">
+                                    مبلغ کسر بابت این روز: {formatToman(day.late_deduction_toman)}
+                                  </div>
+                                ) : null}
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={() => openReviewLateModal(day)}
+                                className="min-h-[28px] px-2.5 rounded-lg bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-[10.5px] font-bold flex items-center gap-1 cursor-pointer"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                                <span>تعیین تکلیف تأخیر</span>
+                              </button>
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -3637,6 +3974,209 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                           placeholder="محاسبه خودکار از روی حقوق ماهانه"
                         />
                       </div>
+
+                      {/* بخش تعیین مبلغ کسر بابت تأخیر و غیبت (پیش‌فرض بر اساس قانون کار: ماه کاری ۲۶ روز = ۲۰۸ ساعت) */}
+                      {(() => {
+                        const currentEffective = calculateLateAndAbsenceRates(settingsForm);
+                        const lateUnit = settingsForm.late_deduction_unit || 'MINUTE';
+                        const absenceUnit = settingsForm.absence_deduction_unit || 'DAY';
+                        const defaultLateForUnit =
+                          lateUnit === 'HOUR'
+                            ? currentEffective.legalHourlyRateToman
+                            : currentEffective.legalMinuteRateToman;
+                        const defaultAbsenceForUnit =
+                          absenceUnit === 'HOUR'
+                            ? currentEffective.legalHourlyRateToman
+                            : currentEffective.legalDailyAbsenceRateToman;
+
+                        return (
+                          <div className="pt-4 border-t border-slate-200 space-y-3.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <h4 className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
+                                  تنظیمات میزان کسر مبلغ بابت تأخیر در ورود و غیبت (پیش‌فرض بر اساس قانون کار)
+                                </h4>
+                                <p className="text-[11px] text-slate-500 mt-0.5">
+                                  به‌صورت پیش‌فرض بر اساس قانون کار (ماه کاری ۲۶ روز معادل ۲۰۸ ساعت کاری) از روی حقوق پایه پرسنل محاسبه می‌شود. در صورت تمایل می‌توانید مبلغ دلخواه را برای هر دقیقه/ساعت تأخیر یا غیبت وارد کنید.
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSettingsForm((prev) =>
+                                    prev
+                                      ? {
+                                          ...prev,
+                                          late_deduction_unit: 'MINUTE',
+                                          late_deduction_rate_toman: null,
+                                          absence_deduction_unit: 'DAY',
+                                          absence_deduction_rate_toman: null,
+                                        }
+                                      : prev
+                                  )
+                                }
+                                className="min-h-[32px] px-3 rounded-xl bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059] text-[11px] font-bold text-[#0B192C] cursor-pointer"
+                              >
+                                بازگردانی به پیش‌فرض خودکار قانون کار
+                              </button>
+                            </div>
+
+                            {/* خلاصه نرخ‌های پیش‌فرض قانون کار برای حقوق فعلی */}
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                              <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 flex items-center justify-between">
+                                <span className="text-slate-600">نرخ هر دقیقه تأخیر (قانون کار):</span>
+                                <strong className="text-[#0B192C] tabular-nums">
+                                  {formatToman(currentEffective.legalMinuteRateToman)}
+                                </strong>
+                              </div>
+                              <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 flex items-center justify-between">
+                                <span className="text-slate-600">نرخ هر ساعت تأخیر (قانون کار):</span>
+                                <strong className="text-[#0B192C] tabular-nums">
+                                  {formatToman(currentEffective.legalHourlyRateToman)}
+                                </strong>
+                              </div>
+                              <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 flex items-center justify-between">
+                                <span className="text-slate-600">نرخ هر روز غیبت (۱/۲۶ حقوق):</span>
+                                <strong className="text-[#0B192C] tabular-nums">
+                                  {formatToman(currentEffective.legalDailyAbsenceRateToman)}
+                                </strong>
+                              </div>
+                            </div>
+
+                            {/* ۱. تنظیم کسر بابت تأخیر در ورود */}
+                            <div className="rounded-xl bg-orange-50/40 border border-orange-200/80 p-3.5 space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-xs font-extrabold text-orange-950">
+                                  ۱. نحوه محاسبه جریمه / کسر بابت تأخیر در ورود (در صورت انتخاب گزینه «ثبت با تأخیر»)
+                                </span>
+                                <span className="text-[11px] font-bold text-orange-900 tabular-nums">
+                                  نرخ فعال فعلی: هر دقیقه{' '}
+                                  {formatToman(currentEffective.effectiveLateMinuteRateToman)} (هر ساعت{' '}
+                                  {formatToman(currentEffective.effectiveLateHourlyRateToman)})
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-start">
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                                    واحد تعیین مبلغ کسر تأخیر
+                                  </label>
+                                  <select
+                                    value={lateUnit}
+                                    onChange={(e) =>
+                                      setSettingsForm((prev) =>
+                                        prev
+                                          ? {
+                                              ...prev,
+                                              late_deduction_unit:
+                                                e.target.value as LateDeductionUnit,
+                                            }
+                                          : prev
+                                      )
+                                    }
+                                    className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white font-semibold text-[#0B192C]"
+                                  >
+                                    <option value="MINUTE">بر اساس هر دقیقه تأخیر (تومان)</option>
+                                    <option value="HOUR">بر اساس هر ساعت تأخیر (تومان)</option>
+                                  </select>
+                                </div>
+
+                                <TomanInput
+                                  label={
+                                    lateUnit === 'HOUR'
+                                      ? 'مبلغ کسر به ازای هر ساعت تأخیر (خالی = پیش‌فرض قانون کار)'
+                                      : 'مبلغ کسر به ازای هر دقیقه تأخیر (خالی = پیش‌فرض قانون کار)'
+                                  }
+                                  value={
+                                    settingsForm.late_deduction_rate_toman !== null &&
+                                    settingsForm.late_deduction_rate_toman !== undefined &&
+                                    settingsForm.late_deduction_rate_toman > 0
+                                      ? String(settingsForm.late_deduction_rate_toman)
+                                      : ''
+                                  }
+                                  onChange={(val) =>
+                                    setSettingsForm((prev) =>
+                                      prev
+                                        ? {
+                                            ...prev,
+                                            late_deduction_rate_toman: val ? Number(val) : null,
+                                          }
+                                        : prev
+                                    )
+                                  }
+                                  placeholder={`پیش‌فرض قانون کار: ${toPersianDigits(defaultLateForUnit.toLocaleString('en-US'))} تومان`}
+                                />
+                              </div>
+                            </div>
+
+                            {/* ۲. تنظیم کسر بابت غیبت */}
+                            <div className="rounded-xl bg-red-50/40 border border-red-200/80 p-3.5 space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-xs font-extrabold text-red-950">
+                                  ۲. نحوه محاسبه کسر بابت غیبت (در صورت انتخاب گزینه «ثبت غیبت»)
+                                </span>
+                                <span className="text-[11px] font-bold text-red-900 tabular-nums">
+                                  نرخ فعال فعلی: هر روز غیبت{' '}
+                                  {formatToman(currentEffective.effectiveDailyAbsenceRateToman)} (هر ساعت{' '}
+                                  {formatToman(currentEffective.effectiveHourlyAbsenceRateToman)})
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-start">
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                                    واحد تعیین مبلغ کسر غیبت
+                                  </label>
+                                  <select
+                                    value={absenceUnit}
+                                    onChange={(e) =>
+                                      setSettingsForm((prev) =>
+                                        prev
+                                          ? {
+                                              ...prev,
+                                              absence_deduction_unit:
+                                                e.target.value as AbsenceDeductionUnit,
+                                            }
+                                          : prev
+                                      )
+                                    }
+                                    className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white font-semibold text-[#0B192C]"
+                                  >
+                                    <option value="DAY">بر اساس هر روز غیبت (تومان)</option>
+                                    <option value="HOUR">بر اساس هر ساعت غیبت (تومان)</option>
+                                  </select>
+                                </div>
+
+                                <TomanInput
+                                  label={
+                                    absenceUnit === 'HOUR'
+                                      ? 'مبلغ کسر به ازای هر ساعت غیبت (خالی = پیش‌فرض قانون کار)'
+                                      : 'مبلغ کسر به ازای هر روز غیبت (خالی = پیش‌فرض قانون کار)'
+                                  }
+                                  value={
+                                    settingsForm.absence_deduction_rate_toman !== null &&
+                                    settingsForm.absence_deduction_rate_toman !== undefined &&
+                                    settingsForm.absence_deduction_rate_toman > 0
+                                      ? String(settingsForm.absence_deduction_rate_toman)
+                                      : ''
+                                  }
+                                  onChange={(val) =>
+                                    setSettingsForm((prev) =>
+                                      prev
+                                        ? {
+                                            ...prev,
+                                            absence_deduction_rate_toman: val ? Number(val) : null,
+                                          }
+                                        : prev
+                                    )
+                                  }
+                                  placeholder={`پیش‌فرض قانون کار: ${toPersianDigits(defaultAbsenceForUnit.toLocaleString('en-US'))} تومان`}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
                   )}
 
@@ -3658,20 +4198,36 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                             <HelpCircle className="w-3.5 h-3.5" />
                           </button>
                         </div>
-                        <label className="inline-flex items-center gap-2 text-xs font-bold text-[#0B192C] cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={settingsForm.sms_enabled}
-                            onChange={(e) =>
-                              setSettingsForm({
-                                ...settingsForm,
-                                sms_enabled: e.target.checked,
-                              })
-                            }
-                            className="w-4 h-4 accent-[#0B192C]"
-                          />
-                          <span>فعال‌سازی ارسال پیامک</span>
-                        </label>
+                        <div className="flex flex-wrap items-center gap-4">
+                          <label className="inline-flex items-center gap-2 text-xs font-bold text-[#0B192C] cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={settingsForm.sms_enabled}
+                              onChange={(e) =>
+                                setSettingsForm({
+                                  ...settingsForm,
+                                  sms_enabled: e.target.checked,
+                                })
+                              }
+                              className="w-4 h-4 accent-[#0B192C]"
+                            />
+                            <span>فعال‌سازی ارسال پیامک</span>
+                          </label>
+                          <label className="inline-flex items-center gap-2 text-xs font-bold text-emerald-900 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={settingsForm.sms_on_task_and_message ?? true}
+                              onChange={(e) =>
+                                setSettingsForm({
+                                  ...settingsForm,
+                                  sms_on_task_and_message: e.target.checked,
+                                })
+                              }
+                              className="w-4 h-4 accent-emerald-700"
+                            />
+                            <span>ارسال پیامک همزمان هنگام ثبت تسک و پیام جدید</span>
+                          </label>
+                        </div>
                       </div>
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -3959,6 +4515,137 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 را شماره‌گیری کرده و دریافت پیامک را فعال نماید؛ و یا در پنل ملی‌پیامک یک کد پترن خدماتی ثبت کرده و کد پترن را در کادر «شماره خط ارسال‌کننده» قرار دهید.
               </p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* پاپ‌آپ بررسی و تعیین تکلیف تأخیر ورود پرسنل توسط مدیر */}
+      {reviewingLateDay && (
+        <div
+          onClick={() => setReviewingLateDay(null)}
+          className="fixed inset-0 z-50 bg-[#0B192C]/55 backdrop-blur-md flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg rounded-2xl bg-white border-2 border-[#C5A059] shadow-2xl p-4 sm:p-5 space-y-3.5 max-h-[92vh] overflow-y-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-[#9A7428]" />
+                <h3 className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
+                  تعیین تکلیف تأخیر ورود پرسنل — تاریخ{' '}
+                  {toPersianDigits(reviewingLateDay.shamsi_date)}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReviewingLateDay(null)}
+                aria-label="بستن"
+                className="w-7 h-7 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-orange-50 border border-orange-200 p-3 text-xs space-y-1">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-bold text-[#0B192C]">
+                  میزان تأخیر ورود:{' '}
+                  <strong className="text-red-700 tabular-nums">
+                    {toPersianDigits(
+                      reviewingLateDay.raw_late_minutes || reviewingLateDay.late_minutes || 0
+                    )}{' '}
+                    دقیقه
+                  </strong>
+                </span>
+                {reviewingLateDay.first_in_time && (
+                  <span className="text-slate-700 tabular-nums">
+                    ساعت ورود ثبت‌شده:{' '}
+                    <strong>{toPersianDigits(reviewingLateDay.first_in_time)}</strong>
+                  </span>
+                )}
+              </div>
+              <div className="text-slate-700 pt-0.5">
+                علت تأخیر اعلام‌شده توسط پرسنل:{' '}
+                <strong className="text-[#0B192C]">
+                  {reviewingLateDay.late_reason || 'توضیحی ثبت نشده است'}
+                </strong>
+              </div>
+            </div>
+
+            <form onSubmit={handleSubmitLateReview} className="space-y-3">
+              <div className="space-y-1.5">
+                <label className="block text-xs font-extrabold text-[#0B192C]">
+                  تصمیم مدیریت برای این تأخیر:
+                </label>
+                <div className="space-y-1.5">
+                  {LATE_DISPOSITION_OPTIONS.map((opt) => {
+                    const selected = lateDecisionChoice === opt.value;
+                    return (
+                      <label
+                        key={opt.value}
+                        className={`block rounded-xl border p-2.5 cursor-pointer transition-colors ${
+                          selected
+                            ? 'bg-[#FCF9F2] border-[#C5A059] ring-1 ring-[#C5A059]'
+                            : 'bg-white border-slate-200 hover:bg-slate-50'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            name="lateDecision"
+                            checked={selected}
+                            onChange={() => setLateDecisionChoice(opt.value)}
+                            className="accent-[#0B192C]"
+                          />
+                          <span className="text-xs font-bold text-[#0B192C]">{opt.label}</span>
+                        </div>
+                        <p className="text-[10.5px] text-slate-600 pr-5 mt-0.5">{opt.desc}</p>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {lateDecisionChoice === 'CUSTOM' && (
+                <TomanInput
+                  label="مبلغ کسر توافقی / سفارشی برای این روز (تومان - اختیاری)"
+                  value={lateCustomDeduction}
+                  onChange={setLateCustomDeduction}
+                  placeholder="مثلاً 100,000 (خالی یا ۰ = بدون کسر نقدی)"
+                />
+              )}
+
+              <div>
+                <label className="block text-xs font-bold text-[#0B192C] mb-1">
+                  یادداشت مدیر برای پرسنل (در پنل پرسنل نمایش داده می‌شود):
+                </label>
+                <textarea
+                  rows={2}
+                  value={lateManagerNote}
+                  onChange={(e) => setLateManagerNote(e.target.value)}
+                  placeholder="یادداشت یا توضیح تصمیم مدیریت برای امید میثمی..."
+                  className="w-full rounded-xl border border-slate-200 p-2.5 text-xs leading-6"
+                />
+              </div>
+
+              <div className="pt-1 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setReviewingLateDay(null)}
+                  className="min-h-[38px] px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold cursor-pointer"
+                >
+                  انصراف
+                </button>
+                <button
+                  type="submit"
+                  disabled={actionLoading}
+                  className="min-h-[38px] px-5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
+                >
+                  {actionLoading ? 'در حال ثبت...' : 'ثبت تصمیم و ارسال به پنل پرسنل'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

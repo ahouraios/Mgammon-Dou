@@ -28,6 +28,16 @@ export type MissionPolicy = 'PAID_AS_WORK' | 'SEPARATE_EXTRA';
 export type FridayHolidayPolicy = 'ALL_OVERTIME' | 'REGULAR_WORK' | 'DISABLED';
 export type OvertimeCalcMode = 'FIXED_RATE' | 'PERCENTAGE';
 export type DeliveryChannel = 'IN_APP' | 'SMS' | 'BOTH';
+export type LateArrivalDisposition =
+  | 'NONE'
+  | 'PENDING'
+  | 'EXCUSED'
+  | 'APPROVED_DELAY'
+  | 'ABSENCE'
+  | 'DEDUCT_LEAVE'
+  | 'CUSTOM';
+export type LateDeductionUnit = 'MINUTE' | 'HOUR';
+export type AbsenceDeductionUnit = 'DAY' | 'HOUR';
 
 export interface UserProfile {
   id: number;
@@ -55,6 +65,13 @@ export interface AttendanceLog {
   modified_by_user_id: number | null;
   modification_reason: string | null;
   is_deleted: boolean;
+  late_status?: LateArrivalDisposition;
+  late_reason?: string | null;
+  manager_late_note?: string | null;
+  custom_deduction_toman?: number | null;
+  late_reviewed_by_user_id?: number | null;
+  late_reviewed_at?: string | null;
+  is_late_seen_by_worker?: boolean;
   created_at: string;
 }
 
@@ -190,9 +207,14 @@ export interface SystemSettings {
   overtime_calc_mode: OvertimeCalcMode; // FIXED_RATE | PERCENTAGE
   overtime_percentage: number; // درصد اضافه‌کاری (مثلاً ۱۴۰٪)
   overtime_rate_toman: number | null; // مبلغ ثابت هر ساعت اضافه‌کاری به تومان
+  late_deduction_unit?: LateDeductionUnit; // MINUTE | HOUR
+  late_deduction_rate_toman?: number | null; // نرخ کسر تأخیر (در صورت خالی بودن: پیش‌فرض قانون کار)
+  absence_deduction_unit?: AbsenceDeductionUnit; // DAY | HOUR
+  absence_deduction_rate_toman?: number | null; // نرخ کسر غیبت (در صورت خالی بودن: پیش‌فرض قانون کار)
   collaboration_start_shamsi: string; // تاریخ شروع همکاری امید میثمی
   monthly_leave_quota_days?: number; // سقف مرخصی ماهانه به روز (پیش‌فرض ۲.۵ روز)
   sms_enabled: boolean;
+  sms_on_task_and_message?: boolean;
   melipayamak_username: string;
   melipayamak_password: string;
   melipayamak_from_number: string;
@@ -215,7 +237,16 @@ export interface DailyAttendanceSummary {
   last_out_time: string | null;
   is_incomplete: boolean;
   is_late: boolean;
+  raw_late_minutes?: number;
   late_minutes: number;
+  late_status?: LateArrivalDisposition;
+  late_reason?: string | null;
+  manager_late_note?: string | null;
+  late_deduction_toman?: number;
+  custom_deduction_toman?: number | null;
+  late_reviewed_at?: string | null;
+  is_late_seen_by_worker?: boolean;
+  first_in_log_id?: number | null;
   gross_presence_minutes: number;
   mission_minutes: number;
   break_deducted_minutes: number;
