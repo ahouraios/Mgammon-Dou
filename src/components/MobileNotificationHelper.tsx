@@ -1,12 +1,12 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Bell,
+  BellOff,
   BellRing,
   CheckCircle2,
+  HelpCircle,
   ShieldAlert,
   Smartphone,
   Volume2,
-  X,
   Zap,
 } from 'lucide-react';
 
@@ -15,6 +15,15 @@ export interface PhoneNotificationPayload {
   title: string;
   body: string;
   tab?: string;
+}
+
+const NOTIF_STATUS_EVENT = 'mgammon-notification-status-changed';
+const KEEPALIVE_STORAGE_KEY = 'mgammon_xiaomi_keepalive';
+
+function notifyStatusChange() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(NOTIF_STATUS_EVENT));
+  }
 }
 
 /**
@@ -130,90 +139,141 @@ export async function triggerNativePhoneNotification(
   }
 }
 
-interface MobileNotificationBannerAndModalProps {
-  onInstallPwaClick?: () => void;
-  canInstallPwa?: boolean;
+/**
+ * هوک وضعیت نوتیفیکیشن برای نمایش آیکون کوچک و بدون متن در بنر هدر و حفظ سرویس پس‌زمینه
+ */
+export function useNotificationStatus(): {
+  permission: NotificationPermission;
+  isNotificationActive: boolean;
+  refreshStatus: () => void;
+} {
+  const getPerm = useCallback((): NotificationPermission => {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      return Notification.permission;
+    }
+    return 'default';
+  }, []);
+
+  const [permission, setPermission] = useState<NotificationPermission>(getPerm);
+  const keepAliveAudioCtxRef = useRef<AudioContext | null>(null);
+
+  const refreshStatus = useCallback(() => {
+    setPermission(getPerm());
+  }, [getPerm]);
+
+  useEffect(() => {
+    ensureNotificationServiceWorker();
+    const onUpdate = () => setPermission(getPerm());
+    window.addEventListener(NOTIF_STATUS_EVENT, onUpdate);
+    window.addEventListener('focus', onUpdate);
+    document.addEventListener('visibilitychange', onUpdate);
+    return () => {
+      window.removeEventListener(NOTIF_STATUS_EVENT, onUpdate);
+      window.removeEventListener('focus', onUpdate);
+      document.removeEventListener('visibilitychange', onUpdate);
+    };
+  }, [getPerm]);
+
+  useEffect(() => {
+    const syncKeepAlive = () => {
+      let enabled = false;
+      try {
+        enabled = localStorage.getItem(KEEPALIVE_STORAGE_KEY) === '1';
+      } catch {
+        enabled = false;
+      }
+
+      if (!enabled) {
+        if (keepAliveAudioCtxRef.current) {
+          keepAliveAudioCtxRef.current.close().catch(() => {});
+          keepAliveAudioCtxRef.current = null;
+        }
+        return;
+      }
+
+      const startSilentKeepAlive = () => {
+        try {
+          if (keepAliveAudioCtxRef.current) return;
+          const AudioCtx =
+            window.AudioContext ||
+            (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+          if (!AudioCtx) return;
+          const ctx = new AudioCtx();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.frequency.value = 30;
+          gain.gain.value = 0.0001;
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start();
+          keepAliveAudioCtxRef.current = ctx;
+        } catch {
+          // ignore until user interaction
+        }
+      };
+
+      window.addEventListener('click', startSilentKeepAlive, { once: true });
+    };
+
+    syncKeepAlive();
+    window.addEventListener(NOTIF_STATUS_EVENT, syncKeepAlive);
+    return () => {
+      window.removeEventListener(NOTIF_STATUS_EVENT, syncKeepAlive);
+    };
+  }, []);
+
+  return {
+    permission,
+    isNotificationActive: permission === 'granted',
+    refreshStatus,
+  };
 }
 
-export const MobileNotificationBannerAndModal: React.FC<
-  MobileNotificationBannerAndModalProps
-> = ({ onInstallPwaClick, canInstallPwa }) => {
-  const [permission, setPermission] = useState<NotificationPermission>(
-    typeof window !== 'undefined' && 'Notification' in window
-      ? Notification.permission
-      : 'default'
-  );
-  const [showGuideModal, setShowGuideModal] = useState(false);
+interface NotificationSettingsGuideSectionProps {
+  role: 'manager' | 'worker';
+}
+
+/**
+ * بخش فعال‌سازی نوتیفیکیشن و راهنمای تنظیمات گوشی — فقط در تب «تنظیمات ← راهنما» قرار می‌گیرد
+ */
+export const NotificationSettingsGuideSection: React.FC<
+  NotificationSettingsGuideSectionProps
+> = ({ role }) => {
+  const { permission, isNotificationActive, refreshStatus } = useNotificationStatus();
   const [keepAliveActive, setKeepAliveActive] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('mgammon_xiaomi_keepalive') === '1';
+      return localStorage.getItem(KEEPALIVE_STORAGE_KEY) === '1';
     } catch {
       return false;
     }
   });
   const [testFeedback, setTestFeedback] = useState<string | null>(null);
-  const keepAliveAudioCtxRef = useRef<AudioContext | null>(null);
-
-  useEffect(() => {
-    ensureNotificationServiceWorker();
-  }, []);
-
-  // حفظ بیداری پس‌زمینه برای جلوگیری از بسته شدن تب در شیائومی (MIUI / HyperOS)
-  useEffect(() => {
-    if (!keepAliveActive) {
-      if (keepAliveAudioCtxRef.current) {
-        keepAliveAudioCtxRef.current.close().catch(() => {});
-        keepAliveAudioCtxRef.current = null;
-      }
-      return;
-    }
-
-    const startSilentKeepAlive = () => {
-      try {
-        if (keepAliveAudioCtxRef.current) return;
-        const AudioCtx =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-        if (!AudioCtx) return;
-        const ctx = new AudioCtx();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.frequency.value = 30;
-        gain.gain.value = 0.0001; // کاملاً بی‌صدا اما مانع خواب رفتن پردازش در MIUI می‌شود
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        keepAliveAudioCtxRef.current = ctx;
-      } catch {
-        // ignore until user interaction
-      }
-    };
-
-    window.addEventListener('click', startSilentKeepAlive, { once: true });
-    return () => {
-      window.removeEventListener('click', startSilentKeepAlive);
-    };
-  }, [keepAliveActive]);
 
   const handleRequestPermission = async () => {
     setTestFeedback(null);
     if (typeof window === 'undefined' || !('Notification' in window)) {
-      setTestFeedback('مرورگر فعلی از نوتیفیکیشن وب پشتیبانی نمی‌کند. لطفاً از مرورگر Chrome استفاده کنید.');
+      setTestFeedback(
+        'مرورگر فعلی از نوتیفیکیشن وب پشتیبانی نمی‌کند. لطفاً از مرورگر Chrome استفاده کنید.'
+      );
       return;
     }
     try {
       const res = await Notification.requestPermission();
-      setPermission(res);
+      refreshStatus();
+      notifyStatusChange();
       if (res === 'granted') {
         await triggerNativePhoneNotification({
           tag: `test-enable-${Date.now()}`,
           title: 'اعلان‌های Mgammon فعال شد',
-          body: 'از این پس هنگام ارسال تسک یا پیام از سمت مدیریت، گوشی شما زنگ و اعلان دریافت می‌کند.',
+          body:
+            role === 'worker'
+              ? 'از این پس هنگام ارسال تسک یا پیام از سمت مدیریت، گوشی شما زنگ و اعلان دریافت می‌کند.'
+              : 'نوتیفیکیشن‌های سامانه روی این دستگاه با موفقیت فعال شد.',
         });
-        setTestFeedback('نوتیفیکیشن گوشی با موفقیت فعال شد و یک اعلان آزمایشی ارسال گردید.');
+        setTestFeedback('نوتیفیکیشن با موفقیت فعال شد و آیکون وضعیت در بنر هدر به حالت فعال تغییر یافت.');
       } else {
         setTestFeedback(
-          'مجوز اعلان در مرورگر مسدود است. از آیکون قفل کنار آدرس سایت در کروم، گزینه Notifications را روی Allow قرار دهید.'
+          'مجوز اعلان در مرورگر مسدود است. از آیکون تنظیمات کنار آدرس سایت در مرورگر، گزینه Notifications را روی Allow قرار دهید.'
         );
       }
     } catch {
@@ -223,18 +283,18 @@ export const MobileNotificationBannerAndModal: React.FC<
 
   const handleSendTestNotification = async () => {
     setTestFeedback(null);
-    if (permission !== 'granted') {
+    if (!isNotificationActive) {
       await handleRequestPermission();
       return;
     }
     const ok = await triggerNativePhoneNotification({
       tag: `test-manual-${Date.now()}`,
-      title: 'تست اعلان مدیریت (مجید نورایی)',
-      body: 'این یک اعلان آزمایشی همراه با صدا و ویبره برای اطمینان از عملکرد روی گوشی شیائومی/اندروید شماست.',
+      title: 'تست اعلان سامانه Mgammon',
+      body: 'این یک اعلان آزمایشی همراه با صدا و ویبره جهت اطمینان از عملکرد نوتیفیکیشن روی دستگاه شماست.',
     });
     setTestFeedback(
       ok
-        ? 'اعلان آزمایشی با صدا و ویبره ارسال شد! بالای صفحه گوشی را بررسی کنید.'
+        ? 'اعلان آزمایشی با صدا و ویبره ارسال شد.'
         : 'صدای هشدار پخش شد. برای نمایش در نوار بالای گوشی مجوز Notifications را بررسی کنید.'
     );
   };
@@ -243,223 +303,151 @@ export const MobileNotificationBannerAndModal: React.FC<
     const next = !keepAliveActive;
     setKeepAliveActive(next);
     try {
-      localStorage.setItem('mgammon_xiaomi_keepalive', next ? '1' : '0');
+      localStorage.setItem(KEEPALIVE_STORAGE_KEY, next ? '1' : '0');
     } catch {
       // ignore
     }
+    notifyStatusChange();
   };
 
   return (
-    <>
-      {/* نوار جمع‌وجور وضعیت نوتیفیکیشن گوشی و راهنمای شیائومی */}
-      <div className="rounded-2xl bg-white border border-[#C5A059]/60 px-3 py-2 flex flex-wrap items-center justify-between gap-2 shadow-2xs">
-        <div className="flex items-center gap-2 min-w-0">
-          <div
-            className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
-              permission === 'granted'
-                ? 'bg-emerald-100 text-emerald-700'
-                : 'bg-amber-100 text-amber-800'
+    <div className="space-y-4">
+      {/* کارت فعال‌سازی نوتیفیکیشن و تست صدا/ویبره */}
+      <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+          <div className="flex items-center gap-2">
+            <div
+              className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${
+                isNotificationActive
+                  ? 'bg-emerald-100 text-emerald-700'
+                  : 'bg-slate-100 text-slate-600'
+              }`}
+            >
+              {isNotificationActive ? (
+                <BellRing className="w-4 h-4" />
+              ) : (
+                <BellOff className="w-4 h-4" />
+              )}
+            </div>
+            <div>
+              <h4 className="text-sm font-bold text-[#0B192C]">
+                تنظیمات و فعال‌سازی نوتیفیکیشن دستگاه
+              </h4>
+              <p className="text-[11px] text-slate-500">
+                وضعیت نوتیفیکیشن در بنر بالای صفحات فقط با یک آیکون کوچک بدون نوشته نمایش داده می‌شود.
+              </p>
+            </div>
+          </div>
+
+          <span
+            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border ${
+              isNotificationActive
+                ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                : 'bg-slate-100 text-slate-600 border-slate-200'
             }`}
           >
-            {permission === 'granted' ? (
-              <BellRing className="w-3.5 h-3.5" />
-            ) : (
-              <Bell className="w-3.5 h-3.5" />
-            )}
-          </div>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[11px] font-extrabold text-[#0B192C]">
-                نوتیفیکیشن تسک و پیام مدیر در گوشی:
-              </span>
-              <span
-                className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
-                  permission === 'granted'
-                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                    : 'bg-amber-50 text-amber-800 border border-amber-200'
-                }`}
-              >
-                {permission === 'granted' ? 'فعال (صدا + اعلان)' : 'نیازمند فعال‌سازی'}
-              </span>
-            </div>
-          </div>
+            {isNotificationActive ? 'فعال' : permission === 'denied' ? 'مسدود در مرورگر' : 'غیرفعال'}
+          </span>
         </div>
 
-        <div className="flex items-center gap-1.5">
-          {permission !== 'granted' && (
-            <button
-              type="button"
-              onClick={handleRequestPermission}
-              className="min-h-[30px] px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[10.5px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
-            >
-              <BellRing className="w-3 h-3" />
-              <span>فعال‌سازی با ۱ کلیک</span>
-            </button>
-          )}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
           <button
             type="button"
-            onClick={() => setShowGuideModal(true)}
-            className="min-h-[30px] px-2.5 rounded-xl bg-[#FCF9F2] hover:bg-amber-50 border border-[#C5A059] text-[#0B192C] text-[10.5px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+            onClick={handleRequestPermission}
+            className="min-h-[42px] rounded-xl bg-[#0B192C] hover:bg-[#152a47] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center justify-center gap-2 cursor-pointer transition-colors"
           >
-            <Smartphone className="w-3.5 h-3.5 text-[#9A7428]" />
-            <span>تنظیمات شیائومی و تست اعلان</span>
+            <BellRing className="w-4 h-4" />
+            <span>
+              {isNotificationActive
+                ? 'بررسی مجدد مجوز نوتیفیکیشن'
+                : 'فعال‌سازی نوتیفیکیشن در این دستگاه'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleSendTestNotification}
+            className="min-h-[42px] rounded-xl bg-slate-100 hover:bg-slate-200 text-[#0B192C] border border-slate-200 text-xs font-bold flex items-center justify-center gap-2 cursor-pointer transition-colors"
+          >
+            <Volume2 className="w-4 h-4 text-[#9A7428]" />
+            <span>ارسال نوتیفیکیشن و صدای آزمایشی</span>
           </button>
         </div>
+
+        {/* سوییچ حفظ فعالیت در پس‌زمینه ویژه شیائومی */}
+        <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/55 p-3.5 flex items-center justify-between gap-3">
+          <div className="space-y-0.5">
+            <div className="text-xs font-bold text-[#0B192C] flex items-center gap-1.5">
+              <Zap className="w-3.5 h-3.5 text-[#9A7428]" />
+              <span>حفظ فعالیت در پس‌زمینه گوشی (ویژه اندروید و شیائومی)</span>
+            </div>
+            <p className="text-[11px] text-slate-600 leading-5">
+              جلوگیری از توقف خودکار برنامه در پس‌زمینه سیستم‌عامل‌های MIUI و HyperOS جهت دریافت به‌موقع اعلان تسک‌ها و پیام‌ها
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={toggleKeepAlive}
+            className={`min-w-[68px] min-h-[34px] px-3 rounded-xl text-xs font-bold transition-colors cursor-pointer shrink-0 ${
+              keepAliveActive
+                ? 'bg-emerald-600 text-white'
+                : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+            }`}
+          >
+            {keepAliveActive ? 'فعال' : 'غیرفعال'}
+          </button>
+        </div>
+
+        {testFeedback && (
+          <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3 text-xs text-emerald-900 font-medium">
+            {testFeedback}
+          </div>
+        )}
       </div>
 
-      {/* مودال جامع تنظیم نوتیفیکیشن در گوشی‌های اندروید و شیائومی (MIUI / HyperOS) */}
-      {showGuideModal && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-900/65 backdrop-blur-xs flex items-center justify-center p-3 overflow-y-auto"
-          onClick={() => setShowGuideModal(false)}
-        >
-          <div
-            className="bg-white rounded-2xl border-2 border-[#C5A059] max-w-lg w-full p-4 space-y-3.5 shadow-xl my-auto max-h-[90vh] overflow-y-auto"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-xl bg-[#0B192C] text-[#C5A059] flex items-center justify-center">
-                  <Smartphone className="w-4 h-4" />
-                </div>
-                <div>
-                  <h3 className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
-                    تنظیم قطعی نوتیفیکیشن در گوشی اندروید و شیائومی
-                  </h3>
-                  <p className="text-[10px] text-slate-500">
-                    دریافت آنی تسک‌ها، پیام‌ها و تصمیمات مدیریت همراه با صدا و ویبره
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowGuideModal(false)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* دکمه‌های عملیاتی فوری */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={handleRequestPermission}
-                className="min-h-[40px] rounded-xl bg-[#0B192C] hover:bg-[#152a47] text-[#C5A059] border border-[#C5A059] text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <BellRing className="w-4 h-4" />
-                <span>
-                  {permission === 'granted'
-                    ? 'مجوز نوتیفیکیشن فعال است'
-                    : '۱. فعال‌سازی مجوز نوتیفیکیشن'}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handleSendTestNotification}
-                className="min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <Volume2 className="w-4 h-4" />
-                <span>تست نوتیفیکیشن و زنگ همین الان</span>
-              </button>
-            </div>
-
-            {canInstallPwa && onInstallPwaClick && (
-              <button
-                type="button"
-                onClick={onInstallPwaClick}
-                className="w-full min-h-[38px] rounded-xl bg-[#FCF9F2] border border-[#C5A059] text-[#0B192C] text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
-              >
-                <Zap className="w-4 h-4 text-[#9A7428]" />
-                <span>نصب مستقیم برنامه روی صفحه اصلی گوشی (پیشنهاد ویژه شیائومی)</span>
-              </button>
-            )}
-
-            {/* سوییچ ضد قطع پس‌زمینه ویژه شیائومی */}
-            <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-3 flex items-center justify-between gap-3">
-              <div className="space-y-0.5">
-                <div className="text-xs font-extrabold text-[#0B192C] flex items-center gap-1.5">
-                  <Zap className="w-3.5 h-3.5 text-[#9A7428]" />
-                  <span>حالت بیداربمان پس‌زمینه (ضد قطع شیائومی MIUI/HyperOS)</span>
-                </div>
-                <p className="text-[10.5px] text-slate-600 leading-5">
-                  با روشن کردن این گزینه، برنامه در پس‌زمینه گوشی شیائومی بسته نمی‌شود و به محض ارسال تسک یا پیام توسط مدیر، زنگ می‌زند.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={toggleKeepAlive}
-                className={`min-w-[64px] min-h-[32px] px-2.5 rounded-xl text-[11px] font-extrabold transition-colors cursor-pointer shrink-0 ${
-                  keepAliveActive
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
-                }`}
-              >
-                {keepAliveActive ? 'روشن ✓' : 'خاموش'}
-              </button>
-            </div>
-
-            {testFeedback && (
-              <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-2.5 text-[11px] text-emerald-900 font-semibold">
-                {testFeedback}
-              </div>
-            )}
-
-            {/* راهنمای گام‌به‌گام ترفند شیائومی */}
-            <div className="rounded-xl bg-slate-50 border border-slate-200 p-3 space-y-2.5">
-              <div className="flex items-center gap-1.5 text-xs font-extrabold text-[#0B192C]">
-                <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
-                <span>
-                  ۴ ترفند حیاتی برای گوشی‌های شیائومی (Xiaomi MIUI / HyperOS) و اندروید:
-                </span>
-              </div>
-              <p className="text-[10.5px] text-slate-600 leading-5">
-                سیستم‌عامل شیائومی به صورت پیش‌فرض برنامه‌ها و مرورگر را در پس‌زمینه می‌بندد. برای دریافت ۱۰۰٪ نوتیفیکیشن‌ها این ۴ کار ساده را یک بار انجام دهید:
-              </p>
-
-              <ol className="space-y-2 text-[11px] text-slate-700 leading-5 list-decimal pr-4">
-                <li>
-                  <strong className="text-[#0B192C]">نصب برنامه (Add to Home Screen):</strong> در مرورگر Chrome روی سه نقطه بالا بزنید و گزینه{' '}
-                  <strong className="text-[#9A7428]">«Install app / افزودن به صفحه اصلی»</strong> را بزنید تا برنامه مثل اپلیکیشن مستقل نصب شود.
-                </li>
-                <li>
-                  <strong className="text-[#0B192C]">حذف محدودیت باتری شیائومی (مهم‌ترین گام):</strong> انگشت خود را روی آیکون برنامه (یا Chrome) نگه دارید ← گزینه{' '}
-                  <strong>App Info (اطلاعات برنامه)</strong> ← بخش{' '}
-                  <strong>Battery Saver (ذخیره باتری)</strong> را باز کنید و روی{' '}
-                  <strong className="text-emerald-700">«No restrictions / بدون محدودیت»</strong> قرار دهید.
-                </li>
-                <li>
-                  <strong className="text-[#0B192C]">فعال‌سازی اجرای خودکار (Autostart):</strong> در همان صفحه App Info، تیک گزینه{' '}
-                  <strong className="text-emerald-700">Autostart (اجرای خودکار در پس‌زمینه)</strong> را روشن کنید و در بخش{' '}
-                  <strong>Notifications</strong> تیک <strong>Allow sound & vibration</strong> و <strong>Lock screen</strong> را فعال کنید.
-                </li>
-                <li>
-                  <strong className="text-[#0B192C]">قفل کردن برنامه در Recent Apps:</strong> دکمه مربع پایین گوشی (برنامه‌های اخیر) را بزنید، کارت برنامه را کمی به پایین بکشید (یا نگه دارید) و روی آیکون{' '}
-                  <strong className="text-[#9A7428]">قفل (Lock)</strong> بزنید تا سیستم شیائومی هرگز آن را نبندد.
-                </li>
-              </ol>
-
-              <div className="pt-2 border-t border-slate-200 flex items-start gap-1.5 text-[10.5px] text-slate-600">
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
-                <span>
-                  <strong>پشتیبان پیامکی (SMS):</strong> همچنین مدیر می‌تواند در بخش تنظیمات سامانه تیک «ارسال پیامک هم‌زمان برای تسک و پیام» را فعال کند تا حتی در زمان قطع بودن اینترنت گوشی، پیامک فوری دریافت کنید.
-                </span>
-              </div>
-            </div>
-
-            <div className="flex justify-end pt-1">
-              <button
-                type="button"
-                onClick={() => setShowGuideModal(false)}
-                className="min-h-[36px] px-4 rounded-xl bg-[#0B192C] text-white text-xs font-bold cursor-pointer"
-              >
-                متوجه شدم و بستن
-              </button>
-            </div>
-          </div>
+      {/* کارت راهنمای گام‌به‌گام تنظیم گوشی‌های اندروید و شیائومی */}
+      <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-5 space-y-3">
+        <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
+          <HelpCircle className="w-4 h-4 text-[#9A7428] shrink-0" />
+          <h4 className="text-sm font-bold text-[#0B192C]">
+            راهنمای دریافت نوتیفیکیشن در گوشی‌های اندروید و شیائومی (MIUI / HyperOS)
+          </h4>
         </div>
-      )}
-    </>
+
+        <p className="text-xs text-slate-600 leading-6">
+          در گوشی‌های شیائومی و اندروید، سیستم مدیریت باتری به‌صورت پیش‌فرض مرورگرها را در پس‌زمینه محدود می‌کند. برای دریافت آنی نوتیفیکیشن تسک‌ها و پیام‌ها، مراحل زیر را یک بار در تنظیمات گوشی انجام دهید:
+        </p>
+
+        <ol className="space-y-2.5 text-xs text-slate-700 leading-6 list-decimal pr-4">
+          <li>
+            <strong className="text-[#0B192C]">نصب برنامه روی صفحه اصلی (Add to Home Screen):</strong>{' '}
+            در مرورگر Chrome روی منوی سه نقطه بالا بزنید و گزینه{' '}
+            <strong className="text-[#9A7428]">Install app / افزودن به صفحه اصلی</strong> را انتخاب کنید.
+          </li>
+          <li>
+            <strong className="text-[#0B192C]">تنظیم باتری روی «بدون محدودیت»:</strong> انگشت خود را روی آیکون برنامه نگه دارید ←{' '}
+            <strong>App Info (اطلاعات برنامه)</strong> ← بخش{' '}
+            <strong>Battery Saver (ذخیره باتری)</strong> را روی{' '}
+            <strong className="text-emerald-700">No restrictions (بدون محدودیت)</strong> قرار دهید.
+          </li>
+          <li>
+            <strong className="text-[#0B192C]">فعال‌سازی اجرای خودکار (Autostart):</strong> در همان صفحه اطلاعات برنامه، گزینه{' '}
+            <strong className="text-emerald-700">Autostart</strong> را روشن کرده و در بخش{' '}
+            <strong>Notifications</strong> مجوز صدا، لرزش و نمایش روی صفحه قفل را فعال نمایید.
+          </li>
+          <li>
+            <strong className="text-[#0B192C]">قفل برنامه در لیست برنامه‌های اخیر:</strong> در صفحه برنامه‌های اخیر گوشی (Recent Apps)، کارت برنامه را نگه داشته و آیکون{' '}
+            <strong className="text-[#9A7428]">قفل (Lock)</strong> را بزنید.
+          </li>
+        </ol>
+
+        <div className="pt-2.5 border-t border-slate-100 flex items-start gap-2 text-[11px] text-slate-600">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+          <span>
+            در صورت فعال بودن گزینه «ارسال پیامک همزمان هنگام ثبت تسک و پیام جدید» در تنظیمات پیامک مدیریت، علاوه بر نوتیفیکیشن برنامه، پیامک نیز به شماره همراه پرسنل ارسال می‌گردد.
+          </span>
+        </div>
+      </div>
+    </div>
   );
 };

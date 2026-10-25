@@ -5,9 +5,12 @@ import {
   Briefcase,
   Moon,
   AlertCircle,
+  BellRing,
+  BellOff,
 } from 'lucide-react';
 import { formatShamsiVerbose, toPersianDigits } from '../shared/jalali';
 import { WorkerLiveStatus } from '../shared/types';
+import { useNotificationStatus } from './MobileNotificationHelper';
 
 interface HeroBannerProps {
   role: 'manager' | 'worker';
@@ -76,6 +79,7 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
   statusDetail,
   isOvertimeActive,
 }) => {
+  const { isNotificationActive } = useNotificationStatus();
   const effectiveBannerUrl = bannerBgUrl || '/assets/media/banner-bg.svg';
   const defaultAvatar =
     role === 'manager' ? '/assets/media/manager-avatar.svg' : '/assets/media/worker-avatar.svg';
@@ -169,6 +173,29 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
 
             {statusDetail && (
               <p className="text-[10px] text-slate-300 truncate">{statusDetail}</p>
+            )}
+          </div>
+        </div>
+
+        {/* آیکون کوچک وضعیت نوتیفیکیشن بدون هیچ نوشته‌ای */}
+        <div className="shrink-0 flex items-center">
+          <div
+            title={
+              isNotificationActive
+                ? 'نوتیفیکیشن فعال است'
+                : 'نوتیفیکیشن غیرفعال است (فعال‌سازی از بخش تنظیمات)'
+            }
+            aria-label={isNotificationActive ? 'نوتیفیکیشن فعال' : 'نوتیفیکیشن غیرفعال'}
+            className={`w-6 h-6 rounded-lg flex items-center justify-center border transition-colors ${
+              isNotificationActive
+                ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-300'
+                : 'bg-slate-800/60 border-slate-600/50 text-slate-400'
+            }`}
+          >
+            {isNotificationActive ? (
+              <BellRing className="w-3 h-3" />
+            ) : (
+              <BellOff className="w-3 h-3" />
             )}
           </div>
         </div>

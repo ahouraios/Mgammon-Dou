@@ -45,6 +45,7 @@ import { LeaveManagementSection } from './LeaveManagementSection';
 import { DailyTasksChecklist } from './DailyTasksChecklist';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
 import { MonthlyStatementSection } from './MonthlyStatementSection';
+import { NotificationSettingsGuideSection } from './MobileNotificationHelper';
 import {
   LayoutDashboard,
   Clock,
@@ -82,7 +83,7 @@ type ManagerTab =
   | 'correspondence'
   | 'settings';
 
-type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms';
+type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms' | 'guide';
 
 interface DashboardResponse {
   ok: boolean;
@@ -3508,7 +3509,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           {activeTab === 'settings' && settingsForm && (
             <div className="space-y-4">
               {/* تب‌های افقی کنار هم برای بخش‌های مختلف تنظیمات */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 p-1.5 rounded-2xl bg-white border border-slate-200 shadow-2xs">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 p-1.5 rounded-2xl bg-white border border-slate-200 shadow-2xs">
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('schedule')}
@@ -3560,6 +3561,19 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   <UserCog className="w-3.5 h-3.5 shrink-0" />
                   <span>حساب و پشتیبان‌گیری</span>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSettingsSubTab('guide')}
+                  className={`min-h-[42px] px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+                    settingsSubTab === 'guide'
+                      ? 'bg-[#0B192C] text-[#C5A059]'
+                      : 'text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+                  <span>راهنما و اعلان</span>
+                </button>
               </div>
 
               {/* زیرتب حساب کاربری مدیر (تغییر تصویر، رمز عبور، اثر انگشت و پشتیبان‌گیری) */}
@@ -3573,8 +3587,13 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 />
               )}
 
+              {/* زیرتب راهنما و تنظیمات نوتیفیکیشن */}
+              {settingsSubTab === 'guide' && (
+                <NotificationSettingsGuideSection role="manager" />
+              )}
+
               {/* زیرتب‌های ساعات کاری، حقوق و پیامک */}
-              {settingsSubTab !== 'account' && (
+              {settingsSubTab !== 'account' && settingsSubTab !== 'guide' && (
                 <form onSubmit={handleSaveSettings} className="space-y-4">
                   {/* ۱. ساعات کاری، پنجشنبه‌ها، سهمیه مرخصی و تاریخ شروع قرارداد */}
                   {settingsSubTab === 'schedule' && (

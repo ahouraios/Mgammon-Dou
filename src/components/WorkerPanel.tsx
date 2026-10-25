@@ -35,7 +35,7 @@ import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
 import { CameraCaptureModal } from './CameraCaptureModal';
 import { MonthlyStatementSection } from './MonthlyStatementSection';
 import {
-  MobileNotificationBannerAndModal,
+  NotificationSettingsGuideSection,
   triggerNativePhoneNotification,
 } from './MobileNotificationHelper';
 import {
@@ -380,9 +380,9 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const [previewFile, setPreviewFile] = useState<PreviewFileItem | null>(null);
   const [cameraTarget, setCameraTarget] = useState<'report' | 'receipt' | null>(null);
 
-  // تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، و اطلاعات قرارداد)
+  // تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، اطلاعات قرارداد، و راهنما و اعلان‌ها)
   const [workerSettingsSubTab, setWorkerSettingsSubTab] = useState<
-    'profile' | 'excel_history' | 'contract'
+    'profile' | 'excel_history' | 'contract' | 'guide'
   >('profile');
 
   const loadAllWorkerData = useCallback(async () => {
@@ -904,9 +904,6 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
         isOvertimeActive={Boolean(liveState?.is_overtime_active)}
         onRefresh={loadAllWorkerData}
       />
-
-      {/* ۱-ب. نوار فعال‌سازی نوتیفیکیشن گوشی (اندروید و شیائومی) */}
-      <MobileNotificationBannerAndModal />
 
       {/* ۲. اعلان فوری پیام جدید یا تسک جدید از سمت مدیریت (با دکمه مستقیم مشاهده) */}
       {unreadMessagesCount > 0 && activeTab !== 'correspondence' && (
@@ -2091,11 +2088,11 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             />
           )}
 
-          {/* ================= تب ۵: تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، و اطلاعات قرارداد) ================= */}
+          {/* ================= تب ۵: تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، قرارداد و راهنما) ================= */}
           {activeTab === 'settings' && (
             <div className="space-y-3.5">
               {/* تب‌های افقی کنار هم در بخش تنظیمات پرسنل */}
-              <div className="grid grid-cols-3 gap-1.5 bg-white p-1.5 rounded-2xl border border-[#C5A059]/45">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-white p-1.5 rounded-2xl border border-[#C5A059]/45">
                 <button
                   type="button"
                   onClick={() => setWorkerSettingsSubTab('profile')}
@@ -2133,6 +2130,19 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                 >
                   <Calendar className="w-3.5 h-3.5" />
                   <span>قرارداد و شیفت</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setWorkerSettingsSubTab('guide')}
+                  className={`min-h-[42px] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    workerSettingsSubTab === 'guide'
+                      ? 'bg-[#0B192C] text-[#C5A059]'
+                      : 'text-slate-600 hover:text-[#0B192C]'
+                  }`}
+                >
+                  <BellRing className="w-3.5 h-3.5" />
+                  <span>راهنما و اعلان</span>
                 </button>
               </div>
 
@@ -2418,6 +2428,11 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                     </div>
                   </div>
                 </div>
+              )}
+
+              {/* زیرتب ۴: راهنما و تنظیمات نوتیفیکیشن */}
+              {workerSettingsSubTab === 'guide' && (
+                <NotificationSettingsGuideSection role="worker" />
               )}
             </div>
           )}
