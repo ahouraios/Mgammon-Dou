@@ -2975,6 +2975,110 @@ apiRouter.post(
         [workerId]
       );
 
+      if (action === 'ADD_SHIFT') {
+        const shamsiDateRaw = String(req.body?.shamsi_date || '');
+        if (!isValidShamsiDate(shamsiDateRaw)) {
+          await conn.rollback();
+          res.status(400).json({ ok: false, message: 'تاریخ واردشده معتبر نیست.' });
+          return;
+        }
+        const shamsiDate = normalizeShamsiDate(shamsiDateRaw);
+        const workDate = shamsiToGregorian(shamsiDate);
+        const checkInRaw = toEnglishDigits(String(req.body?.check_in_time || '')).trim();
+        const checkOutRaw = toEnglishDigits(String(req.body?.check_out_time || '')).trim();
+        const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
+
+        if (
+          !isValidTimeHHMMOrHHMMSS(checkInRaw, true) ||
+          !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)
+        ) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: 'فرمت ساعت ورود و خروج باید معتبر و بین 00:00 تا 23:59 باشد.',
+          });
+          return;
+        }
+
+        const checkInTime = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
+        const checkOutTime = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
+
+        if (parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: 'ساعت خاتمه کار (خروج) باید پس از ساعت آغاز به کار (ورود) باشد.',
+          });
+          return;
+        }
+
+        const [dayRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT * FROM attendance_logs WHERE user_id = ? AND work_date = ? AND is_deleted = 0 FOR UPDATE`,
+          [workerId, workDate]
+        );
+
+        const simulatedLogs = [
+          ...dayRows.map((r) => ({
+            event_type: r.event_type as AttendanceEventType,
+            recorded_time: String(r.recorded_time),
+          })),
+          { event_type: 'WORK_START' as AttendanceEventType, recorded_time: checkInTime },
+          { event_type: 'WORK_END' as AttendanceEventType, recorded_time: checkOutTime },
+        ];
+
+        const seqCheck = validateFullDayLogSequence(simulatedLogs);
+        if (!seqCheck.valid) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: seqCheck.error,
+          });
+          return;
+        }
+
+        const recordedAtIn = `${workDate} ${checkInTime}`;
+        const recordedAtOut = `${workDate} ${checkOutTime}`;
+
+        const [insIn] = await conn.execute<mysql.ResultSetHeader>(
+          `INSERT INTO attendance_logs
+            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+           VALUES (?, ?, ?, 'WORK_START', ?, ?, ?, 1, ?, ?, 0)`,
+          [workerId, workDate, shamsiDate, recordedAtIn, checkInTime, note, managerId, reason]
+        );
+
+        const [insOut] = await conn.execute<mysql.ResultSetHeader>(
+          `INSERT INTO attendance_logs
+            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+           VALUES (?, ?, ?, 'WORK_END', ?, ?, ?, 1, ?, ?, 0)`,
+          [workerId, workDate, shamsiDate, recordedAtOut, checkOutTime, note, managerId, reason]
+        );
+
+        await recordAuditLog({
+          actorUserId: managerId,
+          actionType: 'ATTENDANCE_OVERRIDE',
+          targetEntity: 'attendance_logs',
+          targetId: insIn.insertId,
+          afterState: {
+            action: 'ADD_SHIFT',
+            shamsi_date: shamsiDate,
+            check_in_time: checkInTime,
+            check_out_time: checkOutTime,
+            check_in_log_id: insIn.insertId,
+            check_out_log_id: insOut.insertId,
+          },
+          reason,
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
+
+        await conn.commit();
+        res.status(201).json({
+          ok: true,
+          message: 'نوبت کاری (ساعت ورود و خروج) با موفقیت در کارکرد پرسنل ثبت گردید.',
+        });
+        return;
+      }
+
       if (action === 'ADD') {
         const shamsiDateRaw = String(req.body?.shamsi_date || '');
         if (!isValidShamsiDate(shamsiDateRaw)) {
@@ -3040,7 +3144,7 @@ apiRouter.post(
         await conn.commit();
         res.status(201).json({
           ok: true,
-          message: 'رکورد تردد با موفقیت اضافه شد.',
+          message: 'رویداد تردد با موفقیت در سابقه روزانه ثبت گردید.',
         });
         return;
       }

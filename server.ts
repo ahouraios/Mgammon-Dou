@@ -11,6 +11,7 @@ import {
   migrateLegacyPublicMediaToPrivate,
   sanitizeDbErrorMessage,
   validateProductionSecurityConfig,
+  waitForPendingDatabaseInit,
 } from './src/server/db';
 import { getSessionUser, requireCsrfProtection } from './src/server/auth';
 import { apiRouter } from './src/server/routes';
@@ -75,10 +76,13 @@ export async function createApp() {
   migrateLegacyPublicMediaToPrivate();
 
   // گیت آمادگی دیتابیس: هیچ درخواست وابسته به دیتابیس پیش از تکمیل initializeDatabase پذیرفته نمی‌شود
-  app.use('/api', (req, res, next) => {
+  app.use('/api', async (req, res, next) => {
     if (req.path === '/health') {
       next();
       return;
+    }
+    if (!isDatabaseInitialized()) {
+      await waitForPendingDatabaseInit();
     }
     if (!isDatabaseInitialized()) {
       res.status(503).json({
@@ -242,16 +246,19 @@ export async function createApp() {
 export async function startServer() {
   validateProductionSecurityConfig(process.env);
 
-  // ۱. اجرای کامل initializeDatabase پیش از پذیرش درخواست‌های وابسته به دیتابیس
-  try {
-    await initializeDatabase();
-    console.log('[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests.');
-  } catch (err) {
-    console.error(
-      '[MGAMMON Duo] Database initialization failed during startup:',
-      sanitizeDbErrorMessage(err)
-    );
-  }
+  // ۱. شروع فوری آماده‌سازی دیتابیس به صورت همزمان تا پورت 3000 بلافاصله باز شود و درخواست‌های API منتظر اتمام آن بمانند
+  initializeDatabase()
+    .then(() => {
+      console.log(
+        '[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests.'
+      );
+    })
+    .catch((err) => {
+      console.error(
+        '[MGAMMON Duo] Database initialization failed during startup:',
+        sanitizeDbErrorMessage(err)
+      );
+    });
 
   const app = await createApp();
   const PORT = Number(process.env.PORT || 3000);

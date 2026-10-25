@@ -30,6 +30,7 @@ import {
   formatMinutesToDurationPersian,
   formatMinutesToHHMM,
   formatToman,
+  parseTimeToMinutes,
   SHAMSI_MONTH_NAMES,
   toPersianDigits,
 } from '../shared/jalali';
@@ -272,11 +273,16 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [selectedMgrHistoryMonth, setSelectedMgrHistoryMonth] = useState<string>('');
   const [showAllMgrMonthHistory, setShowAllMgrMonthHistory] = useState(false);
 
-  // فرم ثبت یا اصلاح دستی تردد توسط مدیر
+  // فرم ثبت یا اصلاح دستی تردد توسط مدیر (دو حالت: ثبت یکپارچه نوبت کاری یا ثبت مجزای رویداد تردد)
   const [showAddLogForm, setShowAddLogForm] = useState(false);
+  const [manualEntryMode, setManualEntryMode] = useState<'SHIFT_PAIR' | 'SINGLE_EVENT'>(
+    'SHIFT_PAIR'
+  );
   const [manualShamsiDate, setManualShamsiDate] = useState(initialShamsiDate);
   const [manualEventType, setManualEventType] = useState<AttendanceEventType>('WORK_START');
   const [manualTime, setManualTime] = useState('07:00');
+  const [manualCheckInTime, setManualCheckInTime] = useState('07:00');
+  const [manualCheckOutTime, setManualCheckOutTime] = useState('15:00');
   const [manualReason, setManualReason] = useState('');
   const [editingLogId, setEditingLogId] = useState<number | null>(null);
 
@@ -553,6 +559,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               log_id: editingLogId,
               event_type: manualEventType,
               recorded_time: manualTime,
+              reason: manualReason,
+            }),
+          }
+        );
+        setFeedback({ type: 'success', text: res.message });
+      } else if (manualEntryMode === 'SHIFT_PAIR') {
+        const res = await apiRequest<{ ok: boolean; message: string }>(
+          '/api/attendance/manager-override',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              action: 'ADD_SHIFT',
+              shamsi_date: manualShamsiDate,
+              check_in_time: manualCheckInTime,
+              check_out_time: manualCheckOutTime,
               reason: manualReason,
             }),
           }
@@ -2498,10 +2519,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       setShowAddLogForm((v) => !v);
                       setShowPastWorkForm(false);
                     }}
-                    className="min-h-[40px] px-3 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    className="min-h-[40px] px-3.5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    <span>ثبت تردد دستی</span>
+                    <span>ثبت و اصلاح دستی کارکرد</span>
                   </button>
                 </div>
               </div>
@@ -2625,81 +2646,262 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 </form>
               )}
 
-              {/* فرم ثبت یا ویرایش دستی تردد با انتخابگر ساعت و تقویم */}
+              {/* فرم ثبت یا ویرایش دستی تردد توسط مدیریت (پشتیبانی از ثبت یکپارچه ورود و خروج یا ثبت مجزای هر رویداد) */}
               {showAddLogForm && (
                 <form
                   onSubmit={handleManualAttendanceSubmit}
-                  className="rounded-2xl bg-white border border-[#C5A059] p-4 space-y-3.5"
+                  className="rounded-2xl bg-white border border-[#C5A059] p-4 space-y-4 shadow-2xs"
                 >
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-                    <h4 className="text-sm font-bold text-[#0B192C]">
-                      {editingLogId
-                        ? `ویرایش رکورد تردد #${toPersianDigits(editingLogId)}`
-                        : 'ثبت دستی تردد توسط مدیریت'}
-                    </h4>
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                    <div className="space-y-0.5">
+                      <h4 className="text-sm font-extrabold text-[#0B192C]">
+                        {editingLogId
+                          ? `ویرایش رکورد تردد #${toPersianDigits(editingLogId)}`
+                          : 'ثبت و تنظیم دستی ساعات حضور پرسنل توسط مدیریت'}
+                      </h4>
+                      <p className="text-[11px] text-slate-500">
+                        {editingLogId
+                          ? 'اصلاح زمان یا نوع رویداد ثبت‌شده در سابقه روزانه همراه با درج علت مدیریتی'
+                          : manualEntryMode === 'SHIFT_PAIR'
+                            ? 'ثبت یکپارچه بازه کارکرد روزانه شامل ساعت آغاز به کار (ورود) و خاتمه کار (خروج) در یک مرحله'
+                            : 'ثبت مستقل هر یک از رویدادهای ورود، خروج یا مأموریت به‌صورت مجزا در جدول تردد روز'}
+                      </p>
+                    </div>
                     <button
                       type="button"
                       onClick={() => {
                         setShowAddLogForm(false);
                         setEditingLogId(null);
                       }}
-                      className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                      className="min-h-[32px] px-3 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-semibold text-slate-700 cursor-pointer"
                     >
                       انصراف
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                    {!editingLogId && (
-                      <ShamsiDatePicker
-                        label="تاریخ"
-                        value={manualShamsiDate}
-                        onChange={setManualShamsiDate}
-                        todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-                      />
-                    )}
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                        نوع تردد
-                      </label>
-                      <select
-                        value={manualEventType}
-                        onChange={(e) => setManualEventType(e.target.value as AttendanceEventType)}
-                        className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white"
+                  {/* کلید تغییر حالت ثبت (فقط در حالت افزودن جدید نمایش داده می‌شود) */}
+                  {!editingLogId && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-1.5 rounded-xl bg-slate-100 border border-slate-200/80">
+                      <button
+                        type="button"
+                        onClick={() => setManualEntryMode('SHIFT_PAIR')}
+                        className={`min-h-[40px] px-3 py-2 rounded-lg text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                          manualEntryMode === 'SHIFT_PAIR'
+                            ? 'bg-[#0B192C] text-[#C5A059] shadow-2xs'
+                            : 'text-slate-600 hover:text-[#0B192C]'
+                        }`}
                       >
-                        <option value="WORK_START">شروع کار</option>
-                        <option value="MISSION_START">شروع مأموریت</option>
-                        <option value="MISSION_END">پایان مأموریت و بازگشت</option>
-                        <option value="WORK_END">پایان کار</option>
-                      </select>
+                        <Clock className="w-3.5 h-3.5 shrink-0" />
+                        <span>ثبت یکپارچه نوبت کاری (ورود و خروج همزمان)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setManualEntryMode('SINGLE_EVENT')}
+                        className={`min-h-[40px] px-3 py-2 rounded-lg text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                          manualEntryMode === 'SINGLE_EVENT'
+                            ? 'bg-[#0B192C] text-[#C5A059] shadow-2xs'
+                            : 'text-slate-600 hover:text-[#0B192C]'
+                        }`}
+                      >
+                        <Edit3 className="w-3.5 h-3.5 shrink-0" />
+                        <span>ثبت مجزای رویداد تردد (ورود یا خروج مستقل)</span>
+                      </button>
                     </div>
-                    <TimePickerInput
-                      label="ساعت"
-                      value={manualTime}
-                      onChange={setManualTime}
-                    />
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                        علت ثبت یا اصلاح (الزامی)
-                      </label>
-                      <input
-                        type="text"
-                        required
-                        value={manualReason}
-                        onChange={(e) => setManualReason(e.target.value)}
-                        placeholder="توضیح کوتاه..."
-                        className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs"
-                      />
-                    </div>
-                  </div>
+                  )}
 
-                  <button
-                    type="submit"
-                    disabled={actionLoading}
-                    className="min-h-[42px] px-6 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
-                  >
-                    {actionLoading ? 'در حال ذخیره...' : 'ثبت نهایی'}
-                  </button>
+                  {!editingLogId && manualEntryMode === 'SHIFT_PAIR' ? (
+                    <div className="space-y-3.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                        <ShamsiDatePicker
+                          label="تاریخ کارکرد"
+                          value={manualShamsiDate}
+                          onChange={setManualShamsiDate}
+                          todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                        />
+                        <TimePickerInput
+                          label="ساعت آغاز به کار (ورود)"
+                          value={manualCheckInTime}
+                          onChange={setManualCheckInTime}
+                        />
+                        <TimePickerInput
+                          label="ساعت خاتمه کار (خروج)"
+                          value={manualCheckOutTime}
+                          onChange={setManualCheckOutTime}
+                        />
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                            شرح یا علت ثبت مدیریتی (الزامی)
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={manualReason}
+                            onChange={(e) => setManualReason(e.target.value)}
+                            placeholder="مثلاً ثبت کارکرد روزانه طبق هماهنگی..."
+                            className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs"
+                          />
+                        </div>
+                      </div>
+
+                      {(() => {
+                        const inMins = parseTimeToMinutes(manualCheckInTime);
+                        const outMins = parseTimeToMinutes(manualCheckOutTime);
+                        const diff = outMins - inMins;
+                        if (diff <= 0) {
+                          return (
+                            <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-[11px] font-bold text-red-800 flex items-center gap-1.5">
+                              <AlertTriangle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                              <span>
+                                ساعت خاتمه کار (خروج) باید پس از ساعت آغاز به کار (ورود) تنظیم شود.
+                              </span>
+                            </div>
+                          );
+                        }
+                        return (
+                          <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 px-3.5 py-2 text-xs flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-slate-700 font-semibold">
+                              بازه حضور انتخابی: از{' '}
+                              <strong className="text-[#0B192C] tabular-nums">
+                                {toPersianDigits(manualCheckInTime)}
+                              </strong>{' '}
+                              تا{' '}
+                              <strong className="text-[#0B192C] tabular-nums">
+                                {toPersianDigits(manualCheckOutTime)}
+                              </strong>
+                            </span>
+                            <span className="font-extrabold text-[#9A7428] tabular-nums">
+                              مدت حضور ناخالص: {formatMinutesToDurationPersian(diff)}
+                            </span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  ) : (
+                    <div className="space-y-3.5">
+                      {!editingLogId && (
+                        <div>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                            انتخاب سریع نوع رویداد تردد
+                          </label>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            {(
+                              [
+                                {
+                                  type: 'WORK_START' as AttendanceEventType,
+                                  title: 'ورود (آغاز به کار)',
+                                  defaultTime:
+                                    dashboard?.settings.shift_start_time?.slice(0, 5) || '07:00',
+                                },
+                                {
+                                  type: 'WORK_END' as AttendanceEventType,
+                                  title: 'خروج (خاتمه کار)',
+                                  defaultTime:
+                                    dashboard?.settings.shift_end_time?.slice(0, 5) || '15:00',
+                                },
+                                {
+                                  type: 'MISSION_START' as AttendanceEventType,
+                                  title: 'اعزام به مأموریت',
+                                  defaultTime: '10:00',
+                                },
+                                {
+                                  type: 'MISSION_END' as AttendanceEventType,
+                                  title: 'بازگشت از مأموریت',
+                                  defaultTime: '12:00',
+                                },
+                              ] as const
+                            ).map((item) => {
+                              const active = manualEventType === item.type;
+                              return (
+                                <button
+                                  key={item.type}
+                                  type="button"
+                                  onClick={() => {
+                                    setManualEventType(item.type);
+                                    setManualTime(item.defaultTime);
+                                  }}
+                                  className={`min-h-[38px] px-2.5 py-1.5 rounded-xl border text-xs font-bold transition-all cursor-pointer ${
+                                    active
+                                      ? 'bg-[#FCF9F2] border-[#C5A059] text-[#0B192C] shadow-2xs'
+                                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:border-slate-300'
+                                  }`}
+                                >
+                                  {item.title}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                        {!editingLogId && (
+                          <ShamsiDatePicker
+                            label="تاریخ تردد"
+                            value={manualShamsiDate}
+                            onChange={setManualShamsiDate}
+                            todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                          />
+                        )}
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                            نوع رویداد تردد
+                          </label>
+                          <select
+                            value={manualEventType}
+                            onChange={(e) =>
+                              setManualEventType(e.target.value as AttendanceEventType)
+                            }
+                            className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white font-semibold text-[#0B192C]"
+                          >
+                            <option value="WORK_START">ورود (شروع به کار)</option>
+                            <option value="WORK_END">خروج (پایان کار)</option>
+                            <option value="MISSION_START">اعزام به مأموریت</option>
+                            <option value="MISSION_END">بازگشت از مأموریت</option>
+                          </select>
+                        </div>
+                        <TimePickerInput
+                          label="ساعت وقوع رویداد"
+                          value={manualTime}
+                          onChange={setManualTime}
+                        />
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                            شرح یا علت ثبت مدیریتی (الزامی)
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={manualReason}
+                            onChange={(e) => setManualReason(e.target.value)}
+                            placeholder="مثلاً ثبت ساعت خروج فراموش‌شده..."
+                            className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-end gap-2 pt-1">
+                    <button
+                      type="submit"
+                      disabled={
+                        actionLoading ||
+                        (!editingLogId &&
+                          manualEntryMode === 'SHIFT_PAIR' &&
+                          parseTimeToMinutes(manualCheckOutTime) <=
+                            parseTimeToMinutes(manualCheckInTime))
+                      }
+                      className="min-h-[42px] px-6 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold disabled:opacity-50 cursor-pointer"
+                    >
+                      {actionLoading
+                        ? 'در حال ثبت در سامانه...'
+                        : editingLogId
+                          ? 'ذخیره اصلاحات رکورد'
+                          : manualEntryMode === 'SHIFT_PAIR'
+                            ? 'ثبت یکپارچه ورود و خروج'
+                            : 'ثبت رویداد تردد'}
+                    </button>
+                  </div>
                 </form>
               )}
 
@@ -2952,6 +3154,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                     title="ویرایش ساعت"
                                     onClick={() => {
                                       setEditingLogId(log.id);
+                                      setManualEntryMode('SINGLE_EVENT');
                                       setManualEventType(log.event_type);
                                       setManualTime(log.recorded_time.slice(0, 5));
                                       setManualReason(log.modification_reason || '');
@@ -2986,6 +3189,33 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                   </strong>
                                 </span>
                               </div>
+                            )}
+
+                            {/* دکمه میان‌بر برای افزودن رویداد مکمل (مثلاً ثبت خروج برای روز ناقص) در همان تاریخ */}
+                            {day.logs.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingLogId(null);
+                                  setManualShamsiDate(day.shamsi_date);
+                                  setManualEntryMode('SINGLE_EVENT');
+                                  setManualEventType(day.is_incomplete ? 'WORK_END' : 'WORK_START');
+                                  setManualTime(
+                                    day.is_incomplete
+                                      ? dashboard?.settings.shift_end_time?.slice(0, 5) || '15:00'
+                                      : dashboard?.settings.shift_start_time?.slice(0, 5) || '07:00'
+                                  );
+                                  setManualReason('');
+                                  setShowAddLogForm(true);
+                                  setShowPastWorkForm(false);
+                                }}
+                                className="rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059]/60 px-2 py-1 text-[10.5px] font-bold text-[#0B192C] inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <Plus className="w-3 h-3 text-[#9A7428]" />
+                                <span>
+                                  {day.is_incomplete ? 'ثبت ساعت خروج' : 'افزودن رویداد'}
+                                </span>
+                              </button>
                             )}
                           </div>
 

@@ -123,6 +123,23 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
       let hasMariadbd = await hasMariadbdBinary();
 
       if (!hasMariadbd && fs.existsSync('/etc/debian_version')) {
+        // ابتدا نصب سریع آفلاین از بسته‌های کش‌شده در .data/deb-cache بدون نیاز به اینترنت یا apt-get update
+        try {
+          const cachedDebs = fs
+            .readdirSync(debCacheDir)
+            .filter((f) => f.endsWith('.deb'));
+          if (cachedDebs.length > 0) {
+            await execAsync(
+              `DEBIAN_FRONTEND=noninteractive dpkg -i --force-confdef --force-confold "${debCacheDir}"/*.deb || DEBIAN_FRONTEND=noninteractive dpkg --configure -a`
+            );
+          }
+        } catch {
+          // ignore
+        }
+        hasMariadbd = await hasMariadbdBinary();
+      }
+
+      if (!hasMariadbd && fs.existsSync('/etc/debian_version')) {
         try {
           if (
             fs.existsSync('/etc/apt/sources.list.d/debian.sources') &&
@@ -253,6 +270,16 @@ export function getSimulatedMidTransactionFailure(): string | null {
 export function isDatabaseInitialized(): boolean {
   const cfg = getDbConfig();
   return dbInitialized && !simulatedDisconnect && currentPoolDbName === cfg.database;
+}
+
+export async function waitForPendingDatabaseInit(): Promise<void> {
+  if (dbInitializingPromise) {
+    try {
+      await dbInitializingPromise;
+    } catch {
+      // handled by caller checking isDatabaseInitialized()
+    }
+  }
 }
 
 export function setDatabaseInitializedForTest(ready: boolean): void {
