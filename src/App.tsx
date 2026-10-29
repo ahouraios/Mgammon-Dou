@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { SystemSettings, UserProfile } from './shared/types';
-import { apiRequest, setStoredToken } from './services/api';
+import { AUTH_EXPIRED_EVENT, apiRequest, setStoredToken } from './services/api';
 import {
   authenticateWithDeviceBiometric,
   getStoredBiometricInfo,
@@ -46,6 +46,17 @@ export default function App() {
   useEffect(() => {
     setStoredBio(getStoredBiometricInfo());
   }, [user]);
+
+  useEffect(() => {
+    const handleAuthExpired = () => {
+      setStoredToken(null);
+      setUser(null);
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => {
+      window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -97,7 +108,7 @@ export default function App() {
             }
           }
         } catch {
-          // کاربر هنوز وارد نشده است
+          setStoredToken(null);
         }
       } catch (err) {
         if (mounted) {

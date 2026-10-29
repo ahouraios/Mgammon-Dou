@@ -21,32 +21,27 @@
 
 ---
 
-### ۳. محتویات بسته استقرار و اسکریپت ساخت خودکار (`npm run deploy:package`)
-برای ساخت خودکار، اعتبارسنجی و فشرده‌سازی پکیج استقرار، دستور زیر در پروژه تعریف شده است:
-```bash
-npm run deploy:package
-```
-این دستور به‌صورت خودکار و متوالی:
-1. اعتبارسنجی تایپ‌اسکریپت (`npm run lint`) را اجرا می‌کند.
-2. آزمون‌های خودکار پروژه (`npm test`) را بررسی می‌کند.
-3. بیلد کامل Production کلاینت و سرور (`npm run build`) را تولید می‌کند.
-4. فایل‌های ضروری Production را گردآوری و فایل فشرده **`mgammon-duo-cpanel-deploy.zip`** را در ریشه پروژه ایجاد می‌کند.
+### ۳. تفکیک مرحله ساخت بسته (در محیط توسعه) از محتویات بسته آماده نصب روی هاست
 
-**محتویات این بسته شامل:**
+#### الف) مرحله ساخت بسته در پروژه اصلی توسعه (مخصوص محیط توسعه — خارج از هاست cPanel)
+- دستور `npm run deploy:package` (به همراه اسکریپت‌های پوشه `scripts/`) **صرفاً یک ابزار توسعه در پروژه اصلی (Development Repository)** است که پیش از انتشار، وظیفه اجرای بررسی‌های تایپ‌اسکریپت (`lint`)، آزمون‌های خودکار (`test`)، کامپایل فرانت‌اند و سرور (`dist/` و `app.cjs`) و تولید فایل فشرده `mgammon-duo-cpanel-deploy.zip` را بر عهده دارد.
+- **این دستور و پوشه `scripts/` داخل بسته نهایی Production (`mgammon-duo-cpanel-deploy.zip`) وجود ندارند.** بنابراین هنگام نصب و راه‌اندازی برنامه روی هاست cPanel، به هیچ عنوان نیازی به اجرای `npm run deploy:package` یا `npm run build` نیست و تمام مراحل نصب روی هاست صرفاً از طریق بخش ۴ (بر پایه `app.cjs`، نصب وابستگی‌ها و `npm start`) انجام می‌شود.
+
+#### ب) محتویات بسته نهایی Production (`mgammon-duo-cpanel-deploy.zip`) جهت آپلود روی هاست
+فایل فشرده `mgammon-duo-cpanel-deploy.zip` از پیش بیلد شده و فقط شامل فایل‌های اجرایی و ضروری محیط عملیاتی (Production) زیر است:
 - **`app.cjs`**: فایل اجرایی یکپارچه سرور Node.js + Express با فرمت CommonJS (سازگار با Node.js 22 و لودر **Phusion Passenger** در cPanel).
 - **`dist/`**: پوشه کامپایل‌شده فرانت‌اند React، سرویس‌ورکر PWA (`sw.js`, `registerSW.js`)، مانیفست (`manifest.webmanifest`) و فونت محلی `Vazirmatn-VF.woff2`.
 - **`public/`**: فایل‌های استاتیک پایه، آیکون‌های PWA و بنر پیش‌فرض.
-- **`package.json` و `package-lock.json`**: مشخصات دقیق وابستگی‌های Production سازگار با Node.js 22 و دستور استارت هماهنگ با سرور بیلدشده (`npm start` -> `node app.cjs`).
+- **`package.json` و `package-lock.json`**: مشخصات وابستگی‌های سازگار با Node.js 22 که در نسخه داخل ZIP فقط شامل دستورات اجرایی Production (`"start": "node app.cjs"` و `"start:prod": "NODE_ENV=production node app.cjs"`) است و فاقد اسکریپت‌های توسعه می‌باشد.
 - **`database/schema.sql`**: اسکریپت کامل ساختار ۱۳ جدول پایگاه داده (مورد استفاده در راه‌اندازی دیتابیس).
 - **`.env.example`**: الگوی متغیرهای محیطی (فاقد هرگونه کلید یا رمز محرمانه).
-- **`DEPLOYMENT_CPANEL.md`**: راهنمای جامع استقرار.
-
-> **نکته مهم:** از آنجا که `app.cjs` و پوشه `dist/` از قبل در بسته استقرار ساخته و قرار داده شده‌اند، روی هاست cPanel **نیازی به اجرای `npm run build` نیست**. اسکریپت `deploy:package` صرفاً ابزار محیط توسعه است و در محیط Production نیازی به آن نیست. همچنین پوشه‌های `node_modules/`، `.data/` و فایل‌های محرمانه `.env` در بسته قرار ندارند و وابستگی‌ها مستقیماً روی هاست نصب می‌شوند.
+- **`DEPLOYMENT_CPANEL.md`**: راهنمای جامع استقرار روی هاست.
+- *(پوشه‌های `node_modules/`، `.data/`، `scripts/`، `tests/` و فایل محرمانه `.env` در این بسته قرار ندارند و وابستگی‌ها طبق بخش ۴ مستقیماً روی هاست نصب می‌شوند.)*
 
 ---
 
-### ۴. تنظیم Node.js Application و نصب وابستگی‌ها در cPanel
-1. فایل فشرده پروژه (یا فایل `mgammon-duo-cpanel-deploy.zip`) را در پوشه برنامه روی هاست (مثلاً `/home/cpaneluser/mgammon-duo`) آپلود و **Extract** کنید.
+### ۴. مراحل نصب وابستگی‌ها و اجرای برنامه در cPanel (متکی بر `app.cjs` و `npm start`)
+1. فایل فشرده **`mgammon-duo-cpanel-deploy.zip`** را در پوشه برنامه روی هاست (مثلاً `/home/cpaneluser/mgammon-duo`) آپلود و **Extract** کنید.
 2. در cPanel از بخش **Software** وارد **Setup Node.js App** شوید و روی **Create Application** کلیک کنید.
 3. مقادیر زیر را تنظیم نمایید:
    - **Node.js version**: نسخه `22.x` (پیشنهادی) یا `20.x LTS` را انتخاب کنید.
@@ -73,8 +68,8 @@ npm run deploy:package
    APP_TIMEZONE=Asia/Tehran
    ```
 5. روی دکمه **Create** کلیک کنید.
-6. **نصب وابستگی‌ها روی هاست:** پس از ساخته شدن اپلیکیشن، در همان صفحه **Setup Node.js App** روی دکمه **Run NPM Install** کلیک کنید (این دکمه با استفاده از `package.json` و `package-lock.json` موجود در بسته، پکیج‌های موردنیاز سرور را در محیط مجازی Node.js هاست نصب می‌کند؛ همچنین در صورت دسترسی به Terminal می‌توانید دستور `npm ci --omit=dev` را اجرا نمایید).
-7. پس از اتمام نصب وابستگی‌ها، روی دکمه **Restart** کلیک کنید.
+6. **نصب وابستگی‌ها روی هاست:** پس از ساخته شدن اپلیکیشن، در همان صفحه **Setup Node.js App** روی دکمه **Run NPM Install** کلیک کنید تا پکیج‌های موردنیاز از روی `package.json` و `package-lock.json` روی هاست نصب شوند (در صورت استفاده از Terminal سی‌پنل نیز می‌توانید در محیط مجازی برنامه دستور `npm ci --omit=dev` یا `npm install --omit=dev` را اجرا کنید).
+7. **اجرای برنامه:** روی دکمه **Restart** در Setup Node.js App کلیک کنید تا Passenger فایل اجرایی **`app.cjs`** را اجرا کند (همچنین در صورت اجرای دستی یا از طریق خط فرمان، دستور **`npm start`** مستقیماً `node app.cjs` را اجرا می‌نماید).
 
 ---
 

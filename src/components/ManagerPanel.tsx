@@ -396,48 +396,60 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   }, []);
 
   const loadAttendanceList = useCallback(async () => {
-    const params = new URLSearchParams();
-    if (attFromShamsi.trim()) params.set('fromShamsi', attFromShamsi.trim());
-    if (attToShamsi.trim()) params.set('toShamsi', attToShamsi.trim());
-    const [res, leavesRes] = await Promise.all([
-      apiRequest<{
-        ok: boolean;
-        dailySummaries: DailyAttendanceSummary[];
-        historicalRecords: HistoricalWorkRecord[];
-      }>(`/api/attendance/history?${params.toString()}`),
-      apiRequest<{
-        ok: boolean;
-        leaveRequests: LeaveRequestItem[];
-        quotaSummary: LeaveQuotaSummary;
-      }>('/api/leaves'),
-    ]);
-    setAttendanceSummaries(res.dailySummaries);
-    setHistoricalRecords(res.historicalRecords || []);
-    setLeaveRequests(leavesRes.leaveRequests || []);
-    setLeaveQuota(leavesRes.quotaSummary || null);
+    try {
+      const params = new URLSearchParams();
+      if (attFromShamsi.trim()) params.set('fromShamsi', attFromShamsi.trim());
+      if (attToShamsi.trim()) params.set('toShamsi', attToShamsi.trim());
+      const [res, leavesRes] = await Promise.all([
+        apiRequest<{
+          ok: boolean;
+          dailySummaries: DailyAttendanceSummary[];
+          historicalRecords: HistoricalWorkRecord[];
+        }>(`/api/attendance/history?${params.toString()}`),
+        apiRequest<{
+          ok: boolean;
+          leaveRequests: LeaveRequestItem[];
+          quotaSummary: LeaveQuotaSummary;
+        }>('/api/leaves'),
+      ]);
+      setAttendanceSummaries(res.dailySummaries);
+      setHistoricalRecords(res.historicalRecords || []);
+      setLeaveRequests(leavesRes.leaveRequests || []);
+      setLeaveQuota(leavesRes.quotaSummary || null);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    }
   }, [attFromShamsi, attToShamsi]);
 
   const loadReportsList = useCallback(async () => {
-    const params = new URLSearchParams();
-    if (repSearch.trim()) params.set('search', repSearch.trim());
-    if (repFromShamsi.trim()) params.set('fromShamsi', repFromShamsi.trim());
-    if (repToShamsi.trim()) params.set('toShamsi', repToShamsi.trim());
-    const res = await apiRequest<{ ok: boolean; reports: DailyWorkReport[] }>(
-      `/api/reports?${params.toString()}`
-    );
-    setReports(res.reports);
+    try {
+      const params = new URLSearchParams();
+      if (repSearch.trim()) params.set('search', repSearch.trim());
+      if (repFromShamsi.trim()) params.set('fromShamsi', repFromShamsi.trim());
+      if (repToShamsi.trim()) params.set('toShamsi', repToShamsi.trim());
+      const res = await apiRequest<{ ok: boolean; reports: DailyWorkReport[] }>(
+        `/api/reports?${params.toString()}`
+      );
+      setReports(res.reports);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    }
   }, [repSearch, repFromShamsi, repToShamsi]);
 
   const loadFinanceList = useCallback(async () => {
-    const params = new URLSearchParams();
-    if (finStatusFilter) params.set('status', finStatusFilter);
-    if (finTypeFilter) params.set('txType', finTypeFilter);
-    if (finSearch.trim()) params.set('search', finSearch.trim());
-    const res = await apiRequest<{
-      ok: boolean;
-      transactions: FinancialTransaction[];
-    }>(`/api/finance?${params.toString()}`);
-    setTransactions(res.transactions);
+    try {
+      const params = new URLSearchParams();
+      if (finStatusFilter) params.set('status', finStatusFilter);
+      if (finTypeFilter) params.set('txType', finTypeFilter);
+      if (finSearch.trim()) params.set('search', finSearch.trim());
+      const res = await apiRequest<{
+        ok: boolean;
+        transactions: FinancialTransaction[];
+      }>(`/api/finance?${params.toString()}`);
+      setTransactions(res.transactions);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    }
   }, [finStatusFilter, finTypeFilter, finSearch]);
 
   const hasInitialLoadedRef = useRef(false);
@@ -451,6 +463,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         loadReportsList(),
         loadFinanceList(),
       ]);
+    } catch {
+      // handled in individual loaders
     } finally {
       setLoading(false);
     }
@@ -459,14 +473,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   useEffect(() => {
     if (!hasInitialLoadedRef.current) {
       hasInitialLoadedRef.current = true;
-      refreshAll();
+      void refreshAll();
     }
   }, [refreshAll]);
 
   useEffect(() => {
     if (!hasInitialLoadedRef.current) return;
     const timer = window.setTimeout(() => {
-      loadAttendanceList();
+      void loadAttendanceList();
     }, 250);
     return () => window.clearTimeout(timer);
   }, [loadAttendanceList]);
@@ -474,7 +488,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   useEffect(() => {
     if (!hasInitialLoadedRef.current) return;
     const timer = window.setTimeout(() => {
-      loadReportsList();
+      void loadReportsList();
     }, 250);
     return () => window.clearTimeout(timer);
   }, [loadReportsList]);
@@ -482,7 +496,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   useEffect(() => {
     if (!hasInitialLoadedRef.current) return;
     const timer = window.setTimeout(() => {
-      loadFinanceList();
+      void loadFinanceList();
     }, 250);
     return () => window.clearTimeout(timer);
   }, [loadFinanceList]);

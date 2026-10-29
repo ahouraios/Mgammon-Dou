@@ -55,6 +55,8 @@ export function withAuthTokenUrl(url: string | null | undefined): string {
   return `${url}${separator}token=${encodeURIComponent(token)}`;
 }
 
+export const AUTH_EXPIRED_EVENT = 'mgammon:auth-expired';
+
 export async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -106,6 +108,14 @@ export async function apiRequest<T>(
   }
 
   if (!response.ok || data.ok === false) {
+    const isLoginEndpoint =
+      endpoint.includes('/api/auth/login') || endpoint.includes('/api/auth/biometric/login');
+    if ((response.status === 401 || data.code === 'UNAUTHORIZED') && !isLoginEndpoint) {
+      setStoredToken(null);
+      if (typeof window !== 'undefined' && !endpoint.includes('/api/auth/me')) {
+        window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
+      }
+    }
     const msg =
       typeof data.message === 'string'
         ? data.message
