@@ -15,7 +15,8 @@
     "backup:create": "tsx scripts/backup-cli.ts create",
     "backup:list": "tsx scripts/backup-cli.ts list",
     "backup:verify": "tsx scripts/backup-cli.ts verify",
-    "backup:restore": "tsx scripts/backup-cli.ts restore"
+    "backup:restore": "tsx scripts/backup-cli.ts restore",
+    "deploy:package": "tsx scripts/deploy-package.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
