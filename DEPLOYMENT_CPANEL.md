@@ -13,12 +13,11 @@
 
 ---
 
-### ۲. وارد کردن ساختار جداول (`database/schema.sql`)
-1. در صفحه اصلی cPanel، وارد ابزار **phpMyAdmin** شوید.
-2. از ستون سمت چپ، دیتابیس ساخته‌شده (`cpaneluser_mgammon_duo`) را انتخاب کنید.
-3. از نوار بالا وارد زبانه **Import** شوید.
-4. فایل `database/schema.sql` موجود در پروژه را انتخاب کرده و روی دکمه **Import / Go** کلیک کنید تا تمام ۸ جدول (`users`, `user_sessions`, `attendance_logs`, `daily_work_reports`, `financial_transactions`, `system_settings`, `system_settings_snapshots`, `audit_logs`) با Encoding استاندارد `utf8mb4_unicode_ci` ساخته شوند.
-   > **نکته:** برنامه در اولین اجرا نیز به‌صورت خودکار جداول را بررسی کرده و دو حساب کاربری اولیه (`manager` و `worker`) را با رمزهای هش‌شده (`bcrypt`) ایجاد می‌کند.
+### ۲. راه‌اندازی ساختار جداول و مهاجرت خودکار (`database/schema.sql`)
+1. برنامه در اولین اجرا روی دیتابیس کاملاً خالی، به‌صورت خودکار تمام **۱۳ جدول اصلی** (`schema_migrations`, `users`, `user_sessions`, `attendance_logs`, `historical_work_records`, `daily_work_reports`, `financial_transactions`, `system_settings`, `system_settings_snapshots`, `work_correspondences`, `leave_requests`, `work_tasks`, `audit_logs`) را با Encoding استاندارد `utf8mb4_unicode_ci` ایجاد کرده و مهاجرت‌های نسخه‌بندی‌شده (`v1` تا `v6`) را اجرا می‌کند.
+2. در صورت تمایل به ایمپورت دستی پیش از اجرا، می‌توانید در **phpMyAdmin** دیتابیس ساخته‌شده را انتخاب کرده و از زبانه **Import** فایل `database/schema.sql` را وارد نمایید.
+3. در اولین راه‌اندازی، تنها **دو حساب کاربری اولیه** شامل مدیر (**مجید نورایی** با نقش `manager`) و پرسنل (**امید میثمی** با نقش `worker`) با رمزهای هش‌شده (`bcrypt`) و وضعیت الزام تغییر رمز اولیه (`must_change_password = 1`) به همراه تنظیمات پایه سامانه ایجاد می‌شوند و هیچ داده آزمایشی وارد دیتابیس نمی‌گردد.
+4. تنظیمات وب‌سرویس پیامک (**ملی‌پیامک**) در ابتدای راه‌اندازی الزامی نیست و نبودن آن مانع اجرای هیچ‌یک از بخش‌های سامانه نمی‌شود؛ مدیر می‌تواند پس از ورود، از بخش **«تنظیمات سامانه»** مشخصات خط و حساب ملی‌پیامک را ثبت و آزمایش کند.
 
 ---
 

@@ -117,8 +117,8 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
 
   localMariaDbBootstrapPromise = (async () => {
     try {
-      const persistentDataDir = path.resolve(process.cwd(), '.data/mysql');
-      const debCacheDir = path.resolve(process.cwd(), '.data/deb-cache');
+      const persistentDataDir = process.env.LOCAL_MARIADB_DATADIR || '/var/lib/mysql';
+      const debCacheDir = process.env.LOCAL_DEB_CACHE_DIR || '/var/cache/apt/archives';
       fs.mkdirSync(debCacheDir, { recursive: true });
       let hasMariadbd = await hasMariadbdBinary();
 

@@ -162,13 +162,34 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     if (server) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    try {
+      const cfg = getDbConfig();
+      const adminConn = await mysql.createConnection({
+        host: cfg.host,
+        port: cfg.port,
+        user: cfg.user,
+        password: cfg.password,
+      });
+      await adminConn.query('DROP DATABASE IF EXISTS `mgammon_duo_test`');
+      await adminConn.end();
+    } catch {
+      // ignore
+    }
     await resetPool();
 
     const testMediaPath = path.resolve(process.cwd(), '.data/test_private_media');
     const testBackupPath = path.resolve(process.cwd(), '.data/test_backups');
+    const defaultBackupPath = path.resolve(process.cwd(), '.data/backups');
     try {
       fs.rmSync(testMediaPath, { recursive: true, force: true });
       fs.rmSync(testBackupPath, { recursive: true, force: true });
+      if (fs.existsSync(defaultBackupPath)) {
+        for (const f of fs.readdirSync(defaultBackupPath)) {
+          if (f.startsWith('pre_migration_mgammon_duo_test_')) {
+            fs.unlinkSync(path.join(defaultBackupPath, f));
+          }
+        }
+      }
     } catch {
       // ignore
     }
