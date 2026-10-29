@@ -42,7 +42,6 @@ function validatePrePackageArtifacts(): void {
     'package-lock.json',
     '.env.example',
     'DEPLOYMENT_CPANEL.md',
-    'scripts/backup-cli.ts',
   ];
 
   for (const rel of requiredFiles) {

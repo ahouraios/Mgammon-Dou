@@ -17,7 +17,6 @@ INCLUDE_ITEMS = [
     "dist",
     "public",
     "database/schema.sql",
-    "scripts/backup-cli.ts",
 ]
 
 def is_forbidden(rel_path):
@@ -29,7 +28,7 @@ def is_forbidden(rel_path):
     for p in parts:
         if p.startswith(".env") and p != ".env.example":
             return True
-        if p in [".data", "node_modules", "tests", ".git", "coverage", ".DS_Store", "__pycache__"]:
+        if p in [".data", "node_modules", "tests", ".git", "coverage", ".DS_Store", "__pycache__", "scripts"]:
             return True
         if p.endswith(".log"):
             return True
@@ -51,6 +50,19 @@ def create_package():
             if not os.path.exists(full_path):
                 raise FileNotFoundError(f"Required item missing for release package: {item}")
             
+            if item == "package.json":
+                # Ensure the packaged package.json has start: node app.cjs and only production run scripts
+                with open(full_path, "r", encoding="utf-8") as pf:
+                    pkg_data = json.load(pf)
+                pkg_data["scripts"] = {
+                    "start": "node app.cjs",
+                    "start:prod": "NODE_ENV=production node app.cjs"
+                }
+                pkg_content = json.dumps(pkg_data, indent=2, ensure_ascii=False) + "\n"
+                zf.writestr("package.json", pkg_content)
+                added_files.append({"name": "package.json", "size": len(pkg_content.encode("utf-8"))})
+                continue
+
             if os.path.isfile(full_path):
                 if not is_forbidden(item):
                     zf.write(full_path, item)
