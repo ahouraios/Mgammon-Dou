@@ -21,43 +21,49 @@
 
 ---
 
-### ۳. آماده‌سازی و بیلد پروژه برای cPanel
-پیش از آپلود روی هاست (یا پس از آپلود از طریق Terminal سی‌پنل)، دستور زیر را اجرا کنید:
-```bash
-npm install
-npm run build
-```
-این دستور دو خروجی استاندارد تولید می‌کند:
-- پوشه `dist/`: شامل فایل‌های کامپایل‌شده فرانت‌اند React، سرویس‌ورکر PWA، مانیفست و فونت محلی `Vazirmatn-VF.woff2`.
-- فایل `app.cjs`: فایل اجرایی یکپارچه سرور Node.js + Express با فرمت CommonJS که کاملاً با لودر **Phusion Passenger** در cPanel سازگار است.
+### ۳. محتویات بسته استقرار و فایل‌های آماده انتشار
+بسته نهایی تحویلی از پیش بیلد شده و شامل تمام فایل‌های اجرایی موردنیاز Production است:
+- **`app.cjs`**: فایل اجرایی یکپارچه سرور Node.js + Express با فرمت CommonJS (سازگار با Node.js 22 و لودر **Phusion Passenger** در cPanel).
+- **`dist/`**: پوشه کامپایل‌شده فرانت‌اند React، سرویس‌ورکر PWA (`sw.js`, `registerSW.js`)، مانیفست (`manifest.webmanifest`) و فونت محلی `Vazirmatn-VF.woff2`.
+- **`public/`**: فایل‌های استاتیک پایه، آیکون‌های PWA و بنر پیش‌فرض.
+- **`package.json` و `package-lock.json`**: مشخصات دقیق وابستگی‌های سازگار با Node.js 22 و npm (بدون تداخل نسخه) جهت نصب سریع پکیج‌ها روی هاست.
+- **`database/schema.sql`**: اسکریپت کامل ساختار ۱۳ جدول پایگاه داده.
+- **`.env.example`**: الگوی متغیرهای محیطی (فاقد هرگونه کلید یا رمز محرمانه).
+
+> **نکته مهم:** از آنجا که `app.cjs` و پوشه `dist/` از قبل در بسته استقرار ساخته و قرار داده شده‌اند، روی هاست cPanel **نیازی به اجرای `npm run build` نیست** (مگر اینکه در آینده کدهای پوشه `src/` را تغییر دهید). همچنین پوشه‌های `node_modules/`، `.data/` و فایل‌های محرمانه `.env` در بسته قرار ندارند و وابستگی‌ها مستقیماً روی هاست نصب می‌شوند.
 
 ---
 
-### ۴. تنظیم Node.js Application در cPanel
-1. در cPanel از بخش **Software** وارد **Setup Node.js App** شوید و روی **Create Application** کلیک کنید.
-2. مقادیر زیر را تنظیم نمایید:
-   - **Node.js version**: نسخه `20.x LTS` یا `22.x` را انتخاب کنید.
+### ۴. تنظیم Node.js Application و نصب وابستگی‌ها در cPanel
+1. فایل فشرده پروژه (یا فایل `mgammon-duo-cpanel-deploy.zip`) را در پوشه برنامه روی هاست (مثلاً `/home/cpaneluser/mgammon-duo`) آپلود و **Extract** کنید.
+2. در cPanel از بخش **Software** وارد **Setup Node.js App** شوید و روی **Create Application** کلیک کنید.
+3. مقادیر زیر را تنظیم نمایید:
+   - **Node.js version**: نسخه `22.x` (پیشنهادی) یا `20.x LTS` را انتخاب کنید.
    - **Application mode**: روی `Production` قرار دهید.
    - **Application root**: مسیر پوشه برنامه روی هاست (مثلاً `mgammon-duo`).
    - **Application URL**: دامنه یا ساب‌دامنه مورد نظر خود را انتخاب کنید.
-   - **Application startup file**: مقدار `app.cjs` را وارد کنید.
-3. در بخش **Environment variables** متغیرهای زیر را تعریف کنید (یا در فایل `.env` در ریشه برنامه قرار دهید):
+   - **Application startup file**: دقیقاً مقدار زیر را وارد کنید:
+     ```text
+     app.cjs
+     ```
+4. در بخش **Environment variables** متغیرهای زیر را تعریف کنید (یا در فایل `.env` در ریشه برنامه قرار دهید):
    ```env
    NODE_ENV=production
-   SESSION_SECRET=یک_رشته_تصادفی_۶۴_کاراکتری_امن_وارد_کنید
+   SESSION_SECRET=یک_رشته_تصادفی_حداقل_۳۲_تا_۶۴_کاراکتری_امن_وارد_کنید
    DB_HOST=127.0.0.1
    DB_PORT=3306
    DB_USER=cpaneluser_mgammon
    DB_PASSWORD=رمز_عبور_دیتابیس_شما
    DB_NAME=cpaneluser_mgammon_duo
    INITIAL_MANAGER_USERNAME=manager
-   INITIAL_MANAGER_PASSWORD=رمز_اولیه_مدیر
+   INITIAL_MANAGER_PASSWORD=رمز_اولیه_امن_مدیر
    INITIAL_WORKER_USERNAME=worker
-   INITIAL_WORKER_PASSWORD=رمز_اولیه_نیرو
+   INITIAL_WORKER_PASSWORD=رمز_اولیه_امن_کارمند
    APP_TIMEZONE=Asia/Tehran
    ```
-4. روی دکمه **Create** کلیک کنید.
-5. در صورتی که پوشه `node_modules` را آپلود نکرده‌اید، روی دکمه **Run NPM Install** در همان صفحه کلیک کنید و سپس دکمه **Restart** را بزنید.
+5. روی دکمه **Create** کلیک کنید.
+6. **نصب وابستگی‌ها روی هاست:** پس از ساخته شدن اپلیکیشن، در همان صفحه **Setup Node.js App** روی دکمه **Run NPM Install** کلیک کنید (این دکمه با استفاده از `package.json` و `package-lock.json` موجود در بسته، پکیج‌های موردنیاز سرور را در محیط مجازی Node.js هاست نصب می‌کند؛ همچنین در صورت دسترسی به Terminal می‌توانید دستور `npm ci --omit=dev` را اجرا نمایید).
+7. پس از اتمام نصب وابستگی‌ها، روی دکمه **Restart** کلیک کنید.
 
 ---
 
