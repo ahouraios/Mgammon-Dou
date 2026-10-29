@@ -123,12 +123,12 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
       let hasMariadbd = await hasMariadbdBinary();
 
       if (!hasMariadbd && fs.existsSync('/etc/debian_version')) {
-        // ابتدا نصب سریع آفلاین از بسته‌های کش‌شده در .data/deb-cache بدون نیاز به اینترنت یا apt-get update
+        // ابتدا نصب سریع آفلاین از بسته‌های کش‌شده در .data/deb-cache در صورتی که بسته اصلی mariadb-server در کش موجود باشد
         try {
           const cachedDebs = fs
             .readdirSync(debCacheDir)
             .filter((f) => f.endsWith('.deb'));
-          if (cachedDebs.length > 0) {
+          if (cachedDebs.some((f) => f.startsWith('mariadb-server_'))) {
             await execAsync(
               `DEBIAN_FRONTEND=noninteractive dpkg -i --force-confdef --force-confold "${debCacheDir}"/*.deb || DEBIAN_FRONTEND=noninteractive dpkg --configure -a`
             );
@@ -147,14 +147,21 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
           ) {
             fs.unlinkSync('/etc/apt/sources.list');
           }
+          if (fs.existsSync('/etc/apt/apt.conf.d/docker-clean')) {
+            fs.unlinkSync('/etc/apt/apt.conf.d/docker-clean');
+          }
         } catch {
           // ignore
         }
 
         try {
           await execAsync(
-            `DEBIAN_FRONTEND=noninteractive dpkg --configure -a && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Dir::Cache::archives="${debCacheDir}" mariadb-server`
+            `DEBIAN_FRONTEND=noninteractive dpkg --configure -a && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y -o APT::Keep-Downloaded-Packages="true" -o Dir::Cache::archives="${debCacheDir}" && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o APT::Keep-Downloaded-Packages="true" -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Dir::Cache::archives="${debCacheDir}" mariadb-server`
           );
+          const lockFile = path.join(debCacheDir, 'lock');
+          if (fs.existsSync(lockFile)) {
+            fs.unlinkSync(lockFile);
+          }
         } catch {
           // ignore
         }
@@ -206,7 +213,7 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
         });
         child.unref();
 
-        for (let i = 0; i < 25; i++) {
+        for (let i = 0; i < 30; i++) {
           if (isSocketReady()) {
             return true;
           }
@@ -244,6 +251,26 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
       await execAsync(
         `mysql -u root -e "CREATE DATABASE IF NOT EXISTS \\\`${safeDbName}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD(''); GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING PASSWORD('') WITH GRANT OPTION; FLUSH PRIVILEGES;"`
       );
+
+      // اطمینان از آماده بودن اتصال TCP روی 127.0.0.1:3306 پیش از بازگشت
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          const tcpConn = await mysql.createConnection({
+            host: cfg.host,
+            port: cfg.port,
+            user: cfg.user,
+            password: cfg.password,
+            connectTimeout: 1500,
+          });
+          await tcpConn.query(
+            `CREATE DATABASE IF NOT EXISTS \`${safeDbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+          );
+          await tcpConn.end();
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      }
     } catch {
       // در محیط هاست واقعی سرویس از قبل توسط سرور مدیریت می‌شود
     } finally {

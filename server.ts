@@ -263,7 +263,12 @@ export async function startServer() {
   const app = await createApp();
   const PORT = Number(process.env.PORT || 3000);
 
-  if (process.env.NODE_ENV !== 'production') {
+  const isBundledRuntime =
+    (typeof __filename === 'string' && path.basename(__filename) === 'app.cjs') ||
+    (process.argv[1] ? path.basename(process.argv[1]) === 'app.cjs' : false);
+  const isProductionMode = process.env.NODE_ENV === 'production' || isBundledRuntime;
+
+  if (!isProductionMode) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
@@ -278,6 +283,13 @@ export async function startServer() {
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
+    app.use('/api', (_req, res) => {
+      res.status(404).json({
+        ok: false,
+        code: 'NOT_FOUND',
+        message: 'مسیر وب‌سرویس مورد نظر یافت نشد.',
+      });
+    });
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });

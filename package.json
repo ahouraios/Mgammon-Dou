@@ -6,11 +6,16 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
+    "start:prod": "NODE_ENV=production node app.cjs",
     "build": "vite build && esbuild server.ts --bundle --platform=node --packages=external --format=cjs --outfile=app.cjs",
     "preview": "vite preview",
     "test": "vitest run",
     "clean": "rm -rf dist app.cjs",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "backup:create": "tsx scripts/backup-cli.ts create",
+    "backup:list": "tsx scripts/backup-cli.ts list",
+    "backup:verify": "tsx scripts/backup-cli.ts verify",
+    "backup:restore": "tsx scripts/backup-cli.ts restore"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
