@@ -1581,10 +1581,8 @@ export function generateStatementPeriods(params: {
       const displayEndShamsi = `${nextJy}/${pad2(nextJm)}/${pad2(txEndDay)}`;
 
       const startMonthName = PERSIAN_MONTHS[jm - 1] || '';
-      const nextMonthName = PERSIAN_MONTHS[nextJm - 1] || '';
-      const displayEndDayLabel = toPersianDigits(safeAnchorDay);
-      const title = `ماه ${toPersianDigits(startDay)} ${startMonthName} تا ${displayEndDayLabel} ${nextMonthName} ${toPersianDigits(nextJy)}`;
-      const subtitle = `از ${toPersianDigits(fromShamsi)} تا ${toPersianDigits(displayEndShamsi)}`;
+      const title = `${startMonthName} ${toPersianDigits(jy)}`;
+      const subtitle = `${startMonthName} ${toPersianDigits(jy)}`;
 
       const stmt = calculatePeriodStatement({
         periodKey: `cycle-${fromShamsi}-${displayEndShamsi}`,

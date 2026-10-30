@@ -16,6 +16,7 @@ import {
   Square,
   Trash2,
   Volume2,
+  CalendarClock,
 } from 'lucide-react';
 import { DeliveryChannel, UserRole, WorkCorrespondence } from '../shared/types';
 import { apiRequest } from '../services/api';
@@ -23,13 +24,16 @@ import { pad2, toPersianDigits } from '../shared/jalali';
 import { ShamsiDatePicker } from './ShamsiDatePicker';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
 import { CameraCaptureModal } from './CameraCaptureModal';
+import { DailyTasksChecklist } from './DailyTasksChecklist';
 
 interface WorkCorrespondenceSectionProps {
   role?: UserRole;
   currentUserRole?: UserRole;
   todayShamsi: string;
+  mode?: 'full' | 'dashboard_composer';
   onUnreadChange?: (unreadCount: number) => void;
   onUnreadCleared?: () => void;
+  onOpenFullCorrespondence?: () => void;
 }
 
 interface PendingUploadFile {
@@ -66,6 +70,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
   role,
   currentUserRole,
   todayShamsi,
+  mode = 'full',
   onUnreadChange,
   onUnreadCleared,
 }) => {
@@ -79,13 +84,22 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
     null
   );
 
-  // فرم ارسال پیام، صدا و فایل
+  // فرم یکپارچه ارسال پیام یا برنامه کاری + صدا و فایل
+  const [isWorkProgram, setIsWorkProgram] = useState(false);
+  const [workProgramDate, setWorkProgramDate] = useState(todayShamsi);
+  const [tasksRefreshTrigger, setTasksRefreshTrigger] = useState(0);
   const [subject, setSubject] = useState('');
   const [messageText, setMessageText] = useState('');
   const [replyTo, setReplyTo] = useState<WorkCorrespondence | null>(null);
   const [deliveryChannel, setDeliveryChannel] = useState<DeliveryChannel>('IN_APP');
   const [selectedFiles, setSelectedFiles] = useState<PendingUploadFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (todayShamsi && !subject && !messageText) {
+      setWorkProgramDate(todayShamsi);
+    }
+  }, [todayShamsi, subject, messageText]);
 
   // دوربین موبایل و پیش‌نمایش پاپ‌آپ فایل‌ها
   const [isCameraOpen, setIsCameraOpen] = useState(false);
@@ -349,6 +363,74 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
     setFeedback(null);
     setSending(true);
     try {
+      // حالت ۱: ثبت برنامه کاری زمان‌بندی‌شده (توسط مدیر)
+      if (effectiveRole === 'manager' && isWorkProgram) {
+        const progTitle =
+          subject.trim() || messageText.trim().split('\n')[0].slice(0, 140);
+        const progDesc = subject.trim()
+          ? messageText.trim() || null
+          : messageText.trim().includes('\n')
+            ? messageText.trim()
+            : null;
+        if (!progTitle) {
+          setFeedback({
+            type: 'error',
+            text: 'لطفاً عنوان یا شرح برنامه کاری را تایپ کنید.',
+          });
+          setSending(false);
+          return;
+        }
+        const targetDate = workProgramDate || todayShamsi;
+        const taskRes = await apiRequest<{ ok: boolean; message: string }>('/api/tasks', {
+          method: 'POST',
+          body: JSON.stringify({
+            title: progTitle,
+            description: progDesc,
+            shamsi_date: targetDate,
+            send_sms: deliveryChannel === 'SMS' || deliveryChannel === 'BOTH',
+          }),
+        });
+
+        // اگر فایل، عکس یا ویس هم پیوست شده بود، در مکاتبات نیز ثبت شود تا پیوست از دست نرود
+        if (selectedFiles.length > 0 || recordedAudioBase64) {
+          await apiRequest('/api/correspondences', {
+            method: 'POST',
+            body: JSON.stringify({
+              subject: `برنامه کاری (موعد: ${targetDate}) — ${progTitle}`,
+              message_text: progDesc || progTitle,
+              delivery_channel: 'IN_APP',
+              files: selectedFiles,
+              audio_base64: recordedAudioBase64 || undefined,
+              audio_mime_type: recordedAudioMime || undefined,
+              audio_duration_seconds: recordedDuration || undefined,
+            }),
+          });
+        }
+
+        setSubject('');
+        setMessageText('');
+        setWorkProgramDate(todayShamsi);
+        setReplyTo(null);
+        setSelectedFiles([]);
+        setDeliveryChannel('IN_APP');
+        clearRecordedAudio();
+        if (fileInputRef.current) {
+          fileInputRef.current.value = '';
+        }
+        composeFormRef.current?.reset();
+        setTasksRefreshTrigger((prev) => prev + 1);
+        setFeedback({
+          type: 'success',
+          text: `${taskRes.message || `برنامه کاری برای تاریخ ${toPersianDigits(targetDate)} ثبت شد.`} (فرم برای ثبت بعدی آماده است)`,
+        });
+        await loadCorrespondences();
+        if (onUnreadChangeRef.current) {
+          onUnreadChangeRef.current(unreadCount);
+        }
+        return;
+      }
+
+      // حالت ۲: ارسال پیام کاری معمولی
       const repliedMessage = replyTo;
       const res = await apiRequest<{ ok: boolean; message: string }>('/api/correspondences', {
         method: 'POST',
@@ -375,10 +457,16 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
       }
       setSubject('');
       setMessageText('');
+      setWorkProgramDate(todayShamsi);
       setReplyTo(null);
       setSelectedFiles([]);
+      setDeliveryChannel('IN_APP');
       clearRecordedAudio();
-      setFeedback({ type: 'success', text: res.message });
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      composeFormRef.current?.reset();
+      setFeedback({ type: 'success', text: `${res.message} (فرم برای ثبت بعدی آماده است)` });
       await loadCorrespondences();
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
@@ -649,19 +737,63 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
         )}
       </div>
 
-      {/* ================= بخش ۲ (وسط صفحه): فرم ارسال پیام متنی، صوتی، عکس دوربین و فایل ================= */}
+      {/* ================= بخش ۲ (وسط صفحه): فرم یکپارچه ارسال پیام و برنامه کاری + صدا، دوربین و فایل ================= */}
       <form
         ref={composeFormRef}
         onSubmit={handleSend}
         className="rounded-2xl bg-white border border-[#C5A059]/50 p-4 space-y-3.5"
       >
-        <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
           <h3 className="text-sm font-bold text-[#0B192C]">
             {effectiveRole === 'manager'
-              ? 'ارسال پیام، صدا یا فایل به پرسنل (امید میثمی)'
+              ? isWorkProgram
+                ? 'ثبت و ارسال برنامه کاری جدید برای پرسنل (امید میثمی)'
+                : 'ارسال پیام یا برنامه کاری به پرسنل (امید میثمی)'
               : 'ارسال پیام، صدا یا فایل به مدیریت (مجید نورایی)'}
           </h3>
         </div>
+
+        {/* انتخاب با یک تیک: برنامه کاری زمان‌بندی‌شده یا پیام کاری */}
+        {effectiveRole === 'manager' && !replyTo && (
+          <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/75 p-3 flex flex-wrap items-center justify-between gap-2.5">
+            <label className="inline-flex items-center gap-2.5 text-xs font-extrabold text-[#0B192C] cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={isWorkProgram}
+                onChange={(e) => setIsWorkProgram(e.target.checked)}
+                className="w-4 h-4 accent-[#0B192C] rounded cursor-pointer"
+              />
+              <span>
+                ارسال به‌عنوان «برنامه کاری» (با قابلیت انتخاب تاریخ تحویل در روزهای آینده و تیک انجام)
+              </span>
+            </label>
+
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-white border border-slate-200">
+              <button
+                type="button"
+                onClick={() => setIsWorkProgram(false)}
+                className={`px-3 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                  !isWorkProgram
+                    ? 'bg-[#0B192C] text-[#C5A059] shadow-2xs'
+                    : 'text-slate-600 hover:text-[#0B192C]'
+                }`}
+              >
+                پیام
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsWorkProgram(true)}
+                className={`px-3 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                  isWorkProgram
+                    ? 'bg-[#0B192C] text-[#C5A059] shadow-2xs'
+                    : 'text-slate-600 hover:text-[#0B192C]'
+                }`}
+              >
+                برنامه کاری
+              </button>
+            </div>
+          </div>
+        )}
 
         {replyTo && (
           <div className="rounded-xl bg-amber-50/80 border border-[#C5A059]/60 px-3 py-2 flex items-center justify-between gap-2 text-xs">
@@ -682,19 +814,42 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           </div>
         )}
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div
+          className={`grid grid-cols-1 ${
+            effectiveRole === 'manager' && isWorkProgram
+              ? 'sm:grid-cols-3'
+              : effectiveRole === 'manager'
+                ? 'sm:grid-cols-2'
+                : 'sm:grid-cols-1'
+          } gap-3 items-start`}
+        >
           <div>
             <label className="block text-xs font-medium text-slate-700 mb-1">
-              موضوع (اختیاری)
+              {effectiveRole === 'manager' && isWorkProgram
+                ? 'عنوان برنامه کاری (مثلاً: تحویل سفارش X)'
+                : 'موضوع پیام (اختیاری)'}
             </label>
             <input
               type="text"
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
-              placeholder="عنوان پیام..."
+              placeholder={
+                effectiveRole === 'manager' && isWorkProgram
+                  ? 'عنوان برنامه کاری را تایپ کنید...'
+                  : 'عنوان پیام...'
+              }
               className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs focus:outline-none focus:border-[#0B192C]"
             />
           </div>
+
+          {effectiveRole === 'manager' && isWorkProgram && (
+            <ShamsiDatePicker
+              label="تاریخ تحویل / انجام برنامه کاری (امروز یا آینده)"
+              value={workProgramDate}
+              onChange={setWorkProgramDate}
+              todayShamsi={todayShamsi}
+            />
+          )}
 
           {effectiveRole === 'manager' && (
             <div>
@@ -714,13 +869,31 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           )}
         </div>
 
+        {effectiveRole === 'manager' && isWorkProgram && workProgramDate > todayShamsi && (
+          <div className="rounded-xl bg-indigo-50/80 border border-indigo-200 px-3 py-2 flex items-center gap-2 text-xs text-indigo-950">
+            <CalendarClock className="w-4 h-4 text-indigo-700 shrink-0" />
+            <span>
+              این برنامه کاری برای تاریخ آینده{' '}
+              <strong className="tabular-nums">{toPersianDigits(workProgramDate)}</strong> ثبت و زمان‌بندی می‌شود.
+            </span>
+          </div>
+        )}
+
         <div>
-          <label className="block text-xs font-medium text-slate-700 mb-1">متن پیام</label>
+          <label className="block text-xs font-medium text-slate-700 mb-1">
+            {effectiveRole === 'manager' && isWorkProgram
+              ? 'شرح و جزئیات برنامه کاری'
+              : 'متن پیام'}
+          </label>
           <textarea
             rows={2}
             value={messageText}
             onChange={(e) => setMessageText(e.target.value)}
-            placeholder="متن پیام یا توضیحات خود را بنویسید..."
+            placeholder={
+              effectiveRole === 'manager' && isWorkProgram
+                ? 'شرح برنامه کاری، جزئیات تحویل و نکات لازم را تایپ کنید...'
+                : 'متن پیام یا توضیحات خود را بنویسید...'
+            }
             className="w-full rounded-xl border border-slate-200 p-3 text-xs leading-6 focus:outline-none focus:border-[#0B192C]"
           />
         </div>
@@ -798,7 +971,13 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
               className="w-full sm:w-auto min-h-[42px] px-5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center justify-center gap-1.5 hover:bg-[#152c4a] disabled:opacity-50 cursor-pointer"
             >
               <Send className="w-3.5 h-3.5" />
-              <span>{sending ? 'در حال ارسال...' : 'ارسال پیام'}</span>
+              <span>
+                {sending
+                  ? 'در حال ثبت...'
+                  : effectiveRole === 'manager' && isWorkProgram
+                    ? 'ثبت و ارسال برنامه کاری'
+                    : 'ارسال پیام'}
+              </span>
             </button>
           </div>
 
@@ -840,10 +1019,21 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
         </div>
       </form>
 
-      {/* فیلتر سریع نوع محتوا + جست‌وجوی مکاتبات */}
-      <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
-          <span className="text-xs font-bold text-[#0B192C]">فیلتر سریع مکاتبات:</span>
+      {/* فهرست یکپارچه برنامه‌های کاری در همین بخش */}
+      <DailyTasksChecklist
+        role={effectiveRole}
+        currentShamsiDate={todayShamsi}
+        hideCreateForm={true}
+        refreshTrigger={tasksRefreshTrigger}
+        sectionMode={mode === 'dashboard_composer' ? 'pending_only' : 'full'}
+      />
+
+      {mode === 'full' && (
+        <>
+          {/* فیلتر سریع نوع محتوا + جست‌وجوی مکاتبات */}
+          <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+              <span className="text-xs font-bold text-[#0B192C]">فیلتر سریع مکاتبات:</span>
           <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
             <button
               type="button"
@@ -1132,6 +1322,8 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           </div>
         )}
       </div>
+        </>
+      )}
 
       {/* پاپ‌آپ پیش‌نمایش فایل */}
       <FilePreviewModal file={previewFile} onClose={() => setPreviewFile(null)} />

@@ -47,6 +47,7 @@ import { DailyTasksChecklist } from './DailyTasksChecklist';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
 import { MonthlyStatementSection } from './MonthlyStatementSection';
 import { NotificationSettingsGuideSection } from './MobileNotificationHelper';
+import { updateAppNotificationBadge } from './BrandLogo';
 import {
   LayoutDashboard,
   Clock,
@@ -85,6 +86,57 @@ type ManagerTab =
   | 'settings';
 
 type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms' | 'guide';
+
+type ManagerDashCard =
+  | 'approvals'
+  | 'reports_tasks'
+  | 'quick_message'
+  | 'monthly_statement'
+  | 'live_kpis'
+  | 'chart';
+
+type ManagerAttCard = 'calendar' | 'daily_table' | 'leaves' | 'manual_excel';
+type ManagerRepCard = 'daily_reports' | 'tasks_checklist';
+type ManagerFinCard = 'transactions' | 'add_payment' | 'monthly_statement';
+
+const DEFAULT_MANAGER_SETTINGS: SystemSettings = {
+  id: 1,
+  collaboration_start_shamsi: '1405/07/15',
+  shift_start_time: '07:00',
+  shift_end_time: '15:00',
+  thursday_shift_start_time: '07:00',
+  thursday_shift_end_time: '14:00',
+  overtime_start_time: '15:00',
+  thursday_overtime_start_time: '14:00',
+  overtime_before_shift: false,
+  grace_period_minutes: 0,
+  break_duration_minutes: 0,
+  working_days: [6, 0, 1, 2, 3, 4],
+  official_holidays: [],
+  timezone: 'Asia/Tehran',
+  mission_policy: 'PAID_AS_WORK',
+  friday_holiday_policy: 'ALL_OVERTIME',
+  monthly_leave_quota_days: 2.5,
+  base_salary_toman: 0,
+  hourly_rate_toman: null,
+  overtime_calc_mode: 'FIXED_RATE',
+  overtime_percentage: 140,
+  overtime_rate_toman: 0,
+  late_deduction_unit: 'MINUTE',
+  late_deduction_rate_toman: null,
+  absence_deduction_unit: 'DAY',
+  absence_deduction_rate_toman: null,
+  sms_enabled: false,
+  sms_on_task_and_message: true,
+  melipayamak_username: '',
+  melipayamak_password: '',
+  melipayamak_from_number: '',
+  melipayamak_is_flash: false,
+  worker_phone_number: '',
+  rules_confirmed_by_manager: true,
+  effective_from_shamsi: '1405/07/15',
+  banner_bg_url: null,
+};
 
 interface DashboardResponse {
   ok: boolean;
@@ -239,6 +291,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   onUserAvatarChange,
 }) => {
   const [activeTab, setActiveTab] = useState<ManagerTab>('dashboard');
+  const [activeDashCard, setActiveDashCard] = useState<ManagerDashCard>('approvals');
+  const [activeAttCard, setActiveAttCard] = useState<ManagerAttCard>('calendar');
+  const [activeRepCard, setActiveRepCard] = useState<ManagerRepCard>('daily_reports');
+  const [activeFinCard, setActiveFinCard] = useState<ManagerFinCard>('transactions');
   const [settingsSubTab, setSettingsSubTab] = useState<SettingsSubTab>('schedule');
   const [chartPeriod, setChartPeriod] = useState<'weekly' | 'monthly' | 'yearly'>('weekly');
   const [dashReportFilter, setDashReportFilter] = useState<'today_and_recent' | 'today' | 'previous'>(
@@ -256,7 +312,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [leaveQuota, setLeaveQuota] = useState<LeaveQuotaSummary | null>(null);
   const [reports, setReports] = useState<DailyWorkReport[]>([]);
   const [transactions, setTransactions] = useState<FinancialTransaction[]>([]);
-  const [settingsForm, setSettingsForm] = useState<SystemSettings | null>(null);
+  const [settingsForm, setSettingsForm] = useState<SystemSettings>(DEFAULT_MANAGER_SETTINGS);
+  const [settingsLoadedFromServer, setSettingsLoadedFromServer] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
@@ -389,11 +446,27 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     try {
       const dashRes = await apiRequest<DashboardResponse>('/api/manager/dashboard');
       setDashboard(dashRes);
-      setSettingsForm((prev) => (syncSettings || prev === null ? dashRes.settings : prev));
+      if (dashRes.settings) {
+        setSettingsForm((prev) =>
+          syncSettings || !settingsLoadedFromServer ? dashRes.settings : prev
+        );
+        setSettingsLoadedFromServer(true);
+      }
     } catch (err) {
+      try {
+        const settingsRes = await apiRequest<{ ok: boolean; settings: SystemSettings }>(
+          '/api/settings'
+        );
+        if (settingsRes?.settings) {
+          setSettingsForm(settingsRes.settings);
+          setSettingsLoadedFromServer(true);
+        }
+      } catch {
+        // Keep default settings so UI remains usable
+      }
       setFeedback({ type: 'error', text: (err as Error).message });
     }
-  }, []);
+  }, [settingsLoadedFromServer]);
 
   const loadAttendanceList = useCallback(async () => {
     try {
@@ -1162,6 +1235,114 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     pendingHistoricalCount +
     pendingLateDays.length;
 
+  const managerBadgeCount =
+    totalPendingClaimsCount +
+    (unseen?.unreadCorrespondenceCount || 0) +
+    (unseen?.unseenReportsCount || 0);
+
+  useEffect(() => {
+    updateAppNotificationBadge(managerBadgeCount);
+  }, [managerBadgeCount]);
+
+  const effectiveDashboard = React.useMemo<DashboardResponse>(() => {
+    if (dashboard) return dashboard;
+    const approvedTxs = transactions.filter((t) => t.status === 'APPROVED');
+    const pendingTxs = transactions.filter((t) => t.status === 'PENDING');
+    const netWorkMins =
+      attendanceSummaries.reduce((s, d) => s + (d.net_work_minutes || 0), 0) +
+      historicalRecords
+        .filter((h) => h.status === 'APPROVED')
+        .reduce((s, h) => s + (h.net_work_minutes || 0), 0);
+    const otMins =
+      attendanceSummaries.reduce((s, d) => s + (d.overtime_minutes || 0), 0) +
+      historicalRecords
+        .filter((h) => h.status === 'APPROVED')
+        .reduce((s, h) => s + (h.overtime_minutes || 0), 0);
+    const workDays =
+      attendanceSummaries.filter((d) => d.net_work_minutes > 0 || d.logs.length > 0).length +
+      historicalRecords
+        .filter((h) => h.status === 'APPROVED')
+        .reduce((s, h) => s + (h.work_days_count || 0), 0);
+    return {
+      ok: true,
+      serverTime: { shamsiDate: initialShamsiDate, timeHHMM: '' },
+      liveState: {
+        status: 'FINISHED',
+        status_text: 'وضعیت حضور پرسنل (امید میثمی)',
+        status_detail: 'آماده نمایش سوابق و کارکرد',
+        is_overtime_active: false,
+        last_event: null,
+        allowed_next_events: ['WORK_START'],
+        today_summary: {
+          work_date: '',
+          shamsi_date: initialShamsiDate,
+          day_name: '',
+          is_holiday_or_friday: false,
+          is_working_day: true,
+          logs: [],
+          first_in_time: null,
+          last_out_time: null,
+          is_incomplete: false,
+          is_late: false,
+          late_minutes: 0,
+          gross_presence_minutes: 0,
+          mission_minutes: 0,
+          break_deducted_minutes: 0,
+          net_work_minutes: 0,
+          provisional_work_minutes: 0,
+          overtime_minutes: 0,
+          status_label: 'آماده',
+        },
+      },
+      kpis: {
+        approvedPaymentsToman: approvedTxs.reduce((s, t) => s + (t.amount_toman || 0), 0),
+        pendingPaymentsToman: pendingTxs.reduce((s, t) => s + (t.amount_toman || 0), 0),
+        pendingPaymentsCount: pendingTxs.length,
+        totalNetWorkMinutes: netWorkMins,
+        totalOvertimeMinutes: otMins,
+        totalWorkDays: workDays,
+        incompleteDaysCount: attendanceSummaries.filter((d) => d.is_incomplete).length,
+        baseSalaryToman: settingsForm.base_salary_toman || 0,
+        effectiveHourlyRateToman: 0,
+        effectiveOvertimeHourlyRateToman: settingsForm.overtime_rate_toman || 0,
+        earnedRegularWorkToman: 0,
+        totalOvertimePayToman: 0,
+        totalLateDeductionToman: 0,
+        totalSalaryPlusOvertimeToman: 0,
+      },
+      unseenAlerts: {
+        financeAlert: pendingFinanceCount > 0,
+        pendingFinanceCount,
+        reportsAlert: reports.some((r) => !r.is_seen_by_manager),
+        unseenReportsCount: reports.filter((r) => !r.is_seen_by_manager).length,
+        historicalAlert: pendingHistoricalCount + pendingLeavesCount > 0,
+        pendingHistoricalCount: pendingHistoricalCount + pendingLeavesCount,
+        lateAlert: pendingLateDays.length > 0,
+        pendingLateCount: pendingLateDays.length,
+        correspondenceAlert: false,
+        unreadCorrespondenceCount: 0,
+      },
+      charts: {
+        weekly: [],
+        monthly: [],
+      },
+      recentSummaries: attendanceSummaries.slice(0, 10),
+      settings: settingsForm,
+    };
+  }, [
+    dashboard,
+    transactions,
+    attendanceSummaries,
+    historicalRecords,
+    initialShamsiDate,
+    settingsForm,
+    pendingFinanceCount,
+    reports,
+    pendingHistoricalCount,
+    pendingLeavesCount,
+    pendingLateDays.length,
+  ]);
+
   // استخراج ماه‌های موجود در جدول تردد برای فیلتر ماهانه در پنل مدیر
   const availableMgrHistoryMonths = React.useMemo(() => {
     const map = new Map<string, { key: string; year: number; month: number; count: number }>();
@@ -1215,12 +1396,12 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   }, [mgrMonthFilteredSummaries, showAllMgrMonthHistory]);
 
   return (
-    <div className="max-w-5xl mx-auto px-3 sm:px-4 pt-3 pb-24 space-y-3.5">
+    <div className="max-w-5xl mx-auto px-3 sm:px-4 pt-3 pb-24 space-y-3.5 overflow-x-hidden">
       {/* بنر اصلی سرمه‌ای و طلایی */}
       <HeroBanner
         role="manager"
-        shamsiDate={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-        timeHHMM={dashboard?.serverTime.timeHHMM || ''}
+        shamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+        timeHHMM={effectiveDashboard.serverTime.timeHHMM || ''}
         bannerBgUrl={bannerBgUrl}
         userAvatarUrl={user.avatar_url}
         onRefresh={refreshAll}
@@ -1228,12 +1409,12 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
       />
 
       {/* هشدار هوشمند در صورت فراموشی ثبت خروج پرسنل */}
-      {dashboard?.liveState?.forgotten_checkout_warning &&
-        dashboard.liveState.forgotten_checkout_message && (
+      {effectiveDashboard.liveState?.forgotten_checkout_warning &&
+        effectiveDashboard.liveState.forgotten_checkout_message && (
           <div className="rounded-2xl bg-amber-50 border border-amber-300 px-3.5 py-2.5 flex items-center justify-between gap-2 text-xs text-amber-950 shadow-2xs">
             <div className="flex items-center gap-2 font-bold">
               <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-              <span>{dashboard.liveState.forgotten_checkout_message}</span>
+              <span>{effectiveDashboard.liveState.forgotten_checkout_message}</span>
             </div>
             <button
               type="button"
@@ -1256,7 +1437,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             {unseen?.financeAlert && (
               <button
                 type="button"
-                onClick={() => handleSelectTab('finance')}
+                onClick={() => {
+                  setActiveTab('dashboard');
+                  setActiveDashCard('approvals');
+                  setDashClaimFilter('pending');
+                }}
                 className="px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-300 text-amber-900 font-semibold flex items-center gap-1 cursor-pointer"
               >
                 <GoldenBlinkDot />
@@ -1266,7 +1451,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             {unseen?.reportsAlert && (
               <button
                 type="button"
-                onClick={() => handleSelectTab('reports')}
+                onClick={() => {
+                  setActiveTab('dashboard');
+                  setActiveDashCard('reports_tasks');
+                }}
                 className="px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-900 font-semibold flex items-center gap-1 cursor-pointer"
               >
                 <GoldenBlinkDot />
@@ -1276,7 +1464,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             {unseen?.historicalAlert && (
               <button
                 type="button"
-                onClick={() => handleSelectTab('attendance')}
+                onClick={() => {
+                  setActiveTab('dashboard');
+                  setActiveDashCard('approvals');
+                  setDashClaimFilter('leaves');
+                }}
                 className="px-2.5 py-1 rounded-lg bg-sky-50 border border-sky-300 text-sky-900 font-semibold flex items-center gap-1 cursor-pointer"
               >
                 <GoldenBlinkDot />
@@ -1288,6 +1480,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 type="button"
                 onClick={() => {
                   setActiveTab('dashboard');
+                  setActiveDashCard('approvals');
                   setDashClaimFilter('late');
                 }}
                 className="px-2.5 py-1 rounded-lg bg-orange-50 border border-orange-300 text-orange-950 font-semibold flex items-center gap-1 cursor-pointer"
@@ -1312,22 +1505,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         </div>
       )}
 
-      {/* کادر وضعیت لحظه‌ای پرسنل: امید میثمی + لیست پرداختی‌های تأییدشده در اولین نگاه */}
-      {dashboard?.liveState && (
-        <WorkerStatusAvatar
-          status={dashboard.liveState.status}
-          statusText={dashboard.liveState.status_text}
-          statusDetail={dashboard.liveState.status_detail}
-          isOvertimeActive={dashboard.liveState.is_overtime_active}
-          workerAvatarUrl={dashboard.liveState.worker_profile?.avatar_url}
-          approvedPaymentsToman={dashboard.kpis.approvedPaymentsToman}
-          approvedTransactions={transactions.filter((t) => t.status === 'APPROVED')}
-          pendingPaymentsCount={dashboard.kpis.pendingPaymentsCount}
-          workerPhone={dashboard.liveState.worker_profile?.phone_number}
-          onOpenFinance={() => handleSelectTab('finance')}
-        />
-      )}
-
       {feedback && (
         <div
           role="alert"
@@ -1348,38 +1525,386 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         </div>
       )}
 
-      {loading && !dashboard ? (
-        <div className="rounded-2xl bg-white border border-slate-200 p-8 text-center text-xs text-slate-500">
-          در حال بارگذاری اطلاعات...
-        </div>
-      ) : (
-        <>
-          {activeTab === 'dashboard' && !dashboard && (
-            <div className="rounded-2xl bg-white border border-slate-200 p-6 text-center space-y-3 shadow-2xs">
-              <p className="text-xs font-bold text-[#0B192C]">
-                اطلاعات داشبورد هنوز بارگذاری نشده است.
-              </p>
-              <button
-                type="button"
-                onClick={() => loadDashboardAndSettings()}
-                className="min-h-[38px] px-5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
-              >
-                بارگذاری مجدد داشبورد
-              </button>
-            </div>
-          )}
+      {/* ================= تب ۱: داشبورد مدیریت با ۶ کارت رنگی در ۲ ردیف و نمایش بخش انتخابی ================= */}
+      <>
+        {activeTab === 'dashboard' && (
+          <div className="space-y-3.5">
+            {/* کادر وضعیت لحظه‌ای پرسنل در بالای داشبورد */}
+            <WorkerStatusAvatar
+              status={effectiveDashboard.liveState.status}
+              statusText={effectiveDashboard.liveState.status_text}
+              statusDetail={effectiveDashboard.liveState.status_detail}
+              isOvertimeActive={effectiveDashboard.liveState.is_overtime_active}
+              workerAvatarUrl={effectiveDashboard.liveState.worker_profile?.avatar_url}
+              approvedPaymentsToman={effectiveDashboard.kpis.approvedPaymentsToman}
+              approvedTransactions={transactions.filter((t) => t.status === 'APPROVED')}
+              pendingPaymentsCount={effectiveDashboard.kpis.pendingPaymentsCount}
+              workerPhone={effectiveDashboard.liveState.worker_profile?.phone_number}
+              onOpenFinance={() => handleSelectTab('finance')}
+            />
 
-          {/* ================= تب ۱: صفحه اول مدیریت (مکاتبات ← گزارش کار ← مطالبات ← نمودار روند کلی) ================= */}
-          {activeTab === 'dashboard' && dashboard && (
-            <div className="space-y-4">
-              {/* ۱. بخش مکاتبات کاری با چیدمان حرفه‌ای و دسترسی آسان بلافاصله پس از کادر وضعیت پرسنل */}
+            {/* شبکه ۲ ردیفه و ۳ ستونه کارت‌های کوچک و رنگی داشبورد */}
+            <div className="rounded-2xl bg-white border border-slate-200 p-3 shadow-2xs space-y-2.5">
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <span className="text-xs font-extrabold text-[#0B192C]">
+                  بخش‌های داشبورد مدیریت (برای مشاهده روی کارت کلیک کنید)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => refreshAll()}
+                  className="text-[11px] font-bold text-[#9A7428] hover:text-[#0B192C] cursor-pointer"
+                >
+                  بروزرسانی سریع
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                {/* کارت ۱: مطالبات، مرخصی و تأخیرها */}
+                <button
+                  type="button"
+                  onClick={() => setActiveDashCard('approvals')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                    activeDashCard === 'approvals'
+                      ? 'bg-gradient-to-br from-amber-500 to-orange-600 text-white border-amber-600 shadow-md scale-[1.01]'
+                      : 'bg-gradient-to-br from-amber-50 via-white to-orange-50/70 text-[#0B192C] border-amber-200 hover:border-amber-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5 w-full">
+                    <div
+                      className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                        activeDashCard === 'approvals'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-amber-100 text-amber-800'
+                      }`}
+                    >
+                      <Wallet className="w-4 h-4" />
+                    </div>
+                    {totalPendingClaimsCount > 0 && (
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold tabular-nums ${
+                          activeDashCard === 'approvals'
+                            ? 'bg-white text-orange-700'
+                            : 'bg-rose-600 text-white animate-pulse'
+                        }`}
+                      >
+                        {toPersianDigits(totalPendingClaimsCount)} منتظر
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-xs font-extrabold leading-tight">
+                      مطالبات و تأییدیه‌ها
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 truncate ${
+                        activeDashCard === 'approvals' ? 'text-amber-100' : 'text-slate-500'
+                      }`}
+                    >
+                      مرخصی، تنخواه، مساعده و تأخیر
+                    </div>
+                  </div>
+                </button>
+
+                {/* کارت ۲: گزارش کار روزانه */}
+                <button
+                  type="button"
+                  onClick={() => setActiveDashCard('reports_tasks')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                    activeDashCard === 'reports_tasks'
+                      ? 'bg-gradient-to-br from-emerald-600 to-teal-700 text-white border-emerald-700 shadow-md scale-[1.01]'
+                      : 'bg-gradient-to-br from-emerald-50 via-white to-teal-50/70 text-[#0B192C] border-emerald-200 hover:border-emerald-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5 w-full">
+                    <div
+                      className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                        activeDashCard === 'reports_tasks'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-emerald-100 text-emerald-800'
+                      }`}
+                    >
+                      <FileText className="w-4 h-4" />
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold tabular-nums ${
+                        activeDashCard === 'reports_tasks'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-emerald-100 text-emerald-900'
+                      }`}
+                    >
+                      {toPersianDigits(reports.length)} گزارش
+                    </span>
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-xs font-extrabold leading-tight">
+                      گزارش کار روزانه
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 truncate ${
+                        activeDashCard === 'reports_tasks' ? 'text-emerald-100' : 'text-slate-500'
+                      }`}
+                    >
+                      گزارش‌های امروز و روزهای قبل
+                    </div>
+                  </div>
+                </button>
+
+                {/* کارت ۳: ارسال سریع پیام و برنامه کاری (ادغام‌شده) */}
+                <button
+                  type="button"
+                  onClick={() => setActiveDashCard('quick_message')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                    activeDashCard === 'quick_message'
+                      ? 'bg-gradient-to-br from-purple-600 to-indigo-700 text-white border-purple-700 shadow-md scale-[1.01]'
+                      : 'bg-gradient-to-br from-purple-50 via-white to-indigo-50/70 text-[#0B192C] border-purple-200 hover:border-purple-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5 w-full">
+                    <div
+                      className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                        activeDashCard === 'quick_message'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-purple-100 text-purple-800'
+                      }`}
+                    >
+                      <MessageSquare className="w-4 h-4" />
+                    </div>
+                    {(unseen?.unreadCorrespondenceCount || 0) > 0 && (
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold tabular-nums ${
+                          activeDashCard === 'quick_message'
+                            ? 'bg-white text-purple-700'
+                            : 'bg-purple-600 text-white'
+                        }`}
+                      >
+                        {toPersianDigits(unseen?.unreadCorrespondenceCount || 0)} پیام جدید
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-xs font-extrabold leading-tight">
+                      ارسال پیام و برنامه کاری
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 truncate ${
+                        activeDashCard === 'quick_message' ? 'text-purple-100' : 'text-slate-500'
+                      }`}
+                    >
+                      ثبت برنامه کاری یا پیام به پرسنل
+                    </div>
+                  </div>
+                </button>
+
+                {/* کارت ۴: صورتحساب ماهانه */}
+                <button
+                  type="button"
+                  onClick={() => setActiveDashCard('monthly_statement')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                    activeDashCard === 'monthly_statement'
+                      ? 'bg-gradient-to-br from-sky-600 to-blue-700 text-white border-sky-700 shadow-md scale-[1.01]'
+                      : 'bg-gradient-to-br from-sky-50 via-white to-blue-50/70 text-[#0B192C] border-sky-200 hover:border-sky-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5 w-full">
+                    <div
+                      className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                        activeDashCard === 'monthly_statement'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-sky-100 text-sky-800'
+                      }`}
+                    >
+                      <Coins className="w-4 h-4" />
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+                        activeDashCard === 'monthly_statement'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-sky-100 text-sky-900'
+                      }`}
+                    >
+                      تفکیک ماهانه
+                    </span>
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-xs font-extrabold leading-tight">
+                      صورتحساب ماهانه
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 truncate ${
+                        activeDashCard === 'monthly_statement' ? 'text-sky-100' : 'text-slate-500'
+                      }`}
+                    >
+                      حقوق، اضافه‌کاری و پرداختی هر ماه
+                    </div>
+                  </div>
+                </button>
+
+                {/* کارت ۵: خلاصه ساعات کاری و شیفت */}
+                <button
+                  type="button"
+                  onClick={() => setActiveDashCard('live_kpis')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                    activeDashCard === 'live_kpis'
+                      ? 'bg-gradient-to-br from-[#0B192C] to-[#1D3557] text-[#C5A059] border-[#C5A059] shadow-md scale-[1.01]'
+                      : 'bg-gradient-to-br from-[#FCF9F2] via-white to-amber-50/60 text-[#0B192C] border-[#C5A059]/60 hover:border-[#C5A059]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5 w-full">
+                    <div
+                      className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                        activeDashCard === 'live_kpis'
+                          ? 'bg-[#C5A059]/20 text-[#C5A059]'
+                          : 'bg-[#0B192C] text-[#C5A059]'
+                      }`}
+                    >
+                      <Clock className="w-4 h-4" />
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold tabular-nums ${
+                        activeDashCard === 'live_kpis'
+                          ? 'bg-[#C5A059]/25 text-[#F6E2B3]'
+                          : 'bg-amber-100 text-[#9A7428]'
+                      }`}
+                    >
+                      {toPersianDigits(effectiveDashboard.kpis.totalWorkDays)} روز کاری
+                    </span>
+                  </div>
+                  <div className="mt-2">
+                    <div
+                      className={`text-xs font-extrabold leading-tight ${
+                        activeDashCard === 'live_kpis' ? 'text-white' : 'text-[#0B192C]'
+                      }`}
+                    >
+                      خلاصه کارکرد و اضافه‌کاری
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 truncate tabular-nums ${
+                        activeDashCard === 'live_kpis' ? 'text-[#F6E2B3]' : 'text-slate-500'
+                      }`}
+                    >
+                      کارکرد: {formatMinutesToHHMM(effectiveDashboard.kpis.totalNetWorkMinutes)} | اضافه‌کاری:{' '}
+                      {formatMinutesToHHMM(effectiveDashboard.kpis.totalOvertimeMinutes)}
+                    </div>
+                  </div>
+                </button>
+
+                {/* کارت ۶: نمودار روند فعالیت */}
+                <button
+                  type="button"
+                  onClick={() => setActiveDashCard('chart')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                    activeDashCard === 'chart'
+                      ? 'bg-gradient-to-br from-rose-600 to-pink-700 text-white border-rose-700 shadow-md scale-[1.01]'
+                      : 'bg-gradient-to-br from-rose-50 via-white to-pink-50/70 text-[#0B192C] border-rose-200 hover:border-rose-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5 w-full">
+                    <div
+                      className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                        activeDashCard === 'chart'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-rose-100 text-rose-800'
+                      }`}
+                    >
+                      <LayoutDashboard className="w-4 h-4" />
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+                        activeDashCard === 'chart'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-rose-100 text-rose-900'
+                      }`}
+                    >
+                      هفتگی / ماهانه
+                    </span>
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-xs font-extrabold leading-tight">
+                      نمودار روند فعالیت
+                    </div>
+                    <div
+                      className={`text-[10px] mt-0.5 truncate ${
+                        activeDashCard === 'chart' ? 'text-rose-100' : 'text-slate-500'
+                      }`}
+                    >
+                      آمار تصویری حضور و اضافه‌کاری
+                    </div>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            {/* محتوای کارت انتخاب‌شده در داشبورد (ارسال یکپارچه پیام و برنامه کاری) */}
+            {activeDashCard === 'quick_message' && (
               <WorkCorrespondenceSection
                 role="manager"
                 todayShamsi={currentShamsi}
+                mode="dashboard_composer"
                 onUnreadChange={() => loadDashboardAndSettings()}
+                onOpenFullCorrespondence={() => handleSelectTab('correspondence')}
               />
+            )}
 
-              {/* ۲. بخش مشاهده گزارش کار امروز و روزهای قبل */}
+            {activeDashCard === 'live_kpis' && (
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="rounded-2xl bg-gradient-to-br from-sky-50 via-white to-cyan-50/70 border border-sky-200 p-3.5 space-y-1 shadow-2xs">
+                  <div className="text-[11px] font-semibold text-sky-800">
+                    مجموع ساعات کاری خالص
+                  </div>
+                  <div className="text-sm sm:text-base font-extrabold text-[#0B192C] tabular-nums">
+                    {formatMinutesToDurationPersian(effectiveDashboard.kpis.totalNetWorkMinutes)}
+                  </div>
+                  <div className="text-[11px] text-slate-600 pt-1 border-t border-sky-100 tabular-nums">
+                    معادل {formatMinutesToHHMM(effectiveDashboard.kpis.totalNetWorkMinutes)} ساعت
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-gradient-to-br from-amber-50 via-white to-yellow-50/70 border border-amber-300 p-3.5 space-y-1 shadow-2xs">
+                  <div className="text-[11px] font-semibold text-amber-900">
+                    مجموع اضافه‌کاری تأییدشده
+                  </div>
+                  <div className="text-sm sm:text-base font-extrabold text-[#9A7428] tabular-nums">
+                    {formatMinutesToDurationPersian(effectiveDashboard.kpis.totalOvertimeMinutes)}
+                  </div>
+                  <div className="text-[11px] text-slate-600 pt-1 border-t border-amber-100 tabular-nums truncate">
+                    {effectiveDashboard.kpis.totalOvertimePayToman > 0
+                      ? `مبلغ: ${formatToman(effectiveDashboard.kpis.totalOvertimePayToman)}`
+                      : `معادل ${formatMinutesToHHMM(effectiveDashboard.kpis.totalOvertimeMinutes)}`}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-gradient-to-br from-purple-50 via-white to-pink-50/60 border border-purple-200 p-3.5 space-y-1 shadow-2xs">
+                  <div className="text-[11px] font-semibold text-purple-900">
+                    روزهای کاری ثبت‌شده
+                  </div>
+                  <div className="text-sm sm:text-base font-extrabold text-[#0B192C] tabular-nums">
+                    {toPersianDigits(effectiveDashboard.kpis.totalWorkDays)} روز
+                  </div>
+                  <div className="text-[11px] text-slate-600 pt-1 border-t border-purple-100 tabular-nums">
+                    شروع قرارداد:{' '}
+                    {toPersianDigits(effectiveDashboard.settings.collaboration_start_shamsi)}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-gradient-to-br from-emerald-50 via-white to-teal-50/70 border border-emerald-200 p-3.5 space-y-1 shadow-2xs">
+                  <div className="text-[11px] font-semibold text-emerald-800">
+                    ساعت شیفت و نرخ اضافه‌کاری
+                  </div>
+                  <div className="text-xs sm:text-sm font-extrabold text-[#0B192C] tabular-nums">
+                    {toPersianDigits(effectiveDashboard.settings.shift_start_time)} تا{' '}
+                    {toPersianDigits(effectiveDashboard.settings.shift_end_time)}
+                  </div>
+                  <div className="text-[11px] text-[#9A7428] font-bold pt-1 border-t border-emerald-100 tabular-nums">
+                    نرخ ساعتی:{' '}
+                    {effectiveDashboard.kpis.effectiveOvertimeHourlyRateToman > 0
+                      ? formatToman(effectiveDashboard.kpis.effectiveOvertimeHourlyRateToman)
+                      : 'تعیین نشده'}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeDashCard === 'reports_tasks' && (
               <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3 shadow-2xs">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
                   <div className="flex items-center gap-2">
@@ -1387,7 +1912,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     <div>
                       <h3 className="text-xs sm:text-sm font-extrabold text-[#0B192C] flex items-center gap-1.5">
                         <span>گزارش کار روزانه پرسنل (امروز و روزهای قبل)</span>
-                        {dashboard.unseenAlerts.reportsAlert && <GoldenBlinkDot />}
+                        {effectiveDashboard.unseenAlerts.reportsAlert && <GoldenBlinkDot />}
                       </h3>
                       <p className="text-[10.5px] text-slate-500">
                         بررسی سریع گزارش فعالیت‌های ثبت‌شده امروز ({toPersianDigits(currentShamsi)}) و سوابق روزهای گذشته
@@ -1557,8 +2082,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 )}
               </div>
+            )}
 
-              {/* ۳. بخش مطالبات پرسنل (مرخصی، درخواست تنخواه، مساعده و سایر موارد) با امکان تعیین تکلیف فوری */}
+            {activeDashCard === 'approvals' && (
               <div className="rounded-2xl bg-white border border-[#C5A059]/55 p-4 space-y-3 shadow-2xs">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
                   <div className="flex items-center gap-2">
@@ -1577,7 +2103,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   <div className="flex flex-wrap items-center gap-1.5">
                     <button
                       type="button"
-                      onClick={() => handleSelectTab('finance')}
+                      onClick={() => {
+                        handleSelectTab('finance');
+                        setActiveFinCard('add_payment');
+                      }}
                       className="min-h-[30px] px-2.5 rounded-xl bg-[#0B192C] text-[#C5A059] text-[11px] font-bold cursor-pointer"
                     >
                       + ثبت پرداخت / مساعده / هزینه
@@ -1728,7 +2257,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                   return (
                     <div className="space-y-2.5">
-                      {/* الف-۰) تأخیرهای ورود پرسنل و تعیین تکلیف توسط مدیر */}
                       {displayedLateDays.length > 0 && (
                         <div className="space-y-2">
                           {displayedLateDays.map((day) => {
@@ -1810,7 +2338,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         </div>
                       )}
 
-                      {/* الف) درخواست‌های مرخصی */}
                       {displayedLeaves.length > 0 && (
                         <div className="space-y-2">
                           {displayedLeaves.map((lv) => (
@@ -1890,7 +2417,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         </div>
                       )}
 
-                      {/* ب) مطالبات مالی: تنخواه، مساعده، علی‌الحساب، هزینه‌های متفرقه و حقوق */}
                       {displayedTxs.length > 0 && (
                         <div className="space-y-2">
                           {displayedTxs.map((tx) => (
@@ -1997,7 +2523,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         </div>
                       )}
 
-                      {/* ج) سوابق کارکرد قبلی در انتظار تأیید */}
                       {filteredHistorical.length > 0 && (
                         <div className="space-y-2">
                           {filteredHistorical.map((rec) => (
@@ -2068,19 +2593,21 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   );
                 })()}
               </div>
+            )}
 
-              {/* ۳-ب. صورتحساب دقیق هر ماه / دوره کاری (حقوق + اضافه‌کاری و جمع پرداختی مدیر به تفکیک ماه) */}
+            {activeDashCard === 'monthly_statement' && (
               <MonthlyStatementSection
                 role="manager"
                 currentShamsiDate={currentShamsi}
-                collaborationStartShamsi={dashboard.settings.collaboration_start_shamsi}
+                collaborationStartShamsi={effectiveDashboard.settings.collaboration_start_shamsi}
                 dailySummaries={attendanceSummaries}
                 historicalRecords={historicalRecords}
                 transactions={transactions}
-                settings={dashboard.settings}
+                settings={effectiveDashboard.settings}
               />
+            )}
 
-              {/* ۴. نمودار زیبای روند کلی فعالیت با حالات هفتگی، ماهانه و سالانه و تفکیک رنگی در یک نگاه */}
+            {activeDashCard === 'chart' && (
               <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3.5 shadow-2xs">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
                   <div>
@@ -2092,7 +2619,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     </p>
                   </div>
 
-                  {/* کلیدهای سه‌حالته هفتگی، ماهانه و سالانه */}
                   <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100">
                     <button
                       type="button"
@@ -2130,7 +2656,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 </div>
 
-                {/* راهنمای رنگ‌ها و خلاصه مجموع دوره انتخاب‌شده + مجموع کارکرد و پرداختی کل تا تاریخ روز */}
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
                   <div className="rounded-xl bg-emerald-50/80 border border-emerald-200 px-3 py-2 flex items-center justify-between">
                     <div className="flex items-center gap-1.5">
@@ -2176,14 +2701,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     <div className="flex items-center gap-1.5 min-w-0">
                       <span className="w-2.5 h-2.5 rounded-full bg-[#C5A059] shrink-0" />
                       <span className="text-[11px] font-bold text-[#0B192C] truncate">
-                        مجموع کارکرد تا تاریخ روز (حقوق + اضافه‌کاری)
+                        مجموع کارکرد تا تاریخ روز
                       </span>
                     </div>
                     <strong className="text-[#0B192C] font-extrabold tabular-nums whitespace-nowrap">
                       {formatToman(
-                        dashboard.kpis.totalSalaryPlusOvertimeToman ??
-                          (dashboard.kpis.earnedRegularWorkToman ?? 0) +
-                            dashboard.kpis.totalOvertimePayToman
+                        effectiveDashboard.kpis.totalSalaryPlusOvertimeToman ??
+                          (effectiveDashboard.kpis.earnedRegularWorkToman ?? 0) +
+                            effectiveDashboard.kpis.totalOvertimePayToman
                       )}
                     </strong>
                   </div>
@@ -2196,7 +2721,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       </span>
                     </div>
                     <strong className="text-teal-800 font-extrabold tabular-nums whitespace-nowrap">
-                      {formatToman(dashboard.kpis.approvedPaymentsToman)}
+                      {formatToman(effectiveDashboard.kpis.approvedPaymentsToman)}
                     </strong>
                   </div>
                 </div>
@@ -2207,9 +2732,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </p>
                 ) : (
                   <div className="space-y-3">
-                    {/* نمودار ستونی عمودی چندرنگ برای دید سریع در یک نگاه */}
                     <div className="rounded-2xl bg-gradient-to-b from-slate-50/90 to-[#FCF9F2]/60 border border-slate-200/80 p-3.5 overflow-x-auto">
-                      <div className="min-w-[500px] h-40 flex items-end justify-between gap-1.5 pt-4 pb-1 px-1">
+                      <div className="min-w-[300px] h-40 flex items-end justify-between gap-1.5 pt-4 pb-1 px-1">
                         {activityTrendData.map((item) => {
                           const netH = Math.min(
                             100,
@@ -2237,7 +2761,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                             <div
                               key={item.key}
                               title={`${item.label} (${item.subLabel}) — کارکرد: ${toPersianDigits(item.netHours)} ساعت | اضافه‌کاری: ${toPersianDigits(item.overtimeHours)} ساعت | گزارش: ${toPersianDigits(item.reportsCount)} | مرخصی: ${toPersianDigits(item.leavesCount)}`}
-                              className="flex-1 flex flex-col items-center gap-1.5 h-full justify-end group min-w-[26px]"
+                              className="flex-1 flex flex-col items-center gap-1.5 h-full justify-end group min-w-[22px]"
                             >
                               <div className="w-full max-w-[28px] h-28 rounded-t-lg bg-slate-200/60 overflow-hidden flex flex-col justify-end p-0.5 gap-0.5">
                                 {lvH > 0 && (
@@ -2277,7 +2801,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       </div>
                     </div>
 
-                    {/* ردیف‌های تفکیکی با رنگ‌های مشخص برای خوانایی دقیق */}
                     <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
                       {activityTrendData
                         .filter(
@@ -2367,14 +2890,131 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 )}
               </div>
-            </div>
-          )}
+            )}
+          </div>
+        )}
 
           {/* ================= تب ۲: تردد، خلاصه ساعات کاری و اضافه‌کاری، تقویم کارکرد، مرخصی‌ها و اکسل ================= */}
           {activeTab === 'attendance' && (
             <div className="space-y-4">
-              {/* خلاصه کل ساعات کاری، اضافه‌کاری، روزهای کاری و جزئیات شیفت و قرارداد (منتقل‌شده از صفحه اول به تب تردد) */}
-              {dashboard && (
+              {/* کارت‌های رنگی انتخاب بخش در تب تردد و مرخصی */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setActiveAttCard('calendar')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeAttCard === 'calendar'
+                      ? 'bg-gradient-to-br from-sky-600 to-blue-700 text-white border-sky-700 shadow-md'
+                      : 'bg-gradient-to-br from-sky-50 via-white to-blue-50/70 text-[#0B192C] border-sky-200 hover:border-sky-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <CalendarClock className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold opacity-85">تقویم ماهانه</span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">تقویم و خلاصه کارکرد</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeAttCard === 'calendar' ? 'text-sky-100' : 'text-slate-500'
+                      }`}
+                    >
+                      نمای تصویری روزهای کاری
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveAttCard('daily_table')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeAttCard === 'daily_table'
+                      ? 'bg-gradient-to-br from-[#0B192C] to-[#1D3557] text-[#C5A059] border-[#C5A059] shadow-md'
+                      : 'bg-gradient-to-br from-[#FCF9F2] via-white to-amber-50/60 text-[#0B192C] border-[#C5A059]/60 hover:border-[#C5A059]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <Clock className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold opacity-85">ورود و خروج</span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div
+                      className={`text-xs font-extrabold ${
+                        activeAttCard === 'daily_table' ? 'text-white' : 'text-[#0B192C]'
+                      }`}
+                    >
+                      جدول تردد و ثبت دستی
+                    </div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeAttCard === 'daily_table' ? 'text-[#F6E2B3]' : 'text-slate-500'
+                      }`}
+                    >
+                      مشاهده و اصلاح ساعات روزانه
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveAttCard('leaves')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeAttCard === 'leaves'
+                      ? 'bg-gradient-to-br from-teal-600 to-emerald-700 text-white border-teal-700 shadow-md'
+                      : 'bg-gradient-to-br from-teal-50 via-white to-emerald-50/70 text-[#0B192C] border-teal-200 hover:border-teal-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <FileText className="w-4 h-4 shrink-0" />
+                    {pendingLeavesCount > 0 && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[9.5px] font-extrabold bg-rose-600 text-white">
+                        {toPersianDigits(pendingLeavesCount)} جدید
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">مرخصی روزانه و ساعتی</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeAttCard === 'leaves' ? 'text-teal-100' : 'text-slate-500'
+                      }`}
+                    >
+                      بررسی مرخصی و مانده سهمیه
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveAttCard('manual_excel')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeAttCard === 'manual_excel'
+                      ? 'bg-gradient-to-br from-purple-600 to-indigo-700 text-white border-purple-700 shadow-md'
+                      : 'bg-gradient-to-br from-purple-50 via-white to-indigo-50/70 text-[#0B192C] border-purple-200 hover:border-purple-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <FileSpreadsheet className="w-4 h-4 shrink-0" />
+                    {pendingHistoricalCount > 0 && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[9.5px] font-extrabold bg-amber-500 text-white">
+                        {toPersianDigits(pendingHistoricalCount)} منتظر
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">اکسل و سوابق قبلی</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeAttCard === 'manual_excel' ? 'text-purple-100' : 'text-slate-500'
+                      }`}
+                    >
+                      بارگذاری اکسل و کارکردهای گذشته
+                    </div>
+                  </div>
+                </button>
+              </div>
+
+              {activeAttCard === 'calendar' && (
                 <>
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
                     <div className="rounded-2xl bg-gradient-to-br from-sky-50 via-white to-cyan-50/70 border border-sky-200 p-3.5 space-y-1 shadow-2xs">
@@ -2382,10 +3022,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         مجموع ساعات کاری خالص
                       </div>
                       <div className="text-sm sm:text-base font-extrabold text-[#0B192C] tabular-nums">
-                        {formatMinutesToDurationPersian(dashboard.kpis.totalNetWorkMinutes)}
+                        {formatMinutesToDurationPersian(effectiveDashboard.kpis.totalNetWorkMinutes)}
                       </div>
                       <div className="text-[11px] text-slate-600 pt-1 border-t border-sky-100 tabular-nums">
-                        معادل {formatMinutesToHHMM(dashboard.kpis.totalNetWorkMinutes)} ساعت
+                        معادل {formatMinutesToHHMM(effectiveDashboard.kpis.totalNetWorkMinutes)} ساعت
                       </div>
                     </div>
 
@@ -2394,12 +3034,12 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         مجموع اضافه‌کاری تأییدشده
                       </div>
                       <div className="text-sm sm:text-base font-extrabold text-[#9A7428] tabular-nums">
-                        {formatMinutesToDurationPersian(dashboard.kpis.totalOvertimeMinutes)}
+                        {formatMinutesToDurationPersian(effectiveDashboard.kpis.totalOvertimeMinutes)}
                       </div>
                       <div className="text-[11px] text-slate-600 pt-1 border-t border-amber-100 tabular-nums truncate">
-                        {dashboard.kpis.totalOvertimePayToman > 0
-                          ? `مبلغ: ${formatToman(dashboard.kpis.totalOvertimePayToman)}`
-                          : `معادل ${formatMinutesToHHMM(dashboard.kpis.totalOvertimeMinutes)}`}
+                        {effectiveDashboard.kpis.totalOvertimePayToman > 0
+                          ? `مبلغ: ${formatToman(effectiveDashboard.kpis.totalOvertimePayToman)}`
+                          : `معادل ${formatMinutesToHHMM(effectiveDashboard.kpis.totalOvertimeMinutes)}`}
                       </div>
                     </div>
 
@@ -2408,10 +3048,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         روزهای کاری ثبت‌شده
                       </div>
                       <div className="text-sm sm:text-base font-extrabold text-[#0B192C] tabular-nums">
-                        {toPersianDigits(dashboard.kpis.totalWorkDays)} روز
+                        {toPersianDigits(effectiveDashboard.kpis.totalWorkDays)} روز
                       </div>
                       <div className="text-[11px] text-slate-600 pt-1 border-t border-purple-100 tabular-nums">
-                        شروع قرارداد: {toPersianDigits(dashboard.settings.collaboration_start_shamsi)}
+                        شروع قرارداد: {toPersianDigits(effectiveDashboard.settings.collaboration_start_shamsi)}
                       </div>
                     </div>
 
@@ -2420,43 +3060,46 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         ساعت شیفت و نرخ اضافه‌کاری
                       </div>
                       <div className="text-xs sm:text-sm font-extrabold text-[#0B192C] tabular-nums">
-                        {toPersianDigits(dashboard.settings.shift_start_time)} تا{' '}
-                        {toPersianDigits(dashboard.settings.shift_end_time)}
+                        {toPersianDigits(effectiveDashboard.settings.shift_start_time)} تا{' '}
+                        {toPersianDigits(effectiveDashboard.settings.shift_end_time)}
                       </div>
                       <div className="text-[11px] text-[#9A7428] font-bold pt-1 border-t border-emerald-100 tabular-nums">
                         نرخ ساعتی:{' '}
-                        {dashboard.kpis.effectiveOvertimeHourlyRateToman > 0
-                          ? formatToman(dashboard.kpis.effectiveOvertimeHourlyRateToman)
+                        {effectiveDashboard.kpis.effectiveOvertimeHourlyRateToman > 0
+                          ? formatToman(effectiveDashboard.kpis.effectiveOvertimeHourlyRateToman)
                           : 'تعیین نشده'}
                       </div>
                     </div>
                   </div>
+
+                  {/* ۱. تقویم تصویری کارکرد ماهانه */}
+                  <MonthlyAttendanceCalendar
+                    currentShamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                    dailySummaries={attendanceSummaries}
+                    leaveRequests={leaveRequests}
+                    historicalRecords={historicalRecords}
+                    onMonthChange={(y, m) => {
+                      setSelectedMgrHistoryMonth(`${y}/${String(m).padStart(2, '0')}`);
+                      setShowAllMgrMonthHistory(false);
+                    }}
+                  />
                 </>
               )}
 
-              {/* ۱. تقویم تصویری کارکرد ماهانه */}
-              <MonthlyAttendanceCalendar
-                currentShamsiDate={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-                dailySummaries={attendanceSummaries}
-                leaveRequests={leaveRequests}
-                historicalRecords={historicalRecords}
-                onMonthChange={(y, m) => {
-                  setSelectedMgrHistoryMonth(`${y}/${String(m).padStart(2, '0')}`);
-                  setShowAllMgrMonthHistory(false);
-                }}
-              />
-
               {/* ۲. مدیریت مرخصی‌های روزانه و ساعتی + شمارنده مرخصی استحقاقی */}
-              <LeaveManagementSection
-                role="manager"
-                currentShamsiDate={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-                onUpdated={() => {
-                  loadAttendanceList();
-                  loadDashboardAndSettings();
-                }}
-              />
+              {activeAttCard === 'leaves' && (
+                <LeaveManagementSection
+                  role="manager"
+                  currentShamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                  onUpdated={() => {
+                    loadAttendanceList();
+                    loadDashboardAndSettings();
+                  }}
+                />
+              )}
 
               {/* ۳. فیلتر و ابزارهای ثبت تردد دستی و اکسل */}
+              {(activeAttCard === 'daily_table' || activeAttCard === 'manual_excel') && (
               <div className="rounded-2xl bg-white border border-slate-200 p-4 flex flex-wrap items-end justify-between gap-3">
                 <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-end gap-2.5 w-full sm:w-auto">
                   <div className="w-full sm:w-44">
@@ -2540,6 +3183,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </button>
                 </div>
               </div>
+              )}
 
               {/* فرم افزودن سوابق کارکرد و اضافه‌کاری قبلی */}
               {showPastWorkForm && (
@@ -2920,7 +3564,13 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               )}
 
               {/* فهرست سوابق قبلی کارکرد و فایل‌های اکسل بارگذاری‌شده */}
-              {historicalRecords.length > 0 && (
+              {activeAttCard === 'manual_excel' && historicalRecords.length === 0 && (
+                <div className="rounded-2xl bg-white border border-slate-200 p-6 text-center text-xs text-slate-500">
+                  هنوز فایل اکسل یا سابقه کارکرد قبلی ثبت نشده است. از دکمه‌های بالا برای بارگذاری اکسل یا افزودن سابقه استفاده کنید.
+                </div>
+              )}
+
+              {(activeAttCard === 'manual_excel' || activeAttCard === 'daily_table') && historicalRecords.length > 0 && (
                 <div className="rounded-2xl bg-white border border-[#C5A059]/60 p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-bold text-[#0B192C] flex items-center gap-2">
@@ -3080,6 +3730,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               )}
 
               {/* لیست ترددهای روزانه (فقط ماه انتخاب‌شده + نمایش ۲ روز آخر در حالت بسته) */}
+              {activeAttCard === 'daily_table' && (
               <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2">
                   <div className="flex items-center gap-1.5">
@@ -3101,8 +3752,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     >
                       {availableMgrHistoryMonths.map((m) => (
                         <option key={m.key} value={m.key}>
-                          {SHAMSI_MONTH_NAMES[m.month - 1]} {toPersianDigits(m.year)} (
-                          {toPersianDigits(m.count)} روز)
+                          {SHAMSI_MONTH_NAMES[m.month - 1]} {toPersianDigits(m.year)}
                         </option>
                       ))}
                     </select>
@@ -3314,131 +3964,278 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </>
                 )}
               </div>
+              )}
             </div>
           )}
 
-          {/* ================= تب ۳: چک‌لیست کارها و گزارش‌های روزانه ================= */}
+          {/* ================= تب ۳: برنامه‌های کاری و گزارش‌های روزانه ================= */}
           {activeTab === 'reports' && (
             <div className="space-y-4">
-              {/* ۱. چک‌لیست کارهای روزانه (وظایف محول‌شده از طرف مدیر به پرسنل) */}
-              <DailyTasksChecklist
-                role="manager"
-                currentShamsiDate={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-              />
-
-              {/* ۲. فیلتر و جست‌وجو در گزارش‌های روزانه */}
-              <div className="rounded-2xl bg-white border border-slate-200 p-4 grid grid-cols-2 sm:grid-cols-4 gap-2.5 items-end">
-                <div className="col-span-2 sm:col-span-1">
-                  <label className="block text-xs font-medium text-slate-600 mb-1">
-                    جست‌وجو در متن گزارش
-                  </label>
-                  <input
-                    type="text"
-                    value={repSearch}
-                    onChange={(e) => setRepSearch(e.target.value)}
-                    placeholder="عبارت مورد نظر..."
-                    className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs"
-                  />
-                </div>
-                <ShamsiDatePicker
-                  label="از تاریخ"
-                  value={repFromShamsi}
-                  onChange={setRepFromShamsi}
-                  allowClear
-                  placeholder="همه تاریخ‌ها"
-                  todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-                />
-                <ShamsiDatePicker
-                  label="تا تاریخ"
-                  value={repToShamsi}
-                  onChange={setRepToShamsi}
-                  allowClear
-                  placeholder="همه تاریخ‌ها"
-                  todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-                />
+              {/* کارت‌های انتخاب بخش در تب گزارش‌ها */}
+              <div className="grid grid-cols-2 gap-2.5">
                 <button
                   type="button"
-                  onClick={loadReportsList}
-                  className="col-span-2 sm:col-span-1 min-h-[42px] rounded-xl bg-[#0B192C] text-white text-xs font-semibold cursor-pointer"
+                  onClick={() => setActiveRepCard('daily_reports')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[74px] ${
+                    activeRepCard === 'daily_reports'
+                      ? 'bg-gradient-to-br from-emerald-600 to-teal-700 text-white border-emerald-700 shadow-md'
+                      : 'bg-gradient-to-br from-emerald-50 via-white to-teal-50/70 text-[#0B192C] border-emerald-200 hover:border-emerald-400'
+                  }`}
                 >
-                  جست‌وجو
+                  <div className="flex items-center justify-between gap-1">
+                    <FileText className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold">
+                      {toPersianDigits(reports.length)} گزارش
+                    </span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">گزارش‌های کار روزانه پرسنل</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeRepCard === 'daily_reports' ? 'text-emerald-100' : 'text-slate-500'
+                      }`}
+                    >
+                      مشاهده و جست‌وجو در گزارش‌های امید میثمی
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveRepCard('tasks_checklist')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[74px] ${
+                    activeRepCard === 'tasks_checklist'
+                      ? 'bg-gradient-to-br from-indigo-600 to-purple-700 text-white border-indigo-700 shadow-md'
+                      : 'bg-gradient-to-br from-indigo-50 via-white to-purple-50/70 text-[#0B192C] border-indigo-200 hover:border-indigo-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <Check className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold">برنامه کاری</span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">برنامه‌های کاری پرسنل</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeRepCard === 'tasks_checklist' ? 'text-indigo-100' : 'text-slate-500'
+                      }`}
+                    >
+                      ثبت و پیگیری برنامه‌های کاری و تاریخ تحویل
+                    </div>
+                  </div>
                 </button>
               </div>
 
-              <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3">
-                <h3 className="text-sm font-bold text-[#0B192C] flex items-center gap-2">
-                  {dashboard?.unseenAlerts.reportsAlert && <GoldenBlinkDot />}
-                  <span>گزارش‌های روزانه پرسنل — امید میثمی</span>
-                </h3>
-                {reports.length === 0 ? (
-                  <p className="text-xs text-slate-500 py-5 text-center">گزارشی یافت نشد.</p>
-                ) : (
-                  <div className="divide-y divide-slate-100">
-                    {reports.map((rep) => (
-                      <div key={rep.id} className="py-3 space-y-2">
-                        <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums">
-                          <div className="flex items-center gap-2">
-                            {!rep.is_seen_by_manager && <GoldenBlinkDot title="گزارش جدید" />}
-                            <span className="font-bold text-[#0B192C]">
-                              {toPersianDigits(rep.shamsi_date)}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span>ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}</span>
-                          </div>
-                          {rep.duration_minutes && (
-                            <span className="text-[#9A7428] font-medium">
-                              مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
-                          {rep.activity_description}
-                        </p>
-                        {rep.photo_url && (
-                          <div className="pt-1">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setPreviewFile({
-                                  file_url: rep.photo_url!,
-                                  file_name: rep.photo_name || `تصویر گزارش ${rep.shamsi_date}`,
-                                  mime_type: 'image/jpeg',
-                                })
-                              }
-                              className="inline-flex items-center gap-2 p-1.5 pr-2.5 rounded-xl bg-slate-50 hover:bg-amber-50/50 border border-slate-200 hover:border-[#C5A059] text-xs font-semibold text-[#0B192C] transition-colors cursor-pointer"
-                            >
-                              <img
-                                src={rep.photo_url}
-                                alt="تصویر کار انجام‌شده"
-                                className="w-10 h-10 rounded-lg object-cover border border-slate-200"
-                              />
-                              <ImageIcon className="w-3.5 h-3.5 text-[#9A7428]" />
-                              <span>پیش‌نمایش تصویر کار انجام‌شده</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    ))}
+              {/* ۱. برنامه‌های کاری محول‌شده از طرف مدیر به پرسنل */}
+              {activeRepCard === 'tasks_checklist' && (
+                <DailyTasksChecklist
+                  role="manager"
+                  currentShamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                />
+              )}
+
+              {/* ۲. فیلتر و جست‌وجو در گزارش‌های روزانه */}
+              {activeRepCard === 'daily_reports' && (
+                <>
+                  <div className="rounded-2xl bg-white border border-slate-200 p-4 grid grid-cols-2 sm:grid-cols-4 gap-2.5 items-end">
+                    <div className="col-span-2 sm:col-span-1">
+                      <label className="block text-xs font-medium text-slate-600 mb-1">
+                        جست‌وجو در متن گزارش
+                      </label>
+                      <input
+                        type="text"
+                        value={repSearch}
+                        onChange={(e) => setRepSearch(e.target.value)}
+                        placeholder="عبارت مورد نظر..."
+                        className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs"
+                      />
+                    </div>
+                    <ShamsiDatePicker
+                      label="از تاریخ"
+                      value={repFromShamsi}
+                      onChange={setRepFromShamsi}
+                      allowClear
+                      placeholder="همه تاریخ‌ها"
+                      todayShamsi={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                    />
+                    <ShamsiDatePicker
+                      label="تا تاریخ"
+                      value={repToShamsi}
+                      onChange={setRepToShamsi}
+                      allowClear
+                      placeholder="همه تاریخ‌ها"
+                      todayShamsi={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                    />
+                    <button
+                      type="button"
+                      onClick={loadReportsList}
+                      className="col-span-2 sm:col-span-1 min-h-[42px] rounded-xl bg-[#0B192C] text-white text-xs font-semibold cursor-pointer"
+                    >
+                      جست‌وجو
+                    </button>
                   </div>
-                )}
-              </div>
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3">
+                    <h3 className="text-sm font-bold text-[#0B192C] flex items-center gap-2">
+                      {effectiveDashboard.unseenAlerts.reportsAlert && <GoldenBlinkDot />}
+                      <span>گزارش‌های روزانه پرسنل — امید میثمی</span>
+                    </h3>
+                    {reports.length === 0 ? (
+                      <p className="text-xs text-slate-500 py-5 text-center">گزارشی یافت نشد.</p>
+                    ) : (
+                      <div className="divide-y divide-slate-100">
+                        {reports.map((rep) => (
+                          <div key={rep.id} className="py-3 space-y-2">
+                            <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums">
+                              <div className="flex items-center gap-2">
+                                {!rep.is_seen_by_manager && <GoldenBlinkDot title="گزارش جدید" />}
+                                <span className="font-bold text-[#0B192C]">
+                                  {toPersianDigits(rep.shamsi_date)}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}</span>
+                              </div>
+                              {rep.duration_minutes && (
+                                <span className="text-[#9A7428] font-medium">
+                                  مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
+                              {rep.activity_description}
+                            </p>
+                            {rep.photo_url && (
+                              <div className="pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPreviewFile({
+                                      file_url: rep.photo_url!,
+                                      file_name: rep.photo_name || `تصویر گزارش ${rep.shamsi_date}`,
+                                      mime_type: 'image/jpeg',
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-2 p-1.5 pr-2.5 rounded-xl bg-slate-50 hover:bg-amber-50/50 border border-slate-200 hover:border-[#C5A059] text-xs font-semibold text-[#0B192C] transition-colors cursor-pointer"
+                                >
+                                  <img
+                                    src={rep.photo_url}
+                                    alt="تصویر کار انجام‌شده"
+                                    className="w-10 h-10 rounded-lg object-cover border border-slate-200"
+                                  />
+                                  <ImageIcon className="w-3.5 h-3.5 text-[#9A7428]" />
+                                  <span>پیش‌نمایش تصویر کار انجام‌شده</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
           {/* ================= تب ۴: امور مالی، مساعده، هزینه‌های متفرقه (اسنپ/وسیله) و تنخواه ================= */}
           {activeTab === 'finance' && (
             <div className="space-y-4">
-              {/* صورتحساب تفصیلی هر ماه / دوره کاری (مبلغ حقوق + اضافه‌کاری، تنخواه و جمع کل پرداختی مدیر در هر ماه) */}
-              <MonthlyStatementSection
-                role="manager"
-                currentShamsiDate={dashboard?.serverTime.shamsiDate || initialShamsiDate}
-                collaborationStartShamsi={dashboard?.settings.collaboration_start_shamsi}
-                dailySummaries={attendanceSummaries}
-                historicalRecords={historicalRecords}
-                transactions={transactions}
-                settings={dashboard?.settings || null}
-              />
+              {/* کارت‌های رنگی انتخاب بخش در تب مالی */}
+              <div className="grid grid-cols-3 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setActiveFinCard('transactions')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeFinCard === 'transactions'
+                      ? 'bg-gradient-to-br from-amber-500 to-orange-600 text-white border-amber-600 shadow-md'
+                      : 'bg-gradient-to-br from-amber-50 via-white to-orange-50/70 text-[#0B192C] border-amber-200 hover:border-amber-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <Wallet className="w-4 h-4 shrink-0" />
+                    {pendingFinanceCount > 0 && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[9.5px] font-extrabold bg-rose-600 text-white">
+                        {toPersianDigits(pendingFinanceCount)} منتظر
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">سوابق و درخواست‌های مالی</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeFinCard === 'transactions' ? 'text-amber-100' : 'text-slate-500'
+                      }`}
+                    >
+                      تأیید تنخواه و لیست پرداختی‌ها
+                    </div>
+                  </div>
+                </button>
 
+                <button
+                  type="button"
+                  onClick={() => setActiveFinCard('add_payment')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeFinCard === 'add_payment'
+                      ? 'bg-gradient-to-br from-emerald-600 to-teal-700 text-white border-emerald-700 shadow-md'
+                      : 'bg-gradient-to-br from-emerald-50 via-white to-teal-50/70 text-[#0B192C] border-emerald-200 hover:border-emerald-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <Plus className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold">ثبت جدید</span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">ثبت پرداخت / هزینه</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeFinCard === 'add_payment' ? 'text-emerald-100' : 'text-slate-500'
+                      }`}
+                    >
+                      حقوق، مساعده، اسنپ یا تنخواه
+                    </div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveFinCard('monthly_statement')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[76px] ${
+                    activeFinCard === 'monthly_statement'
+                      ? 'bg-gradient-to-br from-sky-600 to-blue-700 text-white border-sky-700 shadow-md'
+                      : 'bg-gradient-to-br from-sky-50 via-white to-blue-50/70 text-[#0B192C] border-sky-200 hover:border-sky-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <Coins className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold">ماه‌ها</span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">صورتحساب تفصیلی ماهانه</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeFinCard === 'monthly_statement' ? 'text-sky-100' : 'text-slate-500'
+                      }`}
+                    >
+                      محاسبه دقیق هر ماه کاری
+                    </div>
+                  </div>
+                </button>
+              </div>
+
+              {/* صورتحساب تفصیلی هر ماه / دوره کاری */}
+              {activeFinCard === 'monthly_statement' && (
+                <MonthlyStatementSection
+                  role="manager"
+                  currentShamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                  collaborationStartShamsi={effectiveDashboard.settings.collaboration_start_shamsi}
+                  dailySummaries={attendanceSummaries}
+                  historicalRecords={historicalRecords}
+                  transactions={transactions}
+                  settings={effectiveDashboard.settings}
+                />
+              )}
+
+              {activeFinCard === 'add_payment' && (
               <form
                 onSubmit={handleManagerAddPayment}
                 className="rounded-2xl bg-white border border-[#C5A059]/50 p-4 space-y-3"
@@ -3450,49 +4247,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   <p className="text-[10.5px] text-slate-500 mt-0.5">
                     می‌توانید علاوه بر حقوق و مساعده، هزینه‌های جانبی انجام‌شده برای پرسنل (مانند اسنپ، تهیه وسیله و...) یا بستانکاری تنخواه را در لیست پرداختی‌ها ثبت نمایید.
                   </p>
-                </div>
-
-                {/* تگ‌های انتخاب سریع موضوع پرداخت یا هزینه جانبی برای پرسنل */}
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] text-slate-500 ml-1">انتخاب سریع:</span>
-                  {[
-                    {
-                      label: 'هزینه اسنپ پرسنل',
-                      type: 'OTHER' as FinancialTxType,
-                    },
-                    {
-                      label: 'تهیه وسیله / ابزار برای پرسنل',
-                      type: 'OTHER' as FinancialTxType,
-                    },
-                    {
-                      label: 'هزینه ایاب‌وذهاب پرسنل',
-                      type: 'OTHER' as FinancialTxType,
-                    },
-                    {
-                      label: 'ثبت بستانکاری هزینه متفرقه / تنخواه پرسنل',
-                      type: 'PETTY_CASH' as FinancialTxType,
-                    },
-                    {
-                      label: 'پرداخت مساعده',
-                      type: 'ADVANCE' as FinancialTxType,
-                    },
-                    {
-                      label: 'پرداخت حقوق ماهانه',
-                      type: 'SALARY' as FinancialTxType,
-                    },
-                  ].map((preset) => (
-                    <button
-                      key={preset.label}
-                      type="button"
-                      onClick={() => {
-                        setMgrTxType(preset.type);
-                        setMgrDesc(preset.label);
-                      }}
-                      className="px-2 py-0.5 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059]/50 text-[10px] font-semibold text-[#0B192C] transition-colors cursor-pointer"
-                    >
-                      + {preset.label}
-                    </button>
-                  ))}
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-start">
@@ -3526,7 +4280,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     label="تاریخ پرداخت"
                     value={mgrShamsiDate}
                     onChange={setMgrShamsiDate}
-                    todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                    todayShamsi={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
                   />
                 </div>
 
@@ -3566,7 +4320,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   {actionLoading ? 'در حال ثبت...' : 'ثبت قطعی در لیست پرداختی‌ها'}
                 </button>
               </form>
+              )}
 
+              {activeFinCard === 'transactions' && (
+                <>
               {/* فیلتر تراکنش‌ها */}
               <div className="rounded-2xl bg-white border border-slate-200 p-3.5 grid grid-cols-2 sm:grid-cols-4 gap-2.5 items-end">
                 <div>
@@ -3619,7 +4376,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               {/* لیست تراکنش‌ها و هزینه‌های تنخواه */}
               <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3">
                 <h3 className="text-sm font-bold text-[#0B192C] flex items-center gap-2">
-                  {dashboard?.unseenAlerts.financeAlert && <GoldenBlinkDot />}
+                  {effectiveDashboard.unseenAlerts.financeAlert && <GoldenBlinkDot />}
                   <span>درخواست‌های مالی، تنخواه کارگاهی و سوابق پرداخت</span>
                 </h3>
                 {transactions.length === 0 ? (
@@ -3737,6 +4494,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 )}
               </div>
+                </>
+              )}
             </div>
           )}
 
@@ -3744,7 +4503,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           {activeTab === 'correspondence' && (
             <WorkCorrespondenceSection
               role="manager"
-              todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+              todayShamsi={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
               onUnreadChange={() => loadDashboardAndSettings()}
             />
           )}
@@ -4488,7 +5247,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                               }
                               className="w-4 h-4 accent-emerald-700"
                             />
-                            <span>ارسال پیامک همزمان هنگام ثبت تسک و پیام جدید</span>
+                            <span>ارسال پیامک همزمان هنگام ثبت برنامه کاری و پیام جدید</span>
                           </label>
                         </div>
                       </div>
@@ -4596,8 +5355,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             </div>
           )}
         </>
-      )}
-
       {/* پاپ‌آپ ویرایش و اصلاح موارد پرداخت‌شده / تراکنش‌های مالی */}
       {editingFinTx && (
         <div
@@ -5004,7 +5761,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               </span>
             )}
             <MessageSquare className="w-4 h-4" />
-            <span className="text-[10px] whitespace-nowrap">مکاتبات</span>
+            <span className="text-[10px] whitespace-nowrap">پیام و برنامه</span>
           </button>
 
           <button

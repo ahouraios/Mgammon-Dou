@@ -20,12 +20,15 @@ import {
   formatMinutesToHHMM,
   formatToman,
   parseTimeToMinutes,
+  shamsiToGregorian,
   toPersianDigits,
 } from '../shared/jalali';
-import { getDayShiftSchedule } from '../shared/calculationEngine';
+import { calculateDailyAttendance, getDayShiftSchedule } from '../shared/calculationEngine';
 import { ShamsiDatePicker } from './ShamsiDatePicker';
+import { TimePickerInput } from './TimePickerInput';
 import { TomanInput } from './TomanInput';
 import { HeroBanner } from './HeroBanner';
+import { updateAppNotificationBadge } from './BrandLogo';
 import { LeaveManagementSection } from './LeaveManagementSection';
 import { DailyTasksChecklist } from './DailyTasksChecklist';
 import { MonthlyAttendanceCalendar } from './MonthlyAttendanceCalendar';
@@ -337,18 +340,31 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const isFirstPollDoneRef = useRef(false);
   const [externalLeaveRequestType, setExternalLeaveRequestType] = useState<LeaveType | null>(null);
 
-  // ثبت سابقه کارکرد و اضافه‌کاری قبلی توسط پرسنل (در تب تنظیمات)
-  const [showPastWorkForm, setShowPastWorkForm] = useState(false);
+  // ثبت سابقه کارکرد و اضافه‌کاری قبلی توسط پرسنل (با ورود ساعت ورود و خروج و محاسبه خودکار)
+  const [showPastWorkForm, setShowPastWorkForm] = useState(true);
   const [pastWorkDate, setPastWorkDate] = useState(initialShamsiDate);
+  const [pastEntryType, setPastEntryType] = useState<
+    'WORK' | 'MISSION' | 'DAILY_LEAVE' | 'HOURLY_LEAVE'
+  >('WORK');
+  const [pastCheckIn, setPastCheckIn] = useState('07:00');
+  const [pastCheckOut, setPastCheckOut] = useState('15:00');
+  const [pastLeaveStartTime, setPastLeaveStartTime] = useState('10:00');
+  const [pastLeaveEndTime, setPastLeaveEndTime] = useState('12:00');
   const [pastWorkTitle, setPastWorkTitle] = useState('');
-  const [pastWorkDays, setPastWorkDays] = useState('1');
-  const [pastWorkHours, setPastWorkHours] = useState('');
-  const [pastWorkMins, setPastWorkMins] = useState('0');
-  const [pastOtHours, setPastOtHours] = useState('');
-  const [pastOtMins, setPastOtMins] = useState('0');
   const [pastWorkNote, setPastWorkNote] = useState('');
   const excelInputRef = useRef<HTMLInputElement | null>(null);
   const [uploadingExcel, setUploadingExcel] = useState(false);
+
+  // کارت‌های انتخابی برای جلوگیری از اسکرول طولانی در تب‌های پرسنل
+  const [workerAttendanceCard, setWorkerAttendanceCard] = useState<
+    'today_clock' | 'calendar_history' | 'past_work' | 'leaves'
+  >('today_clock');
+  const [workerReportsCard, setWorkerReportsCard] = useState<
+    'new_report' | 'pending_tasks' | 'archive'
+  >('new_report');
+  const [workerFinanceCard, setWorkerFinanceCard] = useState<
+    'statement' | 'new_expense' | 'history'
+  >('statement');
 
   // فرم گزارش کار روزانه + عکس
   const [reportShamsiDate, setReportShamsiDate] = useState(initialShamsiDate);
@@ -488,7 +504,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
           notifiedKeysRef.current.add(taskKey);
           triggerNativePhoneNotification({
             tag: taskKey,
-            title: 'تسک / وظیفه کاری جدید از طرف مدیر',
+            title: 'برنامه کاری جدید از طرف مدیر',
             body: `${liveRes.latestPendingTask.title}${
               liveRes.latestPendingTask.description
                 ? ` — ${liveRes.latestPendingTask.description}`
@@ -547,6 +563,102 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
 
   const pendingWorkTasks = workTasks.filter((t) => !t.is_completed);
 
+  // بروزرسانی نشان عددی روی لوگوی برنامه و آیکون PWA موبایل برای پرسنل
+  const workerBadgeCount =
+    unreadMessagesCount + pendingWorkTasks.length + unseenLateDecisions.length;
+  useEffect(() => {
+    updateAppNotificationBadge(workerBadgeCount);
+  }, [workerBadgeCount]);
+
+  // محاسبه خودکار کارکرد خالص، تأخیر و اضافه‌کاری بر اساس ساعت ورود و خروج روزهای قبل
+  const pastWorkAutoCalc = React.useMemo(() => {
+    const targetShamsi = pastWorkDate || serverShamsiDate || initialShamsiDate;
+    let workDateIso = '2026-10-01';
+    try {
+      workDateIso = shamsiToGregorian(targetShamsi);
+    } catch {
+      // fallback
+    }
+    const fallbackSettings: SystemSettings = settings || {
+      id: 1,
+      shift_start_time: '07:00',
+      shift_end_time: '15:00',
+      thursday_shift_start_time: '07:00',
+      thursday_shift_end_time: '14:00',
+      thursday_overtime_start_time: '14:00',
+      grace_period_minutes: 15,
+      break_duration_minutes: 0,
+      working_days: [6, 0, 1, 2, 3, 4],
+      overtime_start_time: '15:00',
+      overtime_before_shift: false,
+      mission_policy: 'PAID_AS_WORK',
+      friday_holiday_policy: 'ALL_OVERTIME',
+      official_holidays: [],
+      timezone: 'Asia/Tehran',
+      collaboration_start_shamsi: '1405/06/15',
+      base_salary_toman: null,
+      hourly_rate_toman: null,
+      overtime_calc_mode: 'FIXED_RATE',
+      overtime_percentage: 140,
+      overtime_rate_toman: null,
+      late_deduction_unit: 'MINUTE',
+      late_deduction_rate_toman: null,
+      absence_deduction_unit: 'DAY',
+      absence_deduction_rate_toman: null,
+      monthly_leave_quota_days: 2.5,
+      sms_enabled: false,
+      sms_on_task_and_message: true,
+      melipayamak_username: '',
+      melipayamak_password: '',
+      melipayamak_from_number: '',
+      melipayamak_is_flash: false,
+      worker_phone_number: '',
+      rules_confirmed_by_manager: true,
+      effective_from_shamsi: '1405/06/15',
+      banner_bg_url: null,
+    };
+    const inTime = pastCheckIn || '07:00';
+    const outTime = pastCheckOut || '15:00';
+    return calculateDailyAttendance(
+      workDateIso,
+      targetShamsi,
+      [
+        {
+          id: -1,
+          user_id: user.id,
+          event_type: pastEntryType === 'MISSION' ? 'MISSION_START' : 'WORK_START',
+          work_date: workDateIso,
+          shamsi_date: targetShamsi,
+          recorded_at: '',
+          recorded_time: inTime,
+          is_manual_override: true,
+          modified_by_user_id: user.id,
+          modification_reason: null,
+          is_deleted: false,
+          note: null,
+          created_at: '',
+        },
+        {
+          id: -2,
+          user_id: user.id,
+          event_type: pastEntryType === 'MISSION' ? 'MISSION_END' : 'WORK_END',
+          work_date: workDateIso,
+          shamsi_date: targetShamsi,
+          recorded_at: '',
+          recorded_time: outTime,
+          is_manual_override: true,
+          modified_by_user_id: user.id,
+          modification_reason: null,
+          is_deleted: false,
+          note: null,
+          created_at: '',
+        },
+      ],
+      fallbackSettings,
+      { isToday: false }
+    );
+  }, [pastWorkDate, serverShamsiDate, initialShamsiDate, settings, pastCheckIn, pastCheckOut, pastEntryType, user.id]);
+
   const handleOpenCorrespondences = () => {
     setActiveTab('correspondence');
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -554,6 +666,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
 
   const handleOpenTasksAndReports = () => {
     setActiveTab('reports');
+    setWorkerReportsCard('pending_tasks');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -626,11 +739,14 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   };
 
   const handleQuickLeaveRequest = (type: LeaveType) => {
+    setWorkerAttendanceCard('leaves');
     setExternalLeaveRequestType(type);
-    const el = document.getElementById('leave-management-section');
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+    setTimeout(() => {
+      const el = document.getElementById('leave-management-section');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 60);
   };
 
   const handlePastWorkSubmit = async (e: React.FormEvent) => {
@@ -638,26 +754,51 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     setActionLoading(true);
     setFeedback(null);
     try {
-      const netMinutes = Number(pastWorkHours || 0) * 60 + Number(pastWorkMins || 0);
-      const otMinutes = Number(pastOtHours || 0) * 60 + Number(pastOtMins || 0);
+      if (pastEntryType === 'DAILY_LEAVE' || pastEntryType === 'HOURLY_LEAVE') {
+        const res = await apiRequest<{ ok: boolean; message: string }>('/api/leaves', {
+          method: 'POST',
+          body: JSON.stringify({
+            leave_type: pastEntryType === 'DAILY_LEAVE' ? 'DAILY' : 'HOURLY',
+            shamsi_date: pastWorkDate,
+            start_time: pastEntryType === 'HOURLY_LEAVE' ? pastLeaveStartTime : null,
+            end_time: pastEntryType === 'HOURLY_LEAVE' ? pastLeaveEndTime : null,
+            reason: pastWorkNote.trim() || pastWorkTitle.trim() || 'ثبت مرخصی روزهای قبل',
+          }),
+        });
+        setFeedback({ type: 'success', text: res.message });
+        setPastWorkTitle('');
+        setPastWorkNote('');
+        await loadAllWorkerData();
+        return;
+      }
+
+      const defaultTitle =
+        pastEntryType === 'MISSION'
+          ? `مأموریت مورخ ${pastWorkDate} (${pastCheckIn} تا ${pastCheckOut})`
+          : `کارکرد روز ${pastWorkDate} (ورود ${pastCheckIn} - خروج ${pastCheckOut})`;
+
       const res = await apiRequest<{ ok: boolean; message: string }>('/api/historical-work', {
         method: 'POST',
         body: JSON.stringify({
           shamsi_date: pastWorkDate,
-          title: pastWorkTitle,
-          work_days_count: Number(pastWorkDays || 1),
-          net_work_minutes: netMinutes,
-          overtime_minutes: otMinutes,
-          note: pastWorkNote,
+          title: pastWorkTitle.trim() || defaultTitle,
+          entry_type: pastEntryType,
+          check_in: pastCheckIn,
+          check_out: pastCheckOut,
+          work_days_count: 1,
+          net_work_minutes: pastWorkAutoCalc.net_work_minutes,
+          overtime_minutes: pastWorkAutoCalc.overtime_minutes,
+          note:
+            pastWorkNote.trim() ||
+            `ساعت ورود: ${pastCheckIn} | ساعت خروج: ${pastCheckOut}${
+              pastWorkAutoCalc.late_minutes > 0
+                ? ` | تأخیر: ${pastWorkAutoCalc.late_minutes} دقیقه`
+                : ''
+            }`,
         }),
       });
       setFeedback({ type: 'success', text: res.message });
-      setShowPastWorkForm(false);
       setPastWorkTitle('');
-      setPastWorkHours('');
-      setPastWorkMins('0');
-      setPastOtHours('');
-      setPastOtMins('0');
       setPastWorkNote('');
       await loadAllWorkerData();
     } catch (err) {
@@ -966,10 +1107,10 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             <div className="space-y-0.5 min-w-0">
               <div className="flex items-center gap-1.5">
                 <span className="text-[11px] font-extrabold text-[#C5A059]">
-                  {toPersianDigits(pendingWorkTasks.length)} تسک / وظیفه جدید از سمت مدیریت
+                  {toPersianDigits(pendingWorkTasks.length)} برنامه کاری جدید از سمت مدیریت
                 </span>
                 <span className="text-[10px] text-slate-300 tabular-nums">
-                  ({toPersianDigits(pendingWorkTasks[0].shamsi_date)})
+                  (تاریخ تحویل: {toPersianDigits(pendingWorkTasks[0].shamsi_date)})
                 </span>
               </div>
               <p className="text-[11px] text-slate-100 truncate">
@@ -984,7 +1125,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             onClick={handleOpenTasksAndReports}
             className="min-h-[34px] px-3 rounded-xl bg-[#C5A059] hover:bg-[#d4b06a] text-[#0B192C] text-[11px] font-extrabold flex items-center justify-center gap-1 shrink-0 transition-colors cursor-pointer"
           >
-            <span>مشاهده تسک‌ها</span>
+            <span>مشاهده برنامه کاری</span>
             <ArrowLeft className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -1109,610 +1250,919 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
           {/* ================= تب ۱: ثبت تردد، مرخصی و خلاصه مالی و کارکرد ================= */}
           {activeTab === 'attendance' && (
             <div className="space-y-3">
-              {/* بخش ۱ پس از بنر: دکمه‌های ثبت تردد روزانه (سبز، قرمز، بنفش) + دو کلید مجزای مرخصی روزانه و ساعتی با فونت ظریف‌تر */}
-              <div className="rounded-2xl bg-white border border-[#C5A059]/55 p-3 space-y-2.5 shadow-2xs">
-                <div className="flex items-center justify-between gap-2">
-                  <h2 className="text-xs font-extrabold text-[#0B192C]">
-                    ثبت تردد روزانه و مرخصی
-                  </h2>
-                  <span className="text-[10px] text-slate-500 tabular-nums">
-                    امروز: {toPersianDigits(serverShamsiDate)}
-                  </span>
-                </div>
-
-                <div>
-                  <input
-                    type="text"
-                    value={clockNote}
-                    onChange={(e) => setClockNote(e.target.value)}
-                    placeholder="توضیح تردد (اختیاری — مثلاً مقصد مأموریت)..."
-                    className="w-full min-h-[36px] rounded-xl border border-slate-200 bg-slate-50/70 px-2.5 text-[11px] focus:outline-none focus:bg-white focus:border-[#0B192C]"
-                  />
-                </div>
-
-                {/* دکمه‌های ۴گانه تردد با اندازه جمع‌وجور و رنگ‌های اختصاصی: شروع به کار (سبز)، پایان کار (قرمز)، شروع مأموریت (بنفش) */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {EVENT_BUTTON_CONFIG.map((btn) => {
-                    const isAllowed = allowedEvents.includes(btn.type);
-                    const Icon = btn.icon;
-                    return (
-                      <button
-                        key={btn.type}
-                        type="button"
-                        disabled={!isAllowed || actionLoading}
-                        onClick={() => handleClockEvent(btn.type)}
-                        className={`min-h-[38px] rounded-xl border px-2.5 py-1.5 flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                          isAllowed ? btn.enabledClass : btn.disabledClass
-                        }`}
-                      >
-                        <Icon className="w-3.5 h-3.5 shrink-0" />
-                        <span className="text-[11px] font-bold">{btn.label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {/* دو کلید مجزا برای درخواست مرخصی روزانه و درخواست مرخصی ساعتی با رنگ‌های متمایز و فونت ظریف‌تر */}
-                <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-100">
-                  <button
-                    type="button"
-                    onClick={() => handleQuickLeaveRequest('DAILY')}
-                    className="min-h-[36px] rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-[11px] font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
-                  >
-                    <Sun className="w-3.5 h-3.5 shrink-0" />
-                    <span>درخواست مرخصی روزانه</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => handleQuickLeaveRequest('HOURLY')}
-                    className="min-h-[36px] rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-[11px] font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
-                  >
-                    <Timer className="w-3.5 h-3.5 shrink-0" />
-                    <span>درخواست مرخصی ساعتی</span>
-                  </button>
-                </div>
-
-                {/* خلاصه تردد امروز */}
-                {liveState?.today_summary && (
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1.5 border-t border-slate-100">
-                    <div className="rounded-xl bg-slate-50 p-2 border border-slate-200/70">
-                      <div className="text-[9.5px] text-slate-500">ورود امروز</div>
-                      <div className="mt-0.5 text-[11px] font-bold text-[#0B192C] tabular-nums">
-                        {liveState.today_summary.first_in_time
-                          ? toPersianDigits(liveState.today_summary.first_in_time)
-                          : '—'}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 p-2 border border-slate-200/70">
-                      <div className="text-[9.5px] text-slate-500">خروج امروز</div>
-                      <div className="mt-0.5 text-[11px] font-bold text-[#0B192C] tabular-nums">
-                        {liveState.today_summary.last_out_time
-                          ? toPersianDigits(liveState.today_summary.last_out_time)
-                          : '—'}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-slate-50 p-2 border border-slate-200/70">
-                      <div className="text-[9.5px] text-slate-500">کارکرد خالص امروز</div>
-                      <div className="mt-0.5 text-[11px] font-bold text-[#0B192C] tabular-nums">
-                        {formatMinutesToDurationPersian(
-                          liveState.today_summary.provisional_work_minutes
-                        )}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-[#FCF9F2] p-2 border border-[#C5A059]/40">
-                      <div className="text-[9.5px] text-slate-600">اضافه‌کاری امروز</div>
-                      <div className="mt-0.5 text-[11px] font-bold text-[#9A7428] tabular-nums">
-                        {formatMinutesToDurationPersian(
-                          liveState.today_summary.overtime_minutes
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* بخش ۲ پس از دکمه‌های تردد: خلاصه وضعیت مالی و کل کارکرد تا تاریخ روز */}
-              <div className="rounded-2xl bg-white border border-[#C5A059]/55 p-3 space-y-2.5 shadow-2xs">
-                <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
-                  <div className="flex items-center gap-1.5">
-                    <TrendingUp className="w-3.5 h-3.5 text-[#C5A059]" />
-                    <h3 className="text-xs font-extrabold text-[#0B192C]">
-                      خلاصه وضعیت مالی و کل کارکرد تا امروز
-                    </h3>
-                  </div>
-                  <span className="text-[10px] text-slate-500 tabular-nums">
-                    {toPersianDigits(workerKpis.totalWorkDays)} روز کاری ثبت‌شده
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {/* ۱. جمع کل دریافتی تا تاریخ روز */}
-                  <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 space-y-0.5">
-                    <div className="text-[10px] text-slate-500 font-medium">
-                      جمع کل دریافتی تا امروز
-                    </div>
-                    <div className="text-xs sm:text-sm font-extrabold text-[#0B192C] tabular-nums">
-                      {formatToman(workerKpis.approvedReceivedToman)}
-                    </div>
-                    {workerKpis.approvedPettyCashToman > 0 && (
-                      <div className="text-[9.5px] text-emerald-700 tabular-nums font-medium">
-                        + متفرقه/تنخواه: {formatToman(workerKpis.approvedPettyCashToman)}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* ۲. کل ساعات کاری */}
-                  <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 space-y-0.5">
-                    <div className="text-[10px] text-slate-500 font-medium">
-                      کل ساعات کاری
-                    </div>
-                    <div className="text-xs sm:text-sm font-extrabold text-[#0B192C] tabular-nums">
-                      {formatMinutesToDurationPersian(workerKpis.totalNetWorkMinutes)}
-                    </div>
-                    <div className="text-[9.5px] text-slate-500 tabular-nums">
-                      معادل {formatToman(workerKpis.earnedRegularWorkToman)}
-                    </div>
-                  </div>
-
-                  {/* ۳. کل ساعات اضافه‌کاری */}
-                  <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/50 p-2.5 space-y-0.5">
-                    <div className="text-[10px] text-slate-600 font-medium">
-                      کل ساعات اضافه‌کاری
-                    </div>
-                    <div className="text-xs sm:text-sm font-extrabold text-[#9A7428] tabular-nums">
-                      {formatMinutesToDurationPersian(workerKpis.totalOvertimeMinutes)}
-                    </div>
-                    <div className="text-[9.5px] text-slate-600 tabular-nums">
-                      معادل {formatToman(workerKpis.earnedOvertimeToman)}
-                    </div>
-                  </div>
-
-                  {/* ۴. مانده حساب (بدهکار با رنگ قرمز / بستانکار با رنگ سبز) */}
-                  <div
-                    className={`rounded-xl border-2 p-2.5 space-y-0.5 ${
-                      isCreditor
-                        ? 'bg-emerald-50/90 border-emerald-500 text-emerald-950'
-                        : isDebtor
-                          ? 'bg-red-50/90 border-red-500 text-red-950'
-                          : 'bg-slate-50 border-slate-300 text-slate-800'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="text-[10px] font-bold">مانده حساب</span>
-                      <span
-                        className={`text-[9.5px] px-1.5 py-0.5 rounded-md font-extrabold ${
-                          isCreditor
-                            ? 'bg-emerald-600 text-white'
-                            : isDebtor
-                              ? 'bg-red-600 text-white'
-                              : 'bg-slate-600 text-white'
-                        }`}
-                      >
-                        {isCreditor ? 'بستانکار' : isDebtor ? 'بدهکار' : 'تسویه'}
-                      </span>
-                    </div>
-                    <div
-                      className={`text-xs sm:text-sm font-extrabold tabular-nums ${
-                        isCreditor
-                          ? 'text-emerald-700'
-                          : isDebtor
-                            ? 'text-red-700'
-                            : 'text-[#0B192C]'
+              {/* کارت‌های کوچک و رنگی بخش تردد پرسنل برای دسترسی سریع بدون اسکرول طولانی */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {[
+                  {
+                    id: 'today_clock' as const,
+                    title: 'ثبت تردد و کارکرد امروز',
+                    subtitle: `امروز ${toPersianDigits(serverShamsiDate)}`,
+                    icon: Play,
+                    activeBg: 'bg-gradient-to-br from-emerald-600 to-teal-700 text-white border-emerald-600 shadow-sm',
+                    idleBg: 'bg-emerald-50/90 hover:bg-emerald-100/80 text-emerald-950 border-emerald-200',
+                    iconClass: 'bg-emerald-600/15 text-emerald-700',
+                  },
+                  {
+                    id: 'calendar_history' as const,
+                    title: 'تقویم و سوابق ماهانه',
+                    subtitle: 'تقویم و جدول تردد',
+                    icon: Calendar,
+                    activeBg: 'bg-gradient-to-br from-blue-600 to-indigo-700 text-white border-blue-600 shadow-sm',
+                    idleBg: 'bg-blue-50/90 hover:bg-blue-100/80 text-blue-950 border-blue-200',
+                    iconClass: 'bg-blue-600/15 text-blue-700',
+                  },
+                  {
+                    id: 'past_work' as const,
+                    title: 'ثبت کارکرد روزهای قبل',
+                    subtitle: 'ورود و خروج با محاسبه خودکار',
+                    icon: Clock,
+                    activeBg: 'bg-gradient-to-br from-[#0B192C] to-[#1b3556] text-[#C5A059] border-[#C5A059] shadow-sm',
+                    idleBg: 'bg-[#FCF9F2] hover:bg-amber-100/60 text-[#0B192C] border-[#C5A059]/60',
+                    iconClass: 'bg-[#C5A059]/20 text-[#9A7428]',
+                  },
+                  {
+                    id: 'leaves' as const,
+                    title: 'مرخصی روزانه و ساعتی',
+                    subtitle: `${toPersianDigits(leaveRequests.length)} سابقه مرخصی`,
+                    icon: Sun,
+                    activeBg: 'bg-gradient-to-br from-purple-600 to-violet-700 text-white border-purple-600 shadow-sm',
+                    idleBg: 'bg-purple-50/90 hover:bg-purple-100/80 text-purple-950 border-purple-200',
+                    iconClass: 'bg-purple-600/15 text-purple-700',
+                  },
+                ].map((card) => {
+                  const Icon = card.icon;
+                  const isSelected = workerAttendanceCard === card.id;
+                  return (
+                    <button
+                      key={card.id}
+                      type="button"
+                      onClick={() => setWorkerAttendanceCard(card.id)}
+                      className={`rounded-2xl border p-2.5 text-right transition-all cursor-pointer flex flex-col justify-between gap-1.5 min-h-[74px] ${
+                        isSelected ? card.activeBg : card.idleBg
                       }`}
                     >
-                      {formatToman(Math.abs(workerKpis.accountBalanceToman))}
-                    </div>
-                    <div className="text-[9.5px] opacity-85">
-                      {isCreditor
-                        ? 'طلب کارکرد و تنخواه شما'
-                        : isDebtor
-                          ? 'دریافتی بیش از کارکرد'
-                          : 'حساب تسویه است'}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* بخش ۳: سهمیه و سوابق مرخصی (بدون تکرار دکمه‌های درخواست مرخصی) */}
-              <LeaveManagementSection
-                role="worker"
-                currentShamsiDate={serverShamsiDate}
-                externalRequestType={externalLeaveRequestType}
-                onExternalRequestHandled={() => setExternalLeaveRequestType(null)}
-                onUpdated={loadAllWorkerData}
-                hideTriggerButtons={true}
-              />
-
-              {/* بخش ۴: تقویم کارکرد ماهانه با دراپ‌دان انتخاب ماه */}
-              <MonthlyAttendanceCalendar
-                currentShamsiDate={serverShamsiDate}
-                dailySummaries={historySummaries}
-                leaveRequests={leaveRequests}
-                historicalRecords={historicalRecords}
-                onMonthChange={(y, m) => {
-                  setSelectedHistoryMonth(`${y}/${String(m).padStart(2, '0')}`);
-                  setShowAllMonthHistory(false);
-                }}
-              />
-
-              {/* بخش ۵: جدول سوابق ترددهای روزانه (فقط ماه انتخاب‌شده + نمایش ۲ روز آخر در حالت بسته) */}
-              <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-2">
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2">
-                  <div className="flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5 text-[#C5A059]" />
-                    <h3 className="text-xs font-bold text-[#0B192C]">
-                      سوابق ترددهای روزانه ماه انتخاب‌شده
-                    </h3>
-                  </div>
-
-                  {availableHistoryMonths.length > 0 && (
-                    <select
-                      aria-label="فیلتر ماه سوابق تردد"
-                      value={effectiveHistoryMonth}
-                      onChange={(e) => {
-                        setSelectedHistoryMonth(e.target.value);
-                        setShowAllMonthHistory(false);
-                      }}
-                      className="min-h-[28px] rounded-lg border border-slate-200 bg-slate-50 px-2 text-[10.5px] font-bold text-[#0B192C] focus:outline-none cursor-pointer"
-                    >
-                      {availableHistoryMonths.map((m) => (
-                        <option key={m.key} value={m.key}>
-                          {SHAMSI_MONTH_NAMES[m.month - 1]} {toPersianDigits(m.year)} (
-                          {toPersianDigits(m.count)} روز)
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </div>
-
-                {monthHistorySummaries.length === 0 ? (
-                  <p className="text-[11px] text-slate-500 py-3 text-center">
-                    در این ماه رکورد ترددی ثبت نشده است.
-                  </p>
-                ) : (
-                  <>
-                    <div className="divide-y divide-slate-100">
-                      {visibleHistorySummaries.map((day) => (
-                        <div key={day.work_date} className="py-2 space-y-1">
-                          <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
-                            <div className="flex items-center gap-1.5">
-                              <span className="font-bold text-[#0B192C] tabular-nums">
-                                {toPersianDigits(day.shamsi_date)}
-                              </span>
-                              <span aria-hidden="true">·</span>
-                              <span className="text-slate-600">{day.day_name}</span>
-                              <span aria-hidden="true">·</span>
-                              <span
-                                className={
-                                  day.is_incomplete
-                                    ? 'text-amber-700 font-semibold'
-                                    : 'text-slate-600'
-                                }
-                              >
-                                {toPersianDigits(day.status_label)}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-2 tabular-nums text-[10.5px]">
-                              <span className="text-slate-700">
-                                کارکرد: <strong>{formatMinutesToHHMM(day.net_work_minutes)}</strong>
-                              </span>
-                              <span aria-hidden="true">·</span>
-                              <span className="text-[#9A7428]">
-                                اضافه‌کاری: <strong>{formatMinutesToHHMM(day.overtime_minutes)}</strong>
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] text-slate-600">
-                            {day.logs.length > 0 ? (
-                              day.logs.map((l) => (
-                                <span key={l.id} className="tabular-nums">
-                                  {EVENT_TYPE_LABELS[l.event_type]}:{' '}
-                                  <strong className="text-[#0B192C]">
-                                    {toPersianDigits(l.recorded_time.slice(0, 5))}
-                                  </strong>
-                                </span>
-                              ))
-                            ) : (
-                              <>
-                                <span className="tabular-nums">
-                                  شروع کار:{' '}
-                                  <strong className="text-[#0B192C]">
-                                    {toPersianDigits(day.first_in_time || '07:00')}
-                                  </strong>
-                                </span>
-                                <span className="tabular-nums">
-                                  پایان کار:{' '}
-                                  <strong className="text-[#0B192C]">
-                                    {toPersianDigits(day.last_out_time || '15:00')}
-                                  </strong>
-                                </span>
-                              </>
-                            )}
-                          </div>
-
-                          {/* نمایش وضعیت بررسی تأخیر، علت تأخیر و یادداشت مدیر در سابقه روزانه */}
-                          {day.late_status && day.late_status !== 'NONE' && (
-                            <div className="mt-1 rounded-xl bg-slate-50 border border-slate-200/80 px-2.5 py-1.5 text-[10px] space-y-0.5">
-                              <div className="flex flex-wrap items-center justify-between gap-1.5">
-                                <span className="font-bold text-[#0B192C]">
-                                  وضعیت تأخیر ورود ({toPersianDigits(day.raw_late_minutes || day.late_minutes || 0)} دقیقه):
-                                </span>
-                                <span
-                                  className={`px-2 py-0.5 rounded border font-bold ${
-                                    LATE_STATUS_BADGE_INFO[day.late_status]?.className ||
-                                    'bg-slate-100 text-slate-700'
-                                  }`}
-                                >
-                                  {LATE_STATUS_BADGE_INFO[day.late_status]?.label || day.status_label}
-                                </span>
-                              </div>
-                              {day.late_reason && (
-                                <div className="text-slate-600">
-                                  علت اعلام‌شده: <span className="font-semibold">{day.late_reason}</span>
-                                </div>
-                              )}
-                              {day.manager_late_note && (
-                                <div className="text-[#9A7428] font-bold">
-                                  یادداشت مدیر: <span className="text-[#0B192C]">{day.manager_late_note}</span>
-                                </div>
-                              )}
-                              {day.late_deduction_toman && day.late_deduction_toman > 0 ? (
-                                <div className="text-red-700 font-bold tabular-nums">
-                                  مبلغ کسرشده بابت این روز: {formatToman(day.late_deduction_toman)}
-                                </div>
-                              ) : null}
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-
-                    {monthHistorySummaries.length > 2 && (
-                      <div className="pt-1.5 border-t border-slate-100">
-                        <button
-                          type="button"
-                          onClick={() => setShowAllMonthHistory((prev) => !prev)}
-                          className="w-full min-h-[34px] rounded-xl bg-[#FCF9F2] hover:bg-amber-50 border border-[#C5A059]/50 text-[11px] font-bold text-[#0B192C] flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                      <div className="flex items-center justify-between gap-1">
+                        <div
+                          className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                            isSelected ? 'bg-white/20 text-white' : card.iconClass
+                          }`}
                         >
-                          {showAllMonthHistory ? (
-                            <>
-                              <ChevronUp className="w-3.5 h-3.5 text-[#9A7428]" />
-                              <span>بستن و نمایش فقط ۲ روز آخر</span>
-                            </>
-                          ) : (
-                            <>
-                              <ChevronDown className="w-3.5 h-3.5 text-[#9A7428]" />
-                              <span>
-                                نمایش همه اطلاعات این ماه (
-                                {toPersianDigits(monthHistorySummaries.length)} روز)
-                              </span>
-                            </>
-                          )}
-                        </button>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* ================= تب ۲: تسک‌های جدید (بالا) + فرم ارسال گزارش (وسط) + آرشیو تسک‌ها و گزارش‌ها (پایین) ================= */}
-          {activeTab === 'reports' && (
-            <div className="space-y-4">
-              {/* بخش ۱ (بالای صفحه): تسک‌ها و وظایف جدید ارسالی مدیریت و تعیین تکلیف آن‌ها */}
-              <DailyTasksChecklist
-                role="worker"
-                currentShamsiDate={serverShamsiDate}
-                sectionMode="pending_only"
-                externalTasks={workTasks}
-                onTasksUpdated={loadAllWorkerData}
-                onAddCompletedToReport={(summaryText) => {
-                  setReportDesc((prev) => (prev ? `${prev}\n${summaryText}` : summaryText));
-                }}
-              />
-
-              {/* بخش ۲ (وسط صفحه): فرم ثبت و ارسال گزارش کار روزانه */}
-              <form
-                onSubmit={handleReportSubmit}
-                className="rounded-2xl bg-white border border-[#C5A059]/45 p-4 space-y-3.5"
-              >
-                <h3 className="text-sm font-bold text-[#0B192C] border-b border-slate-100 pb-2.5">
-                  ارسال و ثبت گزارش کار روزانه
-                </h3>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <ShamsiDatePicker
-                    label="تاریخ گزارش"
-                    value={reportShamsiDate}
-                    onChange={setReportShamsiDate}
-                    todayShamsi={serverShamsiDate}
-                  />
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                      مدت زمان فعالیت به دقیقه (اختیاری)
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={1440}
-                      value={reportDuration}
-                      onChange={(e) => setReportDuration(e.target.value)}
-                      placeholder="مثلاً ۱۲۰"
-                      className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs tabular-nums focus:outline-none focus:border-[#0B192C]"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">
-                    شرح فعالیت انجام‌شده
-                  </label>
-                  <textarea
-                    rows={3}
-                    required
-                    value={reportDesc}
-                    onChange={(e) => setReportDesc(e.target.value)}
-                    placeholder="جزئیات کارهای انجام‌شده..."
-                    className="w-full rounded-xl border border-slate-200 p-3 text-xs leading-6 focus:outline-none focus:border-[#0B192C]"
-                  />
-                </div>
-
-                {/* پیوست عکس از کار انجام‌شده */}
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <input
-                        ref={reportPhotoInputRef}
-                        type="file"
-                        accept="image/*"
-                        onChange={handleReportPhotoSelect}
-                        className="hidden"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setCameraTarget('report')}
-                        className="min-h-[38px] px-3 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-xs font-semibold text-[#0B192C] flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Camera className="w-3.5 h-3.5 text-[#9A7428]" />
-                        <span>عکس با دوربین از کار انجام‌شده</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => reportPhotoInputRef.current?.click()}
-                        className="min-h-[38px] px-3 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-xs font-semibold text-[#0B192C] flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Paperclip className="w-3.5 h-3.5 text-[#0B192C]" />
-                        <span>انتخاب تصویر از گالری</span>
-                      </button>
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={actionLoading}
-                      className="min-h-[42px] px-6 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
-                    >
-                      {actionLoading ? 'در حال ثبت...' : 'ارسال گزارش'}
-                    </button>
-                  </div>
-
-                  {reportPhotoBase64 && (
-                    <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-2 flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <img
-                          src={reportPhotoBase64}
-                          alt="پیش‌نمایش"
-                          className="w-10 h-10 rounded-lg object-cover border border-[#C5A059]/40"
-                        />
-                        <span className="text-xs font-bold text-[#0B192C] truncate max-w-[180px]">
-                          {reportPhotoName || 'تصویر پیوست‌شده'}
+                          <Icon className="w-3.5 h-3.5" />
+                        </div>
+                        <span
+                          className={`text-[9.5px] font-bold px-1.5 py-0.5 rounded-md ${
+                            isSelected ? 'bg-white/20 text-white' : 'bg-white/80 text-slate-600'
+                          }`}
+                        >
+                          {isSelected ? 'فعال' : 'انتخاب'}
                         </span>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setReportPhotoBase64(null);
-                          setReportPhotoName('');
-                        }}
-                        className="p-1 text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    </div>
-                  )}
-                  {feedback && activeTab === 'reports' && (
-                    <div
-                      className={`rounded-xl px-3 py-2 text-xs font-bold flex items-center justify-between ${
-                        feedback.type === 'success'
-                          ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
-                          : 'bg-red-50 border border-red-200 text-red-900'
-                      }`}
-                    >
-                      <span>{feedback.text}</span>
-                      <button
-                        type="button"
-                        onClick={() => setFeedback(null)}
-                        className="text-[11px] opacity-75 hover:opacity-100 cursor-pointer"
-                      >
-                        بستن
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </form>
-
-              {/* بخش ۳ (پایین صفحه): آرشیو تسک‌های انجام‌شده و سوابق گزارش‌های روزانه */}
-              <DailyTasksChecklist
-                role="worker"
-                currentShamsiDate={serverShamsiDate}
-                sectionMode="archived_only"
-                externalTasks={workTasks}
-                onTasksUpdated={loadAllWorkerData}
-                onAddCompletedToReport={(summaryText) => {
-                  setReportDesc((prev) => (prev ? `${prev}\n${summaryText}` : summaryText));
-                }}
-              />
-
-              <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-2.5">
-                <h3 className="text-sm font-bold text-[#0B192C]">
-                  آرشیو و سوابق گزارش‌های روزانه ({toPersianDigits(reports.length)})
-                </h3>
-                {reports.length === 0 ? (
-                  <p className="text-xs text-slate-500 py-4 text-center">
-                    هنوز گزارش کاری ثبت نشده است.
-                  </p>
-                ) : (
-                  <div className="divide-y divide-slate-100">
-                    {reports.map((rep) => (
-                      <div key={rep.id} className="py-3 space-y-1.5">
-                        <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-[#0B192C]">
-                              {toPersianDigits(rep.shamsi_date)}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span>ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}</span>
-                          </div>
-                          {rep.duration_minutes && (
-                            <span className="text-[#9A7428] font-medium">
-                              مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
-                            </span>
-                          )}
+                      <div>
+                        <div className="text-[11px] font-extrabold leading-tight">{card.title}</div>
+                        <div
+                          className={`text-[9.5px] mt-0.5 truncate ${
+                            isSelected ? 'text-white/85' : ' opacity-75'
+                          }`}
+                        >
+                          {card.subtitle}
                         </div>
-                        <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
-                          {rep.activity_description}
-                        </p>
-                        {rep.photo_url && (
-                          <div className="pt-1">
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* کارت ۱: ثبت تردد روزانه + خلاصه مالی و کل کارکرد تا امروز */}
+              {workerAttendanceCard === 'today_clock' && (
+                <>
+                  <div className="rounded-2xl bg-white border border-[#C5A059]/55 p-3 space-y-2.5 shadow-2xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <h2 className="text-xs font-extrabold text-[#0B192C]">
+                        ثبت تردد روزانه و مرخصی
+                      </h2>
+                      <span className="text-[10px] text-slate-500 tabular-nums">
+                        امروز: {toPersianDigits(serverShamsiDate)}
+                      </span>
+                    </div>
+
+                    <div>
+                      <input
+                        type="text"
+                        value={clockNote}
+                        onChange={(e) => setClockNote(e.target.value)}
+                        placeholder="توضیح تردد (اختیاری — مثلاً مقصد مأموریت)..."
+                        className="w-full min-h-[36px] rounded-xl border border-slate-200 bg-slate-50/70 px-2.5 text-[11px] focus:outline-none focus:bg-white focus:border-[#0B192C]"
+                      />
+                    </div>
+
+                    {/* دکمه‌های ۴گانه تردد */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {EVENT_BUTTON_CONFIG.map((btn) => {
+                        const isAllowed = allowedEvents.includes(btn.type);
+                        const Icon = btn.icon;
+                        return (
+                          <button
+                            key={btn.type}
+                            type="button"
+                            disabled={!isAllowed || actionLoading}
+                            onClick={() => handleClockEvent(btn.type)}
+                            className={`min-h-[38px] rounded-xl border px-2.5 py-1.5 flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                              isAllowed ? btn.enabledClass : btn.disabledClass
+                            }`}
+                          >
+                            <Icon className="w-3.5 h-3.5 shrink-0" />
+                            <span className="text-[11px] font-bold">{btn.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* دو کلید مجزا برای درخواست مرخصی روزانه و درخواست مرخصی ساعتی + ثبت کارکرد روزهای قبل */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1 border-t border-slate-100">
+                      <button
+                        type="button"
+                        onClick={() => handleQuickLeaveRequest('DAILY')}
+                        className="min-h-[36px] rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-[11px] font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+                      >
+                        <Sun className="w-3.5 h-3.5 shrink-0" />
+                        <span>درخواست مرخصی روزانه</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleQuickLeaveRequest('HOURLY')}
+                        className="min-h-[36px] rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-[11px] font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+                      >
+                        <Timer className="w-3.5 h-3.5 shrink-0" />
+                        <span>درخواست مرخصی ساعتی</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setWorkerAttendanceCard('past_work')}
+                        className="min-h-[36px] rounded-xl bg-[#0B192C] hover:bg-[#152944] text-[#C5A059] border border-[#C5A059] text-[11px] font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+                      >
+                        <Clock className="w-3.5 h-3.5 shrink-0" />
+                        <span>ثبت ساعت کاری روزهای قبل</span>
+                      </button>
+                    </div>
+
+                    {/* خلاصه تردد امروز */}
+                    {liveState?.today_summary && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1.5 border-t border-slate-100">
+                        <div className="rounded-xl bg-slate-50 p-2 border border-slate-200/70">
+                          <div className="text-[9.5px] text-slate-500">ورود امروز</div>
+                          <div className="mt-0.5 text-[11px] font-bold text-[#0B192C] tabular-nums">
+                            {liveState.today_summary.first_in_time
+                              ? toPersianDigits(liveState.today_summary.first_in_time)
+                              : '—'}
+                          </div>
+                        </div>
+                        <div className="rounded-xl bg-slate-50 p-2 border border-slate-200/70">
+                          <div className="text-[9.5px] text-slate-500">خروج امروز</div>
+                          <div className="mt-0.5 text-[11px] font-bold text-[#0B192C] tabular-nums">
+                            {liveState.today_summary.last_out_time
+                              ? toPersianDigits(liveState.today_summary.last_out_time)
+                              : '—'}
+                          </div>
+                        </div>
+                        <div className="rounded-xl bg-slate-50 p-2 border border-slate-200/70">
+                          <div className="text-[9.5px] text-slate-500">کارکرد خالص امروز</div>
+                          <div className="mt-0.5 text-[11px] font-bold text-[#0B192C] tabular-nums">
+                            {formatMinutesToDurationPersian(
+                              liveState.today_summary.provisional_work_minutes
+                            )}
+                          </div>
+                        </div>
+                        <div className="rounded-xl bg-[#FCF9F2] p-2 border border-[#C5A059]/40">
+                          <div className="text-[9.5px] text-slate-600">اضافه‌کاری امروز</div>
+                          <div className="mt-0.5 text-[11px] font-bold text-[#9A7428] tabular-nums">
+                            {formatMinutesToDurationPersian(
+                              liveState.today_summary.overtime_minutes
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* خلاصه وضعیت مالی و کل کارکرد تا تاریخ روز */}
+                  <div className="rounded-2xl bg-white border border-[#C5A059]/55 p-3 space-y-2.5 shadow-2xs">
+                    <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                      <div className="flex items-center gap-1.5">
+                        <TrendingUp className="w-3.5 h-3.5 text-[#C5A059]" />
+                        <h3 className="text-xs font-extrabold text-[#0B192C]">
+                          خلاصه وضعیت مالی و کل کارکرد تا امروز
+                        </h3>
+                      </div>
+                      <span className="text-[10px] text-slate-500 tabular-nums">
+                        {toPersianDigits(workerKpis.totalWorkDays)} روز کاری ثبت‌شده
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 space-y-0.5">
+                        <div className="text-[10px] text-slate-500 font-medium">
+                          جمع کل دریافتی تا امروز
+                        </div>
+                        <div className="text-xs sm:text-sm font-extrabold text-[#0B192C] tabular-nums">
+                          {formatToman(workerKpis.approvedReceivedToman)}
+                        </div>
+                        {workerKpis.approvedPettyCashToman > 0 && (
+                          <div className="text-[9.5px] text-emerald-700 tabular-nums font-medium">
+                            + متفرقه/تنخواه: {formatToman(workerKpis.approvedPettyCashToman)}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="rounded-xl bg-slate-50 border border-slate-200 p-2.5 space-y-0.5">
+                        <div className="text-[10px] text-slate-500 font-medium">
+                          کل ساعات کاری
+                        </div>
+                        <div className="text-xs sm:text-sm font-extrabold text-[#0B192C] tabular-nums">
+                          {formatMinutesToDurationPersian(workerKpis.totalNetWorkMinutes)}
+                        </div>
+                        <div className="text-[9.5px] text-slate-500 tabular-nums">
+                          معادل {formatToman(workerKpis.earnedRegularWorkToman)}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/50 p-2.5 space-y-0.5">
+                        <div className="text-[10px] text-slate-600 font-medium">
+                          کل ساعات اضافه‌کاری
+                        </div>
+                        <div className="text-xs sm:text-sm font-extrabold text-[#9A7428] tabular-nums">
+                          {formatMinutesToDurationPersian(workerKpis.totalOvertimeMinutes)}
+                        </div>
+                        <div className="text-[9.5px] text-slate-600 tabular-nums">
+                          معادل {formatToman(workerKpis.earnedOvertimeToman)}
+                        </div>
+                      </div>
+
+                      <div
+                        className={`rounded-xl border-2 p-2.5 space-y-0.5 ${
+                          isCreditor
+                            ? 'bg-emerald-50/90 border-emerald-500 text-emerald-950'
+                            : isDebtor
+                              ? 'bg-red-50/90 border-red-500 text-red-950'
+                              : 'bg-slate-50 border-slate-300 text-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] font-bold">مانده حساب</span>
+                          <span
+                            className={`text-[9.5px] px-1.5 py-0.5 rounded-md font-extrabold ${
+                              isCreditor
+                                ? 'bg-emerald-600 text-white'
+                                : isDebtor
+                                  ? 'bg-red-600 text-white'
+                                  : 'bg-slate-600 text-white'
+                            }`}
+                          >
+                            {isCreditor ? 'بستانکار' : isDebtor ? 'بدهکار' : 'تسویه'}
+                          </span>
+                        </div>
+                        <div
+                          className={`text-xs sm:text-sm font-extrabold tabular-nums ${
+                            isCreditor
+                              ? 'text-emerald-700'
+                              : isDebtor
+                                ? 'text-red-700'
+                                : 'text-[#0B192C]'
+                          }`}
+                        >
+                          {formatToman(Math.abs(workerKpis.accountBalanceToman))}
+                        </div>
+                        <div className="text-[9.5px] opacity-85">
+                          {isCreditor
+                            ? 'طلب کارکرد و تنخواه شما'
+                            : isDebtor
+                              ? 'دریافتی بیش از کارکرد'
+                              : 'حساب تسویه است'}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* کارت ۲: تقویم کارکرد ماهانه و جدول سوابق ترددهای روزانه */}
+              {workerAttendanceCard === 'calendar_history' && (
+                <>
+                  <MonthlyAttendanceCalendar
+                    currentShamsiDate={serverShamsiDate}
+                    dailySummaries={historySummaries}
+                    leaveRequests={leaveRequests}
+                    historicalRecords={historicalRecords}
+                    onMonthChange={(y, m) => {
+                      setSelectedHistoryMonth(`${y}/${String(m).padStart(2, '0')}`);
+                      setShowAllMonthHistory(false);
+                    }}
+                  />
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                      <div className="flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-[#C5A059]" />
+                        <h3 className="text-xs font-bold text-[#0B192C]">
+                          سوابق ترددهای روزانه ماه انتخاب‌شده
+                        </h3>
+                      </div>
+
+                      {availableHistoryMonths.length > 0 && (
+                        <select
+                          aria-label="فیلتر ماه سوابق تردد"
+                          value={effectiveHistoryMonth}
+                          onChange={(e) => {
+                            setSelectedHistoryMonth(e.target.value);
+                            setShowAllMonthHistory(false);
+                          }}
+                          className="min-h-[28px] rounded-lg border border-slate-200 bg-slate-50 px-2 text-[10.5px] font-bold text-[#0B192C] focus:outline-none cursor-pointer"
+                        >
+                          {availableHistoryMonths.map((m) => (
+                            <option key={m.key} value={m.key}>
+                              {SHAMSI_MONTH_NAMES[m.month - 1]} {toPersianDigits(m.year)}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+
+                    {monthHistorySummaries.length === 0 ? (
+                      <p className="text-[11px] text-slate-500 py-3 text-center">
+                        در این ماه رکورد ترددی ثبت نشده است.
+                      </p>
+                    ) : (
+                      <>
+                        <div className="divide-y divide-slate-100">
+                          {visibleHistorySummaries.map((day) => (
+                            <div key={day.work_date} className="py-2 space-y-1">
+                              <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-bold text-[#0B192C] tabular-nums">
+                                    {toPersianDigits(day.shamsi_date)}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="text-slate-600">{day.day_name}</span>
+                                  <span aria-hidden="true">·</span>
+                                  <span
+                                    className={
+                                      day.is_incomplete
+                                        ? 'text-amber-700 font-semibold'
+                                        : 'text-slate-600'
+                                    }
+                                  >
+                                    {toPersianDigits(day.status_label)}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2 tabular-nums text-[10.5px]">
+                                  <span className="text-slate-700">
+                                    کارکرد: <strong>{formatMinutesToHHMM(day.net_work_minutes)}</strong>
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="text-[#9A7428]">
+                                    اضافه‌کاری: <strong>{formatMinutesToHHMM(day.overtime_minutes)}</strong>
+                                  </span>
+                                </div>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] text-slate-600">
+                                {day.logs.length > 0 ? (
+                                  day.logs.map((l) => (
+                                    <span key={l.id} className="tabular-nums">
+                                      {EVENT_TYPE_LABELS[l.event_type]}:{' '}
+                                      <strong className="text-[#0B192C]">
+                                        {toPersianDigits(l.recorded_time.slice(0, 5))}
+                                      </strong>
+                                    </span>
+                                  ))
+                                ) : (
+                                  <>
+                                    <span className="tabular-nums">
+                                      شروع کار:{' '}
+                                      <strong className="text-[#0B192C]">
+                                        {toPersianDigits(day.first_in_time || '07:00')}
+                                      </strong>
+                                    </span>
+                                    <span className="tabular-nums">
+                                      پایان کار:{' '}
+                                      <strong className="text-[#0B192C]">
+                                        {toPersianDigits(day.last_out_time || '15:00')}
+                                      </strong>
+                                    </span>
+                                  </>
+                                )}
+                              </div>
+
+                              {day.late_status && day.late_status !== 'NONE' && (
+                                <div className="mt-1 rounded-xl bg-slate-50 border border-slate-200/80 px-2.5 py-1.5 text-[10px] space-y-0.5">
+                                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                    <span className="font-bold text-[#0B192C]">
+                                      وضعیت تأخیر ورود ({toPersianDigits(day.raw_late_minutes || day.late_minutes || 0)} دقیقه):
+                                    </span>
+                                    <span
+                                      className={`px-2 py-0.5 rounded border font-bold ${
+                                        LATE_STATUS_BADGE_INFO[day.late_status]?.className ||
+                                        'bg-slate-100 text-slate-700'
+                                      }`}
+                                    >
+                                      {LATE_STATUS_BADGE_INFO[day.late_status]?.label || day.status_label}
+                                    </span>
+                                  </div>
+                                  {day.late_reason && (
+                                    <div className="text-slate-600">
+                                      علت اعلام‌شده: <span className="font-semibold">{day.late_reason}</span>
+                                    </div>
+                                  )}
+                                  {day.manager_late_note && (
+                                    <div className="text-[#9A7428] font-bold">
+                                      یادداشت مدیر: <span className="text-[#0B192C]">{day.manager_late_note}</span>
+                                    </div>
+                                  )}
+                                  {day.late_deduction_toman && day.late_deduction_toman > 0 ? (
+                                    <div className="text-red-700 font-bold tabular-nums">
+                                      مبلغ کسرشده بابت این روز: {formatToman(day.late_deduction_toman)}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+
+                        {monthHistorySummaries.length > 2 && (
+                          <div className="pt-1.5 border-t border-slate-100">
                             <button
                               type="button"
-                              onClick={() =>
-                                setPreviewFile({
-                                  file_name: rep.photo_name || 'تصویر گزارش کار',
-                                  file_url: rep.photo_url!,
-                                  mime_type: 'image/jpeg',
-                                })
-                              }
-                              className="inline-flex items-center gap-2 rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-1.5 text-xs font-bold text-[#0B192C] hover:border-[#C5A059] cursor-pointer"
+                              onClick={() => setShowAllMonthHistory((prev) => !prev)}
+                              className="w-full min-h-[34px] rounded-xl bg-[#FCF9F2] hover:bg-amber-50 border border-[#C5A059]/50 text-[11px] font-bold text-[#0B192C] flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
                             >
-                              <img
-                                src={rep.photo_url}
-                                alt="تصویر گزارش"
-                                className="w-9 h-9 rounded-lg object-cover"
-                              />
-                              <Eye className="w-3.5 h-3.5 text-[#9A7428]" />
-                              <span>مشاهده تصویر کار انجام‌شده</span>
+                              {showAllMonthHistory ? (
+                                <>
+                                  <ChevronUp className="w-3.5 h-3.5 text-[#9A7428]" />
+                                  <span>بستن و نمایش فقط ۲ روز آخر</span>
+                                </>
+                              ) : (
+                                <>
+                                  <ChevronDown className="w-3.5 h-3.5 text-[#9A7428]" />
+                                  <span>
+                                    نمایش همه اطلاعات این ماه (
+                                    {toPersianDigits(monthHistorySummaries.length)} روز)
+                                  </span>
+                                </>
+                              )}
                             </button>
                           </div>
                         )}
-                      </div>
-                    ))}
+                      </>
+                    )}
                   </div>
-                )}
+                </>
+              )}
+
+              {/* کارت ۳: ثبت ساعت کاری روزهای قبل (با ورود ساعت ورود و خروج و محاسبه هوشمند کارکرد، تأخیر و اضافه‌کاری) */}
+              {workerAttendanceCard === 'past_work' && (
+                <div className="rounded-2xl bg-white border border-[#C5A059]/60 p-4 space-y-3.5 shadow-2xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+                    <div>
+                      <h3 className="text-xs sm:text-sm font-extrabold text-[#0B192C] flex items-center gap-1.5">
+                        <Clock className="w-4 h-4 text-[#C5A059]" />
+                        <span>ثبت ساعت کاری، مأموریت یا مرخصی روزهای قبل</span>
+                      </h3>
+                      <p className="text-[10.5px] text-slate-500 mt-0.5">
+                        کافی است تاریخ و ساعت ورود و خروج را انتخاب کنید تا کارکرد خالص، تأخیر و اضافه‌کاری به‌صورت خودکار محاسبه و برای تأیید مدیریت ارسال شود.
+                      </p>
+                    </div>
+                  </div>
+
+                  <form onSubmit={handlePastWorkSubmit} className="space-y-3.5">
+                    {/* انتخاب نوع ثبت روزهای قبل */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[
+                        { id: 'WORK' as const, label: 'کارکرد عادی (ورود و خروج)', color: 'border-emerald-500 bg-emerald-50 text-emerald-950' },
+                        { id: 'MISSION' as const, label: 'مأموریت روزهای قبل', color: 'border-purple-500 bg-purple-50 text-purple-950' },
+                        { id: 'DAILY_LEAVE' as const, label: 'مرخصی روزانه', color: 'border-teal-500 bg-teal-50 text-teal-950' },
+                        { id: 'HOURLY_LEAVE' as const, label: 'مرخصی ساعتی', color: 'border-sky-500 bg-sky-50 text-sky-950' },
+                      ].map((item) => {
+                        const active = pastEntryType === item.id;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => setPastEntryType(item.id)}
+                            className={`min-h-[38px] rounded-xl border px-2.5 py-1.5 text-[11px] font-bold transition-all cursor-pointer ${
+                              active
+                                ? `${item.color} border-2 shadow-2xs`
+                                : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                            }`}
+                          >
+                            {item.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-start">
+                      <ShamsiDatePicker
+                        label="تاریخ روز مورد نظر"
+                        value={pastWorkDate}
+                        onChange={setPastWorkDate}
+                        todayShamsi={serverShamsiDate}
+                      />
+
+                      {pastEntryType === 'WORK' || pastEntryType === 'MISSION' ? (
+                        <>
+                          <TimePickerInput
+                            label={pastEntryType === 'MISSION' ? 'ساعت شروع مأموریت' : 'ساعت ورود'}
+                            value={pastCheckIn}
+                            onChange={setPastCheckIn}
+                          />
+                          <TimePickerInput
+                            label={pastEntryType === 'MISSION' ? 'ساعت پایان مأموریت' : 'ساعت خروج'}
+                            value={pastCheckOut}
+                            onChange={setPastCheckOut}
+                          />
+                        </>
+                      ) : pastEntryType === 'HOURLY_LEAVE' ? (
+                        <>
+                          <TimePickerInput
+                            label="ساعت شروع مرخصی"
+                            value={pastLeaveStartTime}
+                            onChange={setPastLeaveStartTime}
+                          />
+                          <TimePickerInput
+                            label="ساعت پایان مرخصی"
+                            value={pastLeaveEndTime}
+                            onChange={setPastLeaveEndTime}
+                          />
+                        </>
+                      ) : (
+                        <div className="sm:col-span-2 rounded-xl bg-teal-50/70 border border-teal-200 p-3 text-xs text-teal-950">
+                          این روز به‌عنوان <strong>مرخصی روزانه کامل</strong> برای تاریخ{' '}
+                          <strong className="tabular-nums">{toPersianDigits(pastWorkDate)}</strong> ثبت و جهت تأیید مدیر ارسال می‌شود.
+                        </div>
+                      )}
+                    </div>
+
+                    {/* پیش‌نمایش زنده محاسبه خودکار کارکرد، اضافه‌کاری و تأخیر */}
+                    {(pastEntryType === 'WORK' || pastEntryType === 'MISSION') && (
+                      <div className="rounded-2xl bg-[#FCF9F2] border border-[#C5A059]/60 p-3 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                        <div className="rounded-xl bg-white border border-slate-200/80 p-2.5 flex items-center justify-between">
+                          <span className="text-slate-500">کارکرد خالص (محاسبه خودکار):</span>
+                          <strong className="text-emerald-700 font-extrabold tabular-nums">
+                            {formatMinutesToDurationPersian(pastWorkAutoCalc.net_work_minutes)}
+                          </strong>
+                        </div>
+                        <div className="rounded-xl bg-white border border-slate-200/80 p-2.5 flex items-center justify-between">
+                          <span className="text-slate-500">اضافه‌کاری (محاسبه خودکار):</span>
+                          <strong className="text-[#9A7428] font-extrabold tabular-nums">
+                            {formatMinutesToDurationPersian(pastWorkAutoCalc.overtime_minutes)}
+                          </strong>
+                        </div>
+                        <div className="rounded-xl bg-white border border-slate-200/80 p-2.5 flex items-center justify-between">
+                          <span className="text-slate-500">وضعیت تأخیر ورود:</span>
+                          <strong
+                            className={`font-extrabold tabular-nums ${
+                              pastWorkAutoCalc.late_minutes > 0 ? 'text-red-600' : 'text-emerald-700'
+                            }`}
+                          >
+                            {pastWorkAutoCalc.late_minutes > 0
+                              ? `${toPersianDigits(pastWorkAutoCalc.late_minutes)} دقیقه تأخیر`
+                              : 'بدون تأخیر'}
+                          </strong>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          عنوان یا موضوع (اختیاری)
+                        </label>
+                        <input
+                          type="text"
+                          value={pastWorkTitle}
+                          onChange={(e) => setPastWorkTitle(e.target.value)}
+                          placeholder="مثلاً کارکرد روزهای قبل یا مأموریت کارگاه..."
+                          className="w-full min-h-[40px] rounded-xl border border-slate-200 bg-white px-3 text-xs"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          توضیحات تکمیلی برای مدیر (اختیاری)
+                        </label>
+                        <input
+                          type="text"
+                          value={pastWorkNote}
+                          onChange={(e) => setPastWorkNote(e.target.value)}
+                          placeholder="توضیح کوتاه..."
+                          className="w-full min-h-[40px] rounded-xl border border-slate-200 bg-white px-3 text-xs"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex justify-end">
+                      <button
+                        type="submit"
+                        disabled={actionLoading}
+                        className="min-h-[42px] px-6 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
+                      >
+                        {actionLoading ? 'در حال ارسال...' : 'ثبت و ارسال جهت تأیید مدیریت'}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              )}
+
+              {/* کارت ۴: سهمیه و سوابق مرخصی */}
+              {workerAttendanceCard === 'leaves' && (
+                <LeaveManagementSection
+                  role="worker"
+                  currentShamsiDate={serverShamsiDate}
+                  externalRequestType={externalLeaveRequestType}
+                  onExternalRequestHandled={() => setExternalLeaveRequestType(null)}
+                  onUpdated={loadAllWorkerData}
+                  hideTriggerButtons={false}
+                />
+              )}
+            </div>
+          )}
+
+          {/* ================= تب ۲: برنامه‌های کاری و گزارش کار روزانه با کارت‌های کوچک و رنگی ================= */}
+          {activeTab === 'reports' && (
+            <div className="space-y-3.5">
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  {
+                    id: 'new_report' as const,
+                    title: 'ثبت گزارش کار روزانه',
+                    subtitle: 'ارسال شرح کار و عکس',
+                    icon: FileText,
+                    activeBg: 'bg-gradient-to-br from-[#0B192C] to-[#1b3556] text-[#C5A059] border-[#C5A059] shadow-sm',
+                    idleBg: 'bg-[#FCF9F2] hover:bg-amber-100/60 text-[#0B192C] border-[#C5A059]/60',
+                    iconClass: 'bg-[#C5A059]/20 text-[#9A7428]',
+                  },
+                  {
+                    id: 'pending_tasks' as const,
+                    title: 'برنامه‌های کاری جدید',
+                    subtitle: `${toPersianDigits(pendingWorkTasks.length)} برنامه در انتظار`,
+                    icon: CheckSquare,
+                    activeBg: 'bg-gradient-to-br from-rose-600 to-orange-600 text-white border-rose-600 shadow-sm',
+                    idleBg: 'bg-rose-50/90 hover:bg-rose-100/80 text-rose-950 border-rose-200',
+                    iconClass: 'bg-rose-600/15 text-rose-700',
+                  },
+                  {
+                    id: 'archive' as const,
+                    title: 'آرشیو گزارش‌ها و برنامه‌ها',
+                    subtitle: `${toPersianDigits(reports.length)} گزارش ثبت‌شده`,
+                    icon: Eye,
+                    activeBg: 'bg-gradient-to-br from-blue-600 to-indigo-700 text-white border-blue-600 shadow-sm',
+                    idleBg: 'bg-blue-50/90 hover:bg-blue-100/80 text-blue-950 border-blue-200',
+                    iconClass: 'bg-blue-600/15 text-blue-700',
+                  },
+                ].map((card) => {
+                  const Icon = card.icon;
+                  const isSelected = workerReportsCard === card.id;
+                  return (
+                    <button
+                      key={card.id}
+                      type="button"
+                      onClick={() => setWorkerReportsCard(card.id)}
+                      className={`rounded-2xl border p-2.5 text-right transition-all cursor-pointer flex flex-col justify-between gap-1.5 min-h-[72px] ${
+                        isSelected ? card.activeBg : card.idleBg
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <div
+                          className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                            isSelected ? 'bg-white/20 text-white' : card.iconClass
+                          }`}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                        </div>
+                        <span
+                          className={`text-[9.5px] font-bold px-1.5 py-0.5 rounded-md ${
+                            isSelected ? 'bg-white/20 text-white' : 'bg-white/80 text-slate-600'
+                          }`}
+                        >
+                          {isSelected ? 'فعال' : 'انتخاب'}
+                        </span>
+                      </div>
+                      <div>
+                        <div className="text-[11px] font-extrabold leading-tight">{card.title}</div>
+                        <div
+                          className={`text-[9.5px] mt-0.5 truncate ${
+                            isSelected ? 'text-white/85' : 'opacity-75'
+                          }`}
+                        >
+                          {card.subtitle}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
+
+              {workerReportsCard === 'pending_tasks' && (
+                <DailyTasksChecklist
+                  role="worker"
+                  currentShamsiDate={serverShamsiDate}
+                  sectionMode="pending_only"
+                  externalTasks={workTasks}
+                  onTasksUpdated={loadAllWorkerData}
+                  onAddCompletedToReport={(summaryText) => {
+                    setReportDesc((prev) => (prev ? `${prev}\n${summaryText}` : summaryText));
+                    setWorkerReportsCard('new_report');
+                  }}
+                />
+              )}
+
+              {workerReportsCard === 'new_report' && (
+                <form
+                  onSubmit={handleReportSubmit}
+                  className="rounded-2xl bg-white border border-[#C5A059]/45 p-4 space-y-3.5"
+                >
+                  <h3 className="text-sm font-bold text-[#0B192C] border-b border-slate-100 pb-2.5">
+                    ارسال و ثبت گزارش کار روزانه
+                  </h3>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <ShamsiDatePicker
+                      label="تاریخ گزارش"
+                      value={reportShamsiDate}
+                      onChange={setReportShamsiDate}
+                      todayShamsi={serverShamsiDate}
+                    />
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                        مدت زمان فعالیت به دقیقه (اختیاری)
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1440}
+                        value={reportDuration}
+                        onChange={(e) => setReportDuration(e.target.value)}
+                        placeholder="مثلاً ۱۲۰"
+                        className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs tabular-nums focus:outline-none focus:border-[#0B192C]"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      شرح فعالیت انجام‌شده
+                    </label>
+                    <textarea
+                      rows={3}
+                      required
+                      value={reportDesc}
+                      onChange={(e) => setReportDesc(e.target.value)}
+                      placeholder="جزئیات کارهای انجام‌شده..."
+                      className="w-full rounded-xl border border-slate-200 p-3 text-xs leading-6 focus:outline-none focus:border-[#0B192C]"
+                    />
+                  </div>
+
+                  {/* پیوست عکس از کار انجام‌شده */}
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          ref={reportPhotoInputRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={handleReportPhotoSelect}
+                          className="hidden"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setCameraTarget('report')}
+                          className="min-h-[38px] px-3 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-xs font-semibold text-[#0B192C] flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Camera className="w-3.5 h-3.5 text-[#9A7428]" />
+                          <span>عکس با دوربین از کار انجام‌شده</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => reportPhotoInputRef.current?.click()}
+                          className="min-h-[38px] px-3 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-xs font-semibold text-[#0B192C] flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Paperclip className="w-3.5 h-3.5 text-[#0B192C]" />
+                          <span>انتخاب تصویر از گالری</span>
+                        </button>
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={actionLoading}
+                        className="min-h-[42px] px-6 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
+                      >
+                        {actionLoading ? 'در حال ثبت...' : 'ارسال گزارش'}
+                      </button>
+                    </div>
+
+                    {reportPhotoBase64 && (
+                      <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-2 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <img
+                            src={reportPhotoBase64}
+                            alt="پیش‌نمایش"
+                            className="w-10 h-10 rounded-lg object-cover border border-[#C5A059]/40"
+                          />
+                          <span className="text-xs font-bold text-[#0B192C] truncate max-w-[180px]">
+                            {reportPhotoName || 'تصویر پیوست‌شده'}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReportPhotoBase64(null);
+                            setReportPhotoName('');
+                          }}
+                          className="p-1 text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </form>
+              )}
+
+              {workerReportsCard === 'archive' && (
+                <>
+                  <DailyTasksChecklist
+                    role="worker"
+                    currentShamsiDate={serverShamsiDate}
+                    sectionMode="archived_only"
+                    externalTasks={workTasks}
+                    onTasksUpdated={loadAllWorkerData}
+                    onAddCompletedToReport={(summaryText) => {
+                      setReportDesc((prev) => (prev ? `${prev}\n${summaryText}` : summaryText));
+                      setWorkerReportsCard('new_report');
+                    }}
+                  />
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-2.5">
+                    <h3 className="text-sm font-bold text-[#0B192C]">
+                      آرشیو و سوابق گزارش‌های روزانه ({toPersianDigits(reports.length)})
+                    </h3>
+                    {reports.length === 0 ? (
+                      <p className="text-xs text-slate-500 py-4 text-center">
+                        هنوز گزارش کاری ثبت نشده است.
+                      </p>
+                    ) : (
+                      <div className="divide-y divide-slate-100">
+                        {reports.map((rep) => (
+                          <div key={rep.id} className="py-3 space-y-1.5">
+                            <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums">
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-[#0B192C]">
+                                  {toPersianDigits(rep.shamsi_date)}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}</span>
+                              </div>
+                              {rep.duration_minutes && (
+                                <span className="text-[#9A7428] font-medium">
+                                  مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
+                              {rep.activity_description}
+                            </p>
+                            {rep.photo_url && (
+                              <div className="pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPreviewFile({
+                                      file_name: rep.photo_name || 'تصویر گزارش کار',
+                                      file_url: rep.photo_url!,
+                                      mime_type: 'image/jpeg',
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-2 rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-1.5 text-xs font-bold text-[#0B192C] hover:border-[#C5A059] cursor-pointer"
+                                >
+                                  <img
+                                    src={rep.photo_url}
+                                    alt="تصویر گزارش"
+                                    className="w-9 h-9 rounded-lg object-cover"
+                                  />
+                                  <Eye className="w-3.5 h-3.5 text-[#9A7428]" />
+                                  <span>مشاهده تصویر کار انجام‌شده</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -1744,334 +2194,395 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                 </div>
               </div>
 
+              {/* کارت‌های کوچک و رنگی بخش امور مالی پرسنل */}
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  {
+                    id: 'statement' as const,
+                    title: 'صورتحساب ماهانه',
+                    subtitle: 'ریز کارکرد و حقوق ماه',
+                    icon: FileSpreadsheet,
+                    activeBg: 'bg-gradient-to-br from-blue-600 to-indigo-700 text-white border-blue-600 shadow-sm',
+                    idleBg: 'bg-blue-50/90 hover:bg-blue-100/80 text-blue-950 border-blue-200',
+                    iconClass: 'bg-blue-600/15 text-blue-700',
+                  },
+                  {
+                    id: 'new_expense' as const,
+                    title: 'ثبت تنخواه / مساعده',
+                    subtitle: 'ارسال فاکتور و درخواست',
+                    icon: Receipt,
+                    activeBg: 'bg-gradient-to-br from-emerald-600 to-teal-700 text-white border-emerald-600 shadow-sm',
+                    idleBg: 'bg-emerald-50/90 hover:bg-emerald-100/80 text-emerald-950 border-emerald-200',
+                    iconClass: 'bg-emerald-600/15 text-emerald-700',
+                  },
+                  {
+                    id: 'history' as const,
+                    title: 'سوابق تراکنش‌های مالی',
+                    subtitle: `${toPersianDigits(transactions.length)} مورد ثبت‌شده`,
+                    icon: Wallet,
+                    activeBg: 'bg-gradient-to-br from-[#0B192C] to-[#1b3556] text-[#C5A059] border-[#C5A059] shadow-sm',
+                    idleBg: 'bg-[#FCF9F2] hover:bg-amber-100/60 text-[#0B192C] border-[#C5A059]/60',
+                    iconClass: 'bg-[#C5A059]/20 text-[#9A7428]',
+                  },
+                ].map((card) => {
+                  const Icon = card.icon;
+                  const isSelected = workerFinanceCard === card.id;
+                  return (
+                    <button
+                      key={card.id}
+                      type="button"
+                      onClick={() => setWorkerFinanceCard(card.id)}
+                      className={`rounded-2xl border p-2.5 text-right transition-all cursor-pointer flex flex-col justify-between gap-1.5 min-h-[72px] ${
+                        isSelected ? card.activeBg : card.idleBg
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <div
+                          className={`w-7 h-7 rounded-xl flex items-center justify-center shrink-0 ${
+                            isSelected ? 'bg-white/20 text-white' : card.iconClass
+                          }`}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                        </div>
+                        <span
+                          className={`text-[9.5px] font-bold px-1.5 py-0.5 rounded-md ${
+                            isSelected ? 'bg-white/20 text-white' : 'bg-white/80 text-slate-600'
+                          }`}
+                        >
+                          {isSelected ? 'فعال' : 'انتخاب'}
+                        </span>
+                      </div>
+                      <div>
+                        <div className="text-[11px] font-extrabold leading-tight">{card.title}</div>
+                        <div
+                          className={`text-[9.5px] mt-0.5 truncate ${
+                            isSelected ? 'text-white/85' : 'opacity-75'
+                          }`}
+                        >
+                          {card.subtitle}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
               {/* صورتحساب تفصیلی هر ماه / دوره در تب امور مالی پرسنل */}
-              <MonthlyStatementSection
-                role="worker"
-                currentShamsiDate={serverShamsiDate}
-                collaborationStartShamsi={
-                  liveState?.worker_profile?.collaboration_start_shamsi ||
-                  settings?.collaboration_start_shamsi ||
-                  user.collaboration_start_shamsi
-                }
-                dailySummaries={historySummaries}
-                historicalRecords={historicalRecords}
-                transactions={transactions}
-                settings={settings}
-                cumulativeBalanceToman={workerKpis.accountBalanceToman}
-              />
+              {workerFinanceCard === 'statement' && (
+                <MonthlyStatementSection
+                  role="worker"
+                  currentShamsiDate={serverShamsiDate}
+                  collaborationStartShamsi={
+                    liveState?.worker_profile?.collaboration_start_shamsi ||
+                    settings?.collaboration_start_shamsi ||
+                    user.collaboration_start_shamsi
+                  }
+                  dailySummaries={historySummaries}
+                  historicalRecords={historicalRecords}
+                  transactions={transactions}
+                  settings={settings}
+                  cumulativeBalanceToman={workerKpis.accountBalanceToman}
+                />
+              )}
 
-              <form
-                onSubmit={handleFinanceSubmit}
-                className="rounded-2xl bg-white border border-[#C5A059]/45 p-3.5 space-y-3"
-              >
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
-                  <div>
-                    <h3 className="text-xs font-extrabold text-[#0B192C]">
-                      ثبت هزینه متفرقه (اسنپ، خرید وسیله، تنخواه) یا درخواست مساعده
-                    </h3>
-                    <p className="text-[10px] text-slate-500 mt-0.5">
-                      در صورت فراموشی ثبت توسط مدیریت، می‌توانید هزینه‌های متفرقه (اسنپ، خرید وسیله یا تنخواه) را ثبت کنید تا پس از تأیید مدیر به حساب مالی شما اضافه شود.
-                    </p>
+              {workerFinanceCard === 'new_expense' && (
+                <form
+                  onSubmit={handleFinanceSubmit}
+                  className="rounded-2xl bg-white border border-[#C5A059]/45 p-3.5 space-y-3"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+                    <div>
+                      <h3 className="text-xs font-extrabold text-[#0B192C]">
+                        ثبت هزینه متفرقه (اسنپ، خرید وسیله، تنخواه) یا درخواست مساعده
+                      </h3>
+                      <p className="text-[10px] text-slate-500 mt-0.5">
+                        در صورت فراموشی ثبت توسط مدیریت، می‌توانید هزینه‌های متفرقه (اسنپ، خرید وسیله یا تنخواه) را ثبت کنید تا پس از تأیید مدیر به حساب مالی شما اضافه شود.
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setFinType('PETTY_CASH')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer flex items-center gap-1 ${
+                          finType === 'PETTY_CASH'
+                            ? 'bg-[#0B192C] text-[#C5A059]'
+                            : 'text-slate-600'
+                        }`}
+                      >
+                        <Receipt className="w-3 h-3" />
+                        <span>هزینه متفرقه / تنخواه</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFinType('ADVANCE')}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                          finType !== 'PETTY_CASH'
+                            ? 'bg-[#0B192C] text-[#C5A059]'
+                            : 'text-slate-600'
+                        }`}
+                      >
+                        مساعده / دریافتی
+                      </button>
+                    </div>
                   </div>
 
-                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setFinType('PETTY_CASH')}
-                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer flex items-center gap-1 ${
+                  {/* تگ‌های انتخاب سریع موضوع خرید کارگاهی، هزینه متفرقه (اسنپ، وسیله، ابزار و...) */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] text-slate-500 ml-1">انتخاب سریع موضوع:</span>
+                    {[
+                      { label: 'خرید برای کارگاه / تهیه اقلام', type: 'PETTY_CASH' as FinancialTxType },
+                      { label: 'تهیه وسیله / ابزار برای کار', type: 'PETTY_CASH' as FinancialTxType },
+                      { label: 'هزینه اسنپ / ایاب‌وذهاب', type: 'PETTY_CASH' as FinancialTxType },
+                      {
+                        label: 'خرید / هزینه انجام‌شده برای کار (اسنپ / وسیله)',
+                        type: 'OTHER' as FinancialTxType,
+                      },
+                      { label: 'درخواست مساعده', type: 'ADVANCE' as FinancialTxType },
+                    ].map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          setFinType(preset.type);
+                          setFinDesc(preset.label);
+                        }}
+                        className="px-2 py-0.5 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059]/50 text-[10px] font-semibold text-[#0B192C] transition-colors cursor-pointer"
+                      >
+                        + {preset.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-start">
+                    <TomanInput
+                      label={
                         finType === 'PETTY_CASH'
-                          ? 'bg-[#0B192C] text-[#C5A059]'
-                          : 'text-slate-600'
-                      }`}
-                    >
-                      <Receipt className="w-3 h-3" />
-                      <span>هزینه متفرقه / تنخواه</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFinType('ADVANCE')}
-                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
-                        finType !== 'PETTY_CASH'
-                          ? 'bg-[#0B192C] text-[#C5A059]'
-                          : 'text-slate-600'
-                      }`}
-                    >
-                      مساعده / دریافتی
-                    </button>
+                          ? 'مبلغ هزینه / فاکتور (تومان)'
+                          : 'مبلغ (تومان)'
+                      }
+                      value={finAmount}
+                      onChange={setFinAmount}
+                      required
+                    />
+
+                    <div>
+                      <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                        نوع ثبت در حساب مالی
+                      </label>
+                      <select
+                        value={finType}
+                        onChange={(e) => setFinType(e.target.value as FinancialTxType)}
+                        className="w-full min-h-[42px] rounded-xl border border-slate-200 px-2.5 text-[11px] bg-white focus:outline-none focus:border-[#0B192C]"
+                      >
+                        <option value="PETTY_CASH">
+                          هزینه متفرقه / اسنپ / تنخواه (اضافه‌شدن به بستانکاری پس از تأیید مدیر)
+                        </option>
+                        <option value="OTHER">
+                          هزینه انجام‌شده توسط مدیر برای پرسنل (اسنپ، خرید وسیله و...)
+                        </option>
+                        <option value="ADVANCE">درخواست مساعده</option>
+                        <option value="ON_ACCOUNT">درخواست علی‌الحساب</option>
+                        <option value="SALARY">دریافتی حقوق</option>
+                      </select>
+                    </div>
+
+                    <ShamsiDatePicker
+                      label="تاریخ"
+                      value={finShamsiDate}
+                      onChange={setFinShamsiDate}
+                      todayShamsi={serverShamsiDate}
+                    />
                   </div>
-                </div>
-
-                {/* تگ‌های انتخاب سریع موضوع خرید کارگاهی، هزینه متفرقه (اسنپ، وسیله، ابزار و...) */}
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] text-slate-500 ml-1">انتخاب سریع موضوع:</span>
-                  {[
-                    { label: 'خرید برای کارگاه / تهیه اقلام', type: 'PETTY_CASH' as FinancialTxType },
-                    { label: 'تهیه وسیله / ابزار برای کار', type: 'PETTY_CASH' as FinancialTxType },
-                    { label: 'هزینه اسنپ / ایاب‌وذهاب', type: 'PETTY_CASH' as FinancialTxType },
-                    {
-                      label: 'خرید / هزینه انجام‌شده برای کار (اسنپ / وسیله)',
-                      type: 'OTHER' as FinancialTxType,
-                    },
-                    { label: 'درخواست مساعده', type: 'ADVANCE' as FinancialTxType },
-                  ].map((preset) => (
-                    <button
-                      key={preset.label}
-                      type="button"
-                      onClick={() => {
-                        setFinType(preset.type);
-                        setFinDesc(preset.label);
-                      }}
-                      className="px-2 py-0.5 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059]/50 text-[10px] font-semibold text-[#0B192C] transition-colors cursor-pointer"
-                    >
-                      + {preset.label}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-start">
-                  <TomanInput
-                    label={
-                      finType === 'PETTY_CASH'
-                        ? 'مبلغ هزینه / فاکتور (تومان)'
-                        : 'مبلغ (تومان)'
-                    }
-                    value={finAmount}
-                    onChange={setFinAmount}
-                    required
-                  />
 
                   <div>
                     <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                      نوع ثبت در حساب مالی
+                      {finType === 'PETTY_CASH'
+                        ? 'شرح هزینه متفرقه (اسنپ، خرید وسیله یا اقلام کارگاهی)'
+                        : 'شرح و توضیحات'}
                     </label>
-                    <select
-                      value={finType}
-                      onChange={(e) => setFinType(e.target.value as FinancialTxType)}
-                      className="w-full min-h-[42px] rounded-xl border border-slate-200 px-2.5 text-[11px] bg-white focus:outline-none focus:border-[#0B192C]"
-                    >
-                      <option value="PETTY_CASH">
-                        هزینه متفرقه / اسنپ / تنخواه (اضافه‌شدن به بستانکاری پس از تأیید مدیر)
-                      </option>
-                      <option value="OTHER">
-                        هزینه انجام‌شده توسط مدیر برای پرسنل (اسنپ، خرید وسیله و...)
-                      </option>
-                      <option value="ADVANCE">درخواست مساعده</option>
-                      <option value="ON_ACCOUNT">درخواست علی‌الحساب</option>
-                      <option value="SALARY">دریافتی حقوق</option>
-                    </select>
+                    <input
+                      type="text"
+                      required
+                      value={finDesc}
+                      onChange={(e) => setFinDesc(e.target.value)}
+                      placeholder={
+                        finType === 'PETTY_CASH'
+                          ? 'مثلاً هزینه اسنپ مأموریت، خرید وسیله یا اقلام مصرفی کارگاه...'
+                          : 'مثلاً هزینه اسنپ پرداخت‌شده توسط مدیر یا درخواست مساعده...'
+                      }
+                      className="w-full min-h-[38px] rounded-xl border border-slate-200 px-3 text-[11px] focus:outline-none focus:border-[#0B192C]"
+                    />
                   </div>
 
-                  <ShamsiDatePicker
-                    label="تاریخ"
-                    value={finShamsiDate}
-                    onChange={setFinShamsiDate}
-                    todayShamsi={serverShamsiDate}
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-medium text-slate-700 mb-1">
-                    {finType === 'PETTY_CASH'
-                      ? 'شرح هزینه متفرقه (اسنپ، خرید وسیله یا اقلام کارگاهی)'
-                      : 'شرح و توضیحات'}
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={finDesc}
-                    onChange={(e) => setFinDesc(e.target.value)}
-                    placeholder={
-                      finType === 'PETTY_CASH'
-                        ? 'مثلاً هزینه اسنپ مأموریت، خرید وسیله یا اقلام مصرفی کارگاه...'
-                        : 'مثلاً هزینه اسنپ پرداخت‌شده توسط مدیر یا درخواست مساعده...'
-                    }
-                    className="w-full min-h-[38px] rounded-xl border border-slate-200 px-3 text-[11px] focus:outline-none focus:border-[#0B192C]"
-                  />
-                </div>
-
-                {/* پیوست عکس فاکتور / رسید */}
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <input
-                        ref={finReceiptInputRef}
-                        type="file"
-                        accept="image/*,.pdf"
-                        onChange={handleFinReceiptSelect}
-                        className="hidden"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setCameraTarget('receipt')}
-                        className="min-h-[34px] px-2.5 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-[11px] font-semibold text-[#0B192C] flex items-center gap-1 cursor-pointer"
-                      >
-                        <Camera className="w-3.5 h-3.5 text-[#9A7428]" />
-                        <span>عکس از رسید با دوربین</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => finReceiptInputRef.current?.click()}
-                        className="min-h-[34px] px-2.5 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-[11px] font-semibold text-[#0B192C] flex items-center gap-1 cursor-pointer"
-                      >
-                        <Paperclip className="w-3.5 h-3.5 text-[#0B192C]" />
-                        <span>پیوست تصویر رسید / فاکتور</span>
-                      </button>
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={actionLoading}
-                      className="min-h-[38px] px-5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-[11px] font-bold cursor-pointer"
-                    >
-                      {actionLoading
-                        ? 'در حال ثبت...'
-                        : finType === 'PETTY_CASH'
-                          ? 'ثبت هزینه متفرقه جهت تأیید مدیر'
-                          : 'ثبت و ارسال برای مدیریت'}
-                    </button>
-                  </div>
-
-                  {finReceiptBase64 && (
-                    <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-2 flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <Receipt className="w-3.5 h-3.5 text-[#9A7428]" />
-                        <span className="text-[11px] font-bold text-[#0B192C] truncate max-w-[200px]">
-                          {finReceiptName || 'تصویر فاکتور پیوست‌شده'}
-                        </span>
+                  {/* پیوست عکس فاکتور / رسید */}
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <input
+                          ref={finReceiptInputRef}
+                          type="file"
+                          accept="image/*,.pdf"
+                          onChange={handleFinReceiptSelect}
+                          className="hidden"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setCameraTarget('receipt')}
+                          className="min-h-[34px] px-2.5 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-[11px] font-semibold text-[#0B192C] flex items-center gap-1 cursor-pointer"
+                        >
+                          <Camera className="w-3.5 h-3.5 text-[#9A7428]" />
+                          <span>عکس از رسید با دوربین</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => finReceiptInputRef.current?.click()}
+                          className="min-h-[34px] px-2.5 rounded-xl border border-slate-200 hover:border-[#C5A059] bg-slate-50 text-[11px] font-semibold text-[#0B192C] flex items-center gap-1 cursor-pointer"
+                        >
+                          <Paperclip className="w-3.5 h-3.5 text-[#0B192C]" />
+                          <span>پیوست تصویر رسید / فاکتور</span>
+                        </button>
                       </div>
+
                       <button
-                        type="button"
-                        onClick={() => {
-                          setFinReceiptBase64(null);
-                          setFinReceiptName('');
-                        }}
-                        className="p-1 text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                        type="submit"
+                        disabled={actionLoading}
+                        className="min-h-[38px] px-5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-[11px] font-bold cursor-pointer"
                       >
-                        <X className="w-3.5 h-3.5" />
+                        {actionLoading
+                          ? 'در حال ثبت...'
+                          : finType === 'PETTY_CASH'
+                            ? 'ثبت هزینه متفرقه جهت تأیید مدیر'
+                            : 'ثبت و ارسال برای مدیریت'}
                       </button>
                     </div>
-                  )}
-                  {feedback && activeTab === 'finance' && (
-                    <div
-                      className={`rounded-xl px-3 py-2 text-xs font-bold flex items-center justify-between ${
-                        feedback.type === 'success'
-                          ? 'bg-emerald-50 border border-emerald-200 text-emerald-900'
-                          : 'bg-red-50 border border-red-200 text-red-900'
-                      }`}
-                    >
-                      <span>{feedback.text}</span>
-                      <button
-                        type="button"
-                        onClick={() => setFeedback(null)}
-                        className="text-[11px] opacity-75 hover:opacity-100 cursor-pointer"
-                      >
-                        بستن
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </form>
 
-              <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-2">
-                <h3 className="text-xs font-bold text-[#0B192C]">
-                  سوابق پرداختی‌ها، هزینه‌های متفرقه و تنخواه
-                </h3>
-                {transactions.length === 0 ? (
-                  <p className="text-[11px] text-slate-500 py-3 text-center">
-                    هنوز تراکنشی ثبت نشده است.
-                  </p>
-                ) : (
-                  <div className="divide-y divide-slate-100">
-                    {transactions.map((tx) => (
-                      <div key={tx.id} className="py-2.5 space-y-1">
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="font-bold text-[#0B192C] tabular-nums">
-                              {formatToman(tx.amount_toman)}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span
-                              className={`px-2 py-0.5 rounded-md text-[10px] font-semibold ${
-                                tx.tx_type === 'PETTY_CASH'
-                                  ? 'bg-emerald-50 text-emerald-900 border border-emerald-200'
-                                  : tx.tx_type === 'OTHER'
-                                    ? 'bg-amber-50 text-amber-900 border border-amber-200'
-                                    : 'bg-slate-100 text-slate-700'
-                              }`}
-                            >
-                              {TX_TYPE_LABELS[tx.tx_type]}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="text-slate-500 tabular-nums">
-                              {toPersianDigits(tx.shamsi_date)}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <span
-                              className={`text-[10.5px] font-bold ${
-                                tx.status === 'APPROVED'
-                                  ? 'text-emerald-700'
-                                  : tx.status === 'REJECTED'
-                                    ? 'text-red-700'
-                                    : 'text-[#9A7428]'
-                              }`}
-                            >
-                              {STATUS_LABELS[tx.status]}
-                            </span>
-
-                            {tx.status === 'PENDING' && (
-                              <>
-                                <button
-                                  type="button"
-                                  disabled={actionLoading}
-                                  onClick={() => openWorkerEditFinModal(tx)}
-                                  title="ویرایش درخواست مالی"
-                                  className="min-h-[26px] px-2 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 text-[#0B192C] border border-[#C5A059]/70 text-[10px] font-bold flex items-center gap-1 cursor-pointer"
-                                >
-                                  <Edit3 className="w-3 h-3 text-[#9A7428]" />
-                                  <span>ویرایش</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={actionLoading}
-                                  onClick={() => handleWorkerDeleteFinance(tx.id)}
-                                  title="حذف درخواست"
-                                  className="min-h-[26px] px-1.5 rounded-lg bg-slate-50 hover:bg-red-50 text-slate-500 hover:text-red-700 border border-slate-200 hover:border-red-200 text-[10px] flex items-center justify-center cursor-pointer"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
-                              </>
-                            )}
-                          </div>
+                    {finReceiptBase64 && (
+                      <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-2 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <Receipt className="w-3.5 h-3.5 text-[#9A7428]" />
+                          <span className="text-[11px] font-bold text-[#0B192C] truncate max-w-[200px]">
+                            {finReceiptName || 'تصویر فاکتور پیوست‌شده'}
+                          </span>
                         </div>
-                        <p className="text-[11px] text-slate-700">{tx.description}</p>
-                        {tx.receipt_file_url && (
-                          <div className="pt-0.5">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setPreviewFile({
-                                  file_name: tx.receipt_file_name || 'تصویر فاکتور / رسید',
-                                  file_url: tx.receipt_file_url!,
-                                })
-                              }
-                              className="inline-flex items-center gap-1 rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 px-2 py-1 text-[10.5px] font-bold text-[#0B192C] hover:border-[#C5A059] cursor-pointer"
-                            >
-                              <Eye className="w-3 h-3 text-[#9A7428]" />
-                              <span>پیش‌نمایش فاکتور / رسید</span>
-                            </button>
-                          </div>
-                        )}
-                        {tx.manager_note && (
-                          <p className="text-[10px] text-slate-500">
-                            یادداشت مدیریت: {tx.manager_note}
-                          </p>
-                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setFinReceiptBase64(null);
+                            setFinReceiptName('');
+                          }}
+                          className="p-1 text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
                       </div>
-                    ))}
+                    )}
                   </div>
-                )}
-              </div>
+                </form>
+              )}
+
+              {workerFinanceCard === 'history' && (
+                <div className="rounded-2xl bg-white border border-slate-200 p-3.5 space-y-2">
+                  <h3 className="text-xs font-bold text-[#0B192C]">
+                    سوابق پرداختی‌ها، هزینه‌های متفرقه و تنخواه
+                  </h3>
+                  {transactions.length === 0 ? (
+                    <p className="text-[11px] text-slate-500 py-3 text-center">
+                      هنوز تراکنشی ثبت نشده است.
+                    </p>
+                  ) : (
+                    <div className="divide-y divide-slate-100">
+                      {transactions.map((tx) => (
+                        <div key={tx.id} className="py-2.5 space-y-1">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-bold text-[#0B192C] tabular-nums">
+                                {formatToman(tx.amount_toman)}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span
+                                className={`px-2 py-0.5 rounded-md text-[10px] font-semibold ${
+                                  tx.tx_type === 'PETTY_CASH'
+                                    ? 'bg-emerald-50 text-emerald-900 border border-emerald-200'
+                                    : tx.tx_type === 'OTHER'
+                                      ? 'bg-amber-50 text-amber-900 border border-amber-200'
+                                      : 'bg-slate-100 text-slate-700'
+                                }`}
+                              >
+                                {TX_TYPE_LABELS[tx.tx_type]}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="text-slate-500 tabular-nums">
+                                {toPersianDigits(tx.shamsi_date)}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className={`text-[10.5px] font-bold ${
+                                  tx.status === 'APPROVED'
+                                    ? 'text-emerald-700'
+                                    : tx.status === 'REJECTED'
+                                      ? 'text-red-700'
+                                      : 'text-[#9A7428]'
+                                }`}
+                              >
+                                {STATUS_LABELS[tx.status]}
+                              </span>
+
+                              {tx.status === 'PENDING' && (
+                                <>
+                                  <button
+                                    type="button"
+                                    disabled={actionLoading}
+                                    onClick={() => openWorkerEditFinModal(tx)}
+                                    title="ویرایش درخواست مالی"
+                                    className="min-h-[26px] px-2 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 text-[#0B192C] border border-[#C5A059]/70 text-[10px] font-bold flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <Edit3 className="w-3 h-3 text-[#9A7428]" />
+                                    <span>ویرایش</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={actionLoading}
+                                    onClick={() => handleWorkerDeleteFinance(tx.id)}
+                                    title="حذف درخواست"
+                                    className="min-h-[26px] px-1.5 rounded-lg bg-slate-50 hover:bg-red-50 text-slate-500 hover:text-red-700 border border-slate-200 hover:border-red-200 text-[10px] flex items-center justify-center cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                          <p className="text-[11px] text-slate-700">{tx.description}</p>
+                          {tx.receipt_file_url && (
+                            <div className="pt-0.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setPreviewFile({
+                                    file_name: tx.receipt_file_name || 'تصویر فاکتور / رسید',
+                                    file_url: tx.receipt_file_url!,
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 px-2 py-1 text-[10.5px] font-bold text-[#0B192C] hover:border-[#C5A059] cursor-pointer"
+                              >
+                                <Eye className="w-3 h-3 text-[#9A7428]" />
+                                <span>پیش‌نمایش فاکتور / رسید</span>
+                              </button>
+                            </div>
+                          )}
+                          {tx.manager_note && (
+                            <p className="text-[10px] text-slate-500">
+                              یادداشت مدیریت: {tx.manager_note}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -2088,62 +2599,63 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             />
           )}
 
-          {/* ================= تب ۵: تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، قرارداد و راهنما) ================= */}
+          {/* ================= تب ۵: تنظیمات پرسنل (حساب کاربری، ارسال اکسل و ثبت ساعت کاری روزهای قبل، قرارداد و راهنما) ================= */}
           {activeTab === 'settings' && (
             <div className="space-y-3.5">
-              {/* تب‌های افقی کنار هم در بخش تنظیمات پرسنل */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 bg-white p-1.5 rounded-2xl border border-[#C5A059]/45">
-                <button
-                  type="button"
-                  onClick={() => setWorkerSettingsSubTab('profile')}
-                  className={`min-h-[42px] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                    workerSettingsSubTab === 'profile'
-                      ? 'bg-[#0B192C] text-[#C5A059]'
-                      : 'text-slate-600 hover:text-[#0B192C]'
-                  }`}
-                >
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>حساب و تصویر</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setWorkerSettingsSubTab('excel_history')}
-                  className={`min-h-[42px] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                    workerSettingsSubTab === 'excel_history'
-                      ? 'bg-[#0B192C] text-[#C5A059]'
-                      : 'text-slate-600 hover:text-[#0B192C]'
-                  }`}
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5" />
-                  <span>ارسال اکسل سوابق</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setWorkerSettingsSubTab('contract')}
-                  className={`min-h-[42px] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                    workerSettingsSubTab === 'contract'
-                      ? 'bg-[#0B192C] text-[#C5A059]'
-                      : 'text-slate-600 hover:text-[#0B192C]'
-                  }`}
-                >
-                  <Calendar className="w-3.5 h-3.5" />
-                  <span>قرارداد و شیفت</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setWorkerSettingsSubTab('guide')}
-                  className={`min-h-[42px] rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                    workerSettingsSubTab === 'guide'
-                      ? 'bg-[#0B192C] text-[#C5A059]'
-                      : 'text-slate-600 hover:text-[#0B192C]'
-                  }`}
-                >
-                  <BellRing className="w-3.5 h-3.5" />
-                  <span>راهنما و اعلان</span>
-                </button>
+              {/* کارت‌های کوچک و رنگی در بخش تنظیمات پرسنل */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {[
+                  {
+                    id: 'profile' as const,
+                    title: 'حساب و تصویر',
+                    subtitle: 'رمز عبور و آواتار',
+                    icon: Lock,
+                  },
+                  {
+                    id: 'excel_history' as const,
+                    title: 'کارکرد روزهای قبل',
+                    subtitle: 'ثبت با ورود/خروج و اکسل',
+                    icon: FileSpreadsheet,
+                  },
+                  {
+                    id: 'contract' as const,
+                    title: 'قرارداد و شیفت',
+                    subtitle: 'ساعات کاری و حقوق',
+                    icon: Calendar,
+                  },
+                  {
+                    id: 'guide' as const,
+                    title: 'راهنما و اعلان',
+                    subtitle: 'تنظیم نوتیفیکیشن',
+                    icon: BellRing,
+                  },
+                ].map((tab) => {
+                  const Icon = tab.icon;
+                  const active = workerSettingsSubTab === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setWorkerSettingsSubTab(tab.id)}
+                      className={`rounded-2xl border p-2.5 text-right transition-all cursor-pointer flex flex-col justify-between gap-1 min-h-[68px] ${
+                        active
+                          ? 'bg-[#0B192C] text-[#C5A059] border-[#C5A059] shadow-sm'
+                          : 'bg-white hover:bg-[#FCF9F2] text-slate-700 border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <Icon className="w-4 h-4" />
+                        <span className="text-[9.5px] font-bold opacity-80">
+                          {active ? 'فعال' : 'انتخاب'}
+                        </span>
+                      </div>
+                      <div>
+                        <div className="text-xs font-extrabold">{tab.title}</div>
+                        <div className="text-[9.5px] opacity-75 truncate">{tab.subtitle}</div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
 
               {/* زیرتب ۱: تصویر پروفایل، تغییر رمز عبور و ورود سریع */}
@@ -2158,17 +2670,17 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                 />
               )}
 
-              {/* زیرتب ۲: ارسال و ثبت فایل اکسل سوابق کارکرد ماه‌های قبل */}
+              {/* زیرتب ۲: ثبت ساعت کاری روزهای قبل (با ورود ساعت ورود و خروج و محاسبه خودکار) + ارسال فایل اکسل */}
               {workerSettingsSubTab === 'excel_history' && (
                 <div className="space-y-3.5">
                   <div className="rounded-2xl bg-white border border-[#C5A059]/55 p-4 space-y-3.5">
                     <div className="space-y-1 border-b border-slate-100 pb-3">
                       <h3 className="text-sm font-bold text-[#0B192C] flex items-center gap-2">
                         <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
-                        <span>ارسال فایل اکسل و ثبت سوابق کارکرد ماه‌های قبل</span>
+                        <span>ثبت ساعت کاری روزهای قبل (با محاسبه خودکار) و ارسال فایل اکسل</span>
                       </h3>
                       <p className="text-xs text-slate-500 leading-5">
-                        می‌توانید فایل اکسل ساعات کاری و اضافه‌کاری ماه‌های گذشته را بارگذاری کنید یا سابقه کارکرد را به‌صورت دستی ثبت نمایید تا پس از تأیید مدیریت در تقویم و محاسبات منظور شود.
+                        با انتخاب تاریخ و ساعت ورود و خروج، کارکرد خالص، تأخیر و اضافه‌کاری به‌صورت خودکار محاسبه شده و جهت تأیید مدیر ارسال می‌گردد. همچنین می‌توانید فایل اکسل ماه‌های قبل را بارگذاری کنید.
                       </p>
                     </div>
 
@@ -2205,7 +2717,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                         className="min-h-[40px] px-3.5 rounded-xl bg-[#FCF9F2] hover:bg-amber-100/70 text-[#0B192C] border border-[#C5A059] text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                       >
                         <Plus className="w-4 h-4 text-[#9A7428]" />
-                        <span>{showPastWorkForm ? 'بستن فرم دستی' : 'ثبت دستی سابقه قبلی'}</span>
+                        <span>{showPastWorkForm ? 'بستن فرم ثبت ساعت کاری' : 'ثبت ساعت کاری روزهای قبل'}</span>
                       </button>
                     </div>
 
@@ -2216,103 +2728,133 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                       >
                         <div className="flex items-center justify-between border-b border-slate-200/70 pb-2">
                           <h4 className="text-xs font-bold text-[#0B192C]">
-                            فرم ثبت دستی سابقه کارکرد و اضافه‌کاری قبلی
+                            ثبت هوشمند کارکرد، مأموریت یا مرخصی روزهای قبل (محاسبه خودکار ساعت کاری و اضافه‌کاری)
                           </h4>
                           <button
                             type="button"
                             onClick={() => setShowPastWorkForm(false)}
                             className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
                           >
-                            انصراف
+                            بستن
                           </button>
                         </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                          {[
+                            { id: 'WORK' as const, label: 'کارکرد عادی (ورود و خروج)' },
+                            { id: 'MISSION' as const, label: 'مأموریت روزهای قبل' },
+                            { id: 'DAILY_LEAVE' as const, label: 'مرخصی روزانه' },
+                            { id: 'HOURLY_LEAVE' as const, label: 'مرخصی ساعتی' },
+                          ].map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => setPastEntryType(item.id)}
+                              className={`min-h-[36px] rounded-xl border px-2 py-1 text-[11px] font-bold transition-all cursor-pointer ${
+                                pastEntryType === item.id
+                                  ? 'bg-[#0B192C] text-[#C5A059] border-[#C5A059]'
+                                  : 'bg-white border-slate-200 text-slate-600'
+                              }`}
+                            >
+                              {item.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-start">
                           <ShamsiDatePicker
                             label="تاریخ"
                             value={pastWorkDate}
                             onChange={setPastWorkDate}
                             todayShamsi={serverShamsiDate}
                           />
+
+                          {pastEntryType === 'WORK' || pastEntryType === 'MISSION' ? (
+                            <>
+                              <TimePickerInput
+                                label={pastEntryType === 'MISSION' ? 'ساعت شروع مأموریت' : 'ساعت ورود'}
+                                value={pastCheckIn}
+                                onChange={setPastCheckIn}
+                              />
+                              <TimePickerInput
+                                label={pastEntryType === 'MISSION' ? 'ساعت پایان مأموریت' : 'ساعت خروج'}
+                                value={pastCheckOut}
+                                onChange={setPastCheckOut}
+                              />
+                            </>
+                          ) : pastEntryType === 'HOURLY_LEAVE' ? (
+                            <>
+                              <TimePickerInput
+                                label="ساعت شروع مرخصی"
+                                value={pastLeaveStartTime}
+                                onChange={setPastLeaveStartTime}
+                              />
+                              <TimePickerInput
+                                label="ساعت پایان مرخصی"
+                                value={pastLeaveEndTime}
+                                onChange={setPastLeaveEndTime}
+                              />
+                            </>
+                          ) : (
+                            <div className="sm:col-span-2 rounded-xl bg-white border border-teal-200 p-3 text-xs text-teal-950">
+                              ثبت <strong>مرخصی روزانه کامل</strong> در تاریخ{' '}
+                              <strong className="tabular-nums">{toPersianDigits(pastWorkDate)}</strong>
+                            </div>
+                          )}
+                        </div>
+
+                        {(pastEntryType === 'WORK' || pastEntryType === 'MISSION') && (
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                            <div className="rounded-xl bg-white border border-slate-200 p-2.5 flex items-center justify-between">
+                              <span className="text-slate-500">کارکرد خالص:</span>
+                              <strong className="text-emerald-700 font-extrabold tabular-nums">
+                                {formatMinutesToDurationPersian(pastWorkAutoCalc.net_work_minutes)}
+                              </strong>
+                            </div>
+                            <div className="rounded-xl bg-white border border-slate-200 p-2.5 flex items-center justify-between">
+                              <span className="text-slate-500">اضافه‌کاری:</span>
+                              <strong className="text-[#9A7428] font-extrabold tabular-nums">
+                                {formatMinutesToDurationPersian(pastWorkAutoCalc.overtime_minutes)}
+                              </strong>
+                            </div>
+                            <div className="rounded-xl bg-white border border-slate-200 p-2.5 flex items-center justify-between">
+                              <span className="text-slate-500">تأخیر ورود:</span>
+                              <strong
+                                className={`font-extrabold tabular-nums ${
+                                  pastWorkAutoCalc.late_minutes > 0 ? 'text-red-600' : 'text-emerald-700'
+                                }`}
+                              >
+                                {pastWorkAutoCalc.late_minutes > 0
+                                  ? `${toPersianDigits(pastWorkAutoCalc.late_minutes)} دقیقه`
+                                  : 'بدون تأخیر'}
+                              </strong>
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                           <div>
-                            <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                              عنوان دوره یا روز کاری
+                            <label className="block text-xs font-medium text-slate-700 mb-1">
+                              عنوان (اختیاری)
                             </label>
                             <input
                               type="text"
-                              required
                               value={pastWorkTitle}
                               onChange={(e) => setPastWorkTitle(e.target.value)}
-                              placeholder="مثلاً کارکرد نیمه اول مهر"
-                              className="w-full min-h-[44px] rounded-xl border border-slate-200 bg-white px-3 text-xs"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                              تعداد روز کاری
-                            </label>
-                            <input
-                              type="number"
-                              min={0}
-                              max={365}
-                              value={pastWorkDays}
-                              onChange={(e) => setPastWorkDays(e.target.value)}
-                              className="w-full min-h-[44px] rounded-xl border border-slate-200 bg-white px-3 text-xs tabular-nums"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                          <div>
-                            <label className="block text-xs font-medium text-slate-700 mb-1">
-                              ساعت کارکرد
-                            </label>
-                            <input
-                              type="number"
-                              min={0}
-                              value={pastWorkHours}
-                              onChange={(e) => setPastWorkHours(e.target.value)}
-                              placeholder="0"
-                              className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs tabular-nums"
+                              placeholder="مثلاً کارکرد روزهای قبل..."
+                              className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs"
                             />
                           </div>
                           <div>
                             <label className="block text-xs font-medium text-slate-700 mb-1">
-                              دقیقه کارکرد
+                              توضیح برای مدیر (اختیاری)
                             </label>
                             <input
-                              type="number"
-                              min={0}
-                              max={59}
-                              value={pastWorkMins}
-                              onChange={(e) => setPastWorkMins(e.target.value)}
-                              className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs tabular-nums"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-xs font-medium text-slate-700 mb-1">
-                              ساعت اضافه‌کاری
-                            </label>
-                            <input
-                              type="number"
-                              min={0}
-                              value={pastOtHours}
-                              onChange={(e) => setPastOtHours(e.target.value)}
-                              placeholder="0"
-                              className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs tabular-nums"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-xs font-medium text-slate-700 mb-1">
-                              دقیقه اضافه‌کاری
-                            </label>
-                            <input
-                              type="number"
-                              min={0}
-                              max={59}
-                              value={pastOtMins}
-                              onChange={(e) => setPastOtMins(e.target.value)}
-                              className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs tabular-nums"
+                              type="text"
+                              value={pastWorkNote}
+                              onChange={(e) => setPastWorkNote(e.target.value)}
+                              placeholder="توضیح..."
+                              className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs"
                             />
                           </div>
                         </div>
@@ -2722,7 +3264,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
               </span>
             )}
             <MessageSquare className="w-4 h-4" />
-            <span className="text-[10px]">مکاتبات</span>
+            <span className="text-[10px]">پیام و برنامه</span>
           </button>
 
           <button

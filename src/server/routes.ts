@@ -2688,20 +2688,66 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
     const overtimeHours = Math.max(0, Number(toEnglishDigits(String(req.body?.overtime_hours ?? 0))));
     const overtimeExtraMins = Math.max(0, Number(toEnglishDigits(String(req.body?.overtime_minutes_part ?? 0))));
     const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
+    const checkInRaw = req.body?.check_in ? toEnglishDigits(String(req.body.check_in)).trim() : '';
+    const checkOutRaw = req.body?.check_out ? toEnglishDigits(String(req.body.check_out)).trim() : '';
+    const checkIn = /^\d{1,2}:\d{2}$/.test(checkInRaw) ? checkInRaw.padStart(5, '0') : undefined;
+    const checkOut = /^\d{1,2}:\d{2}$/.test(checkOutRaw) ? checkOutRaw.padStart(5, '0') : undefined;
+    const entryType = String(req.body?.entry_type || 'WORK').trim();
 
     if (!title) {
       res.status(400).json({ ok: false, message: 'عنوان سابقه کاری قبلی الزامی است.' });
       return;
     }
 
-    const totalNetWorkMinutes =
+    let totalNetWorkMinutes =
       netWorkDirectMinutes > 0
         ? Math.round(netWorkDirectMinutes)
         : Math.round(netWorkHours * 60 + netWorkExtraMins);
-    const totalOvertimeMinutes =
+    let totalOvertimeMinutes =
       overtimeDirectMinutes > 0
         ? Math.round(overtimeDirectMinutes)
         : Math.round(overtimeHours * 60 + overtimeExtraMins);
+
+    if (totalNetWorkMinutes === 0 && totalOvertimeMinutes === 0 && checkIn && checkOut) {
+      const settings = await getSystemSettingsFromDb();
+      const syntheticLogs: AttendanceLog[] = [
+        {
+          id: 1,
+          user_id: 2,
+          work_date: workDate,
+          shamsi_date: shamsiDate,
+          event_type: entryType === 'MISSION' ? 'MISSION_START' : 'WORK_START',
+          recorded_at: `${workDate}T${checkIn}:00Z`,
+          recorded_time: `${checkIn}:00`,
+          note: note,
+          is_manual_override: true,
+          modified_by_user_id: req.user!.id,
+          modification_reason: null,
+          is_deleted: false,
+          created_at: `${workDate}T${checkIn}:00Z`,
+        },
+        {
+          id: 2,
+          user_id: 2,
+          work_date: workDate,
+          shamsi_date: shamsiDate,
+          event_type: 'WORK_END',
+          recorded_at: `${workDate}T${checkOut}:00Z`,
+          recorded_time: `${checkOut}:00`,
+          note: note,
+          is_manual_override: true,
+          modified_by_user_id: req.user!.id,
+          modification_reason: null,
+          is_deleted: false,
+          created_at: `${workDate}T${checkOut}:00Z`,
+        },
+      ];
+      const calcSummary = calculateDailyAttendance(workDate, shamsiDate, syntheticLogs, settings, {
+        isToday: false,
+      });
+      totalNetWorkMinutes = Math.max(0, calcSummary.net_work_minutes - calcSummary.overtime_minutes);
+      totalOvertimeMinutes = Math.max(0, calcSummary.overtime_minutes);
+    }
 
     if (totalNetWorkMinutes === 0 && totalOvertimeMinutes === 0) {
       res.status(400).json({
@@ -2710,6 +2756,22 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
       });
       return;
     }
+
+    const parsedRowsJson =
+      checkIn && checkOut && workDaysCount === 1
+        ? JSON.stringify([
+            {
+              shamsi_date: shamsiDate,
+              title,
+              work_days_count: 1,
+              net_work_minutes: totalNetWorkMinutes,
+              overtime_minutes: totalOvertimeMinutes,
+              check_in: checkIn,
+              check_out: checkOut,
+              note: note || undefined,
+            },
+          ])
+        : null;
 
     const workerId = await getWorkerUserId(pool);
     const isManager = req.user!.role === 'manager';
@@ -2721,8 +2783,8 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
 
     const [ins] = await conn.execute<mysql.ResultSetHeader>(
       `INSERT INTO historical_work_records
-        (user_id, shamsi_date, work_date, title, work_days_count, net_work_minutes, overtime_minutes, note, status, is_seen_by_manager, created_by_user_id, reviewed_by_user_id, reviewed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (user_id, shamsi_date, work_date, title, work_days_count, net_work_minutes, overtime_minutes, note, parsed_rows_json, status, is_seen_by_manager, created_by_user_id, reviewed_by_user_id, reviewed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         workerId,
         shamsiDate,
@@ -2732,6 +2794,7 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
         totalNetWorkMinutes,
         totalOvertimeMinutes,
         note,
+        parsedRowsJson,
         initialStatus,
         seenByManager,
         req.user!.id,
@@ -3704,7 +3767,7 @@ apiRouter.post('/tasks', requireAuth, requireRole('manager'), async (req: Authen
     const sendSmsOverride = Boolean(req.body?.send_sms);
 
     if (!title) {
-      res.status(400).json({ ok: false, message: 'عنوان وظیفه / کار الزامی است.' });
+      res.status(400).json({ ok: false, message: 'عنوان برنامه کاری الزامی است.' });
       return;
     }
 
@@ -3730,7 +3793,7 @@ apiRouter.post('/tasks', requireAuth, requireRole('manager'), async (req: Authen
       settings.melipayamak_password &&
       (sendSmsOverride || (settings.sms_enabled && settings.sms_on_task_and_message))
     ) {
-      const smsText = `وظیفه جدید از طرف مدیریت (مجید نورایی):\n${title}${description ? `\n${description}` : ''}`;
+      const smsText = `برنامه کاری جدید از طرف مدیریت (مجید نورایی) — تاریخ تحویل ${shamsiDate}:\n${title}${description ? `\n${description}` : ''}`;
       const smsRes = await sendMelipayamakSms(settings, targetPhone, smsText);
       smsSent = smsRes.sent;
     }
@@ -3740,8 +3803,8 @@ apiRouter.post('/tasks', requireAuth, requireRole('manager'), async (req: Authen
       id: ins.insertId,
       smsSent,
       message: smsSent
-        ? 'وظیفه کاری جدید به چک‌لیست پرسنل اضافه شد و نوتیفیکیشن + پیامک ارسال گردید.'
-        : 'وظیفه کاری جدید ثبت شد و اعلان آن در گوشی پرسنل نمایش داده می‌شود.',
+        ? 'برنامه کاری جدید ثبت شد و نوتیفیکیشن + پیامک ارسال گردید.'
+        : 'برنامه کاری جدید ثبت شد و اعلان آن در پنل پرسنل نمایش داده می‌شود.',
     });
   } catch (err) {
     handleServerError(res, err);
@@ -3752,7 +3815,7 @@ apiRouter.patch('/tasks/:id/toggle', requireAuth, async (req: AuthenticatedReque
   try {
     const taskId = Number(req.params.id);
     if (!taskId) {
-      res.status(400).json({ ok: false, message: 'شناسه کار معتبر نیست.' });
+      res.status(400).json({ ok: false, message: 'شناسه برنامه کاری معتبر نیست.' });
       return;
     }
 
@@ -3762,7 +3825,7 @@ apiRouter.patch('/tasks/:id/toggle', requireAuth, async (req: AuthenticatedReque
       [taskId]
     );
     if (rows.length === 0) {
-      res.status(404).json({ ok: false, message: 'مورد کاری یافت نشد.' });
+      res.status(404).json({ ok: false, message: 'برنامه کاری یافت نشد.' });
       return;
     }
 
@@ -3770,7 +3833,7 @@ apiRouter.patch('/tasks/:id/toggle', requireAuth, async (req: AuthenticatedReque
       res.status(403).json({
         ok: false,
         code: 'FORBIDDEN',
-        message: 'شما مجوز تغییر وظیفه کاربر دیگر را ندارید.',
+        message: 'شما مجوز تغییر برنامه کاری کاربر دیگر را ندارید.',
       });
       return;
     }
@@ -3789,7 +3852,7 @@ apiRouter.patch('/tasks/:id/toggle', requireAuth, async (req: AuthenticatedReque
     res.json({
       ok: true,
       is_completed: nextCompleted,
-      message: nextCompleted ? 'انجام کار ثبت شد.' : 'وضعیت کار به حالت در انتظار تغییر یافت.',
+      message: nextCompleted ? 'انجام برنامه کاری ثبت شد.' : 'وضعیت برنامه کاری به حالت در انتظار تغییر یافت.',
     });
   } catch (err) {
     handleServerError(res, err);
@@ -3801,7 +3864,7 @@ apiRouter.delete('/tasks/:id', requireAuth, requireRole('manager'), async (req: 
     const taskId = Number(req.params.id);
     const pool = getPool();
     await pool.execute('DELETE FROM work_tasks WHERE id = ?', [taskId]);
-    res.json({ ok: true, message: 'مورد کاری از چک‌لیست حذف شد.' });
+    res.json({ ok: true, message: 'برنامه کاری حذف شد.' });
   } catch (err) {
     handleServerError(res, err);
   }

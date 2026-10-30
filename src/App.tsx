@@ -6,7 +6,7 @@ import {
   getStoredBiometricInfo,
   StoredBiometricInfo,
 } from './services/biometric';
-import { BrandLogo } from './components/BrandLogo';
+import { BrandLogo, updateAppNotificationBadge } from './components/BrandLogo';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { TopShamsiCalendarBar } from './components/TopShamsiCalendarBar';
 import { ForgotPasswordModal } from './components/ForgotPasswordModal';
@@ -51,6 +51,7 @@ export default function App() {
     const handleAuthExpired = () => {
       setStoredToken(null);
       setUser(null);
+      updateAppNotificationBadge(0);
     };
     window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
     return () => {
@@ -194,6 +195,7 @@ export default function App() {
     } finally {
       setStoredToken(null);
       setUser(null);
+      updateAppNotificationBadge(0);
       const savedUsername = getRememberedUsername();
       setUsername(savedUsername);
       setRememberMe(Boolean(savedUsername));
@@ -225,7 +227,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F9FAFB] text-[#0B192C]">
+    <div className="min-h-screen flex flex-col bg-[#F9FAFB] text-[#0B192C] overflow-x-hidden">
       {/* هدر مینیمال سفید، سرمه‌ای و طلایی همراه با تقویم کوچک شمسی */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-[#C5A059]/45 px-3.5 py-2.5">
         <div className="max-w-5xl mx-auto flex items-center justify-between gap-2 sm:gap-3">

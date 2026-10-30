@@ -79,6 +79,7 @@ export async function apiRequest<T>(
   let response: Response;
   try {
     response = await fetch(endpoint, {
+      cache: 'no-store',
       ...options,
       credentials: 'include',
       headers,

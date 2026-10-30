@@ -308,7 +308,6 @@ export const MonthlyAttendanceCalendar: React.FC<MonthlyAttendanceCalendarProps>
             {availableMonths.map((m) => (
               <option key={`${m.year}-${m.month}`} value={`${m.year}-${m.month}`}>
                 {SHAMSI_MONTH_NAMES[m.month - 1]} {toPersianDigits(m.year)}
-                {m.count > 0 ? ` (${toPersianDigits(m.count)} روز کارکرد)` : ''}
               </option>
             ))}
           </select>

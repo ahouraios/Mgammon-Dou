@@ -1457,7 +1457,7 @@ async function requireAuth(req, res, next) {
       });
       return;
     }
-    const enforceInitialPassChange = process.env.NODE_ENV === "production" || process.env.ENFORCE_PASSWORD_CHANGE === "true" || req.headers["x-enforce-password-change"] === "1";
+    const enforceInitialPassChange = process.env.ENFORCE_PASSWORD_CHANGE === "true" || req.headers["x-enforce-password-change"] === "1";
     const allowedDuringPassChange = ["/auth/change-password", "/auth/logout", "/auth/me"];
     if (enforceInitialPassChange && session.user.must_change_password && !allowedDuringPassChange.includes(req.path)) {
       res.status(403).json({
@@ -4850,12 +4850,57 @@ apiRouter.post("/historical-work", requireAuth, async (req, res) => {
     const overtimeHours = Math.max(0, Number(toEnglishDigits(String(req.body?.overtime_hours ?? 0))));
     const overtimeExtraMins = Math.max(0, Number(toEnglishDigits(String(req.body?.overtime_minutes_part ?? 0))));
     const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
+    const checkInRaw = req.body?.check_in ? toEnglishDigits(String(req.body.check_in)).trim() : "";
+    const checkOutRaw = req.body?.check_out ? toEnglishDigits(String(req.body.check_out)).trim() : "";
+    const checkIn = /^\d{1,2}:\d{2}$/.test(checkInRaw) ? checkInRaw.padStart(5, "0") : void 0;
+    const checkOut = /^\d{1,2}:\d{2}$/.test(checkOutRaw) ? checkOutRaw.padStart(5, "0") : void 0;
+    const entryType = String(req.body?.entry_type || "WORK").trim();
     if (!title) {
       res.status(400).json({ ok: false, message: "\u0639\u0646\u0648\u0627\u0646 \u0633\u0627\u0628\u0642\u0647 \u06A9\u0627\u0631\u06CC \u0642\u0628\u0644\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
       return;
     }
-    const totalNetWorkMinutes = netWorkDirectMinutes > 0 ? Math.round(netWorkDirectMinutes) : Math.round(netWorkHours * 60 + netWorkExtraMins);
-    const totalOvertimeMinutes = overtimeDirectMinutes > 0 ? Math.round(overtimeDirectMinutes) : Math.round(overtimeHours * 60 + overtimeExtraMins);
+    let totalNetWorkMinutes = netWorkDirectMinutes > 0 ? Math.round(netWorkDirectMinutes) : Math.round(netWorkHours * 60 + netWorkExtraMins);
+    let totalOvertimeMinutes = overtimeDirectMinutes > 0 ? Math.round(overtimeDirectMinutes) : Math.round(overtimeHours * 60 + overtimeExtraMins);
+    if (totalNetWorkMinutes === 0 && totalOvertimeMinutes === 0 && checkIn && checkOut) {
+      const settings = await getSystemSettingsFromDb();
+      const syntheticLogs = [
+        {
+          id: 1,
+          user_id: 2,
+          work_date: workDate,
+          shamsi_date: shamsiDate,
+          event_type: entryType === "MISSION" ? "MISSION_START" : "WORK_START",
+          recorded_at: `${workDate}T${checkIn}:00Z`,
+          recorded_time: `${checkIn}:00`,
+          note,
+          is_manual_override: true,
+          modified_by_user_id: req.user.id,
+          modification_reason: null,
+          is_deleted: false,
+          created_at: `${workDate}T${checkIn}:00Z`
+        },
+        {
+          id: 2,
+          user_id: 2,
+          work_date: workDate,
+          shamsi_date: shamsiDate,
+          event_type: "WORK_END",
+          recorded_at: `${workDate}T${checkOut}:00Z`,
+          recorded_time: `${checkOut}:00`,
+          note,
+          is_manual_override: true,
+          modified_by_user_id: req.user.id,
+          modification_reason: null,
+          is_deleted: false,
+          created_at: `${workDate}T${checkOut}:00Z`
+        }
+      ];
+      const calcSummary = calculateDailyAttendance(workDate, shamsiDate, syntheticLogs, settings, {
+        isToday: false
+      });
+      totalNetWorkMinutes = Math.max(0, calcSummary.net_work_minutes - calcSummary.overtime_minutes);
+      totalOvertimeMinutes = Math.max(0, calcSummary.overtime_minutes);
+    }
     if (totalNetWorkMinutes === 0 && totalOvertimeMinutes === 0) {
       res.status(400).json({
         ok: false,
@@ -4863,6 +4908,18 @@ apiRouter.post("/historical-work", requireAuth, async (req, res) => {
       });
       return;
     }
+    const parsedRowsJson = checkIn && checkOut && workDaysCount === 1 ? JSON.stringify([
+      {
+        shamsi_date: shamsiDate,
+        title,
+        work_days_count: 1,
+        net_work_minutes: totalNetWorkMinutes,
+        overtime_minutes: totalOvertimeMinutes,
+        check_in: checkIn,
+        check_out: checkOut,
+        note: note || void 0
+      }
+    ]) : null;
     const workerId = await getWorkerUserId(pool2);
     const isManager = req.user.role === "manager";
     const initialStatus = isManager ? "APPROVED" : "PENDING";
@@ -4871,8 +4928,8 @@ apiRouter.post("/historical-work", requireAuth, async (req, res) => {
     await conn.beginTransaction();
     const [ins] = await conn.execute(
       `INSERT INTO historical_work_records
-        (user_id, shamsi_date, work_date, title, work_days_count, net_work_minutes, overtime_minutes, note, status, is_seen_by_manager, created_by_user_id, reviewed_by_user_id, reviewed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (user_id, shamsi_date, work_date, title, work_days_count, net_work_minutes, overtime_minutes, note, parsed_rows_json, status, is_seen_by_manager, created_by_user_id, reviewed_by_user_id, reviewed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         workerId,
         shamsiDate,
@@ -4882,6 +4939,7 @@ apiRouter.post("/historical-work", requireAuth, async (req, res) => {
         totalNetWorkMinutes,
         totalOvertimeMinutes,
         note,
+        parsedRowsJson,
         initialStatus,
         seenByManager,
         req.user.id,
@@ -5717,7 +5775,7 @@ apiRouter.post("/tasks", requireAuth, requireRole("manager"), async (req, res) =
     const shamsiRaw = String(req.body?.shamsi_date || "").trim();
     const sendSmsOverride = Boolean(req.body?.send_sms);
     if (!title) {
-      res.status(400).json({ ok: false, message: "\u0639\u0646\u0648\u0627\u0646 \u0648\u0638\u06CC\u0641\u0647 / \u06A9\u0627\u0631 \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
+      res.status(400).json({ ok: false, message: "\u0639\u0646\u0648\u0627\u0646 \u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
       return;
     }
     const settings = await getSystemSettingsFromDb();
@@ -5734,7 +5792,7 @@ apiRouter.post("/tasks", requireAuth, requireRole("manager"), async (req, res) =
     let smsSent = false;
     const targetPhone = settings.worker_phone_number || workerInfo.phone_number || "";
     if (targetPhone && settings.melipayamak_username && settings.melipayamak_password && (sendSmsOverride || settings.sms_enabled && settings.sms_on_task_and_message)) {
-      const smsText = `\u0648\u0638\u06CC\u0641\u0647 \u062C\u062F\u06CC\u062F \u0627\u0632 \u0637\u0631\u0641 \u0645\u062F\u06CC\u0631\u06CC\u062A (\u0645\u062C\u06CC\u062F \u0646\u0648\u0631\u0627\u06CC\u06CC):
+      const smsText = `\u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u062C\u062F\u06CC\u062F \u0627\u0632 \u0637\u0631\u0641 \u0645\u062F\u06CC\u0631\u06CC\u062A (\u0645\u062C\u06CC\u062F \u0646\u0648\u0631\u0627\u06CC\u06CC) \u2014 \u062A\u0627\u0631\u06CC\u062E \u062A\u062D\u0648\u06CC\u0644 ${shamsiDate}:
 ${title}${description ? `
 ${description}` : ""}`;
       const smsRes = await sendMelipayamakSms(settings, targetPhone, smsText);
@@ -5744,7 +5802,7 @@ ${description}` : ""}`;
       ok: true,
       id: ins.insertId,
       smsSent,
-      message: smsSent ? "\u0648\u0638\u06CC\u0641\u0647 \u06A9\u0627\u0631\u06CC \u062C\u062F\u06CC\u062F \u0628\u0647 \u0686\u06A9\u200C\u0644\u06CC\u0633\u062A \u067E\u0631\u0633\u0646\u0644 \u0627\u0636\u0627\u0641\u0647 \u0634\u062F \u0648 \u0646\u0648\u062A\u06CC\u0641\u06CC\u06A9\u06CC\u0634\u0646 + \u067E\u06CC\u0627\u0645\u06A9 \u0627\u0631\u0633\u0627\u0644 \u06AF\u0631\u062F\u06CC\u062F." : "\u0648\u0638\u06CC\u0641\u0647 \u06A9\u0627\u0631\u06CC \u062C\u062F\u06CC\u062F \u062B\u0628\u062A \u0634\u062F \u0648 \u0627\u0639\u0644\u0627\u0646 \u0622\u0646 \u062F\u0631 \u06AF\u0648\u0634\u06CC \u067E\u0631\u0633\u0646\u0644 \u0646\u0645\u0627\u06CC\u0634 \u062F\u0627\u062F\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F."
+      message: smsSent ? "\u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u062C\u062F\u06CC\u062F \u062B\u0628\u062A \u0634\u062F \u0648 \u0646\u0648\u062A\u06CC\u0641\u06CC\u06A9\u06CC\u0634\u0646 + \u067E\u06CC\u0627\u0645\u06A9 \u0627\u0631\u0633\u0627\u0644 \u06AF\u0631\u062F\u06CC\u062F." : "\u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u062C\u062F\u06CC\u062F \u062B\u0628\u062A \u0634\u062F \u0648 \u0627\u0639\u0644\u0627\u0646 \u0622\u0646 \u062F\u0631 \u067E\u0646\u0644 \u067E\u0631\u0633\u0646\u0644 \u0646\u0645\u0627\u06CC\u0634 \u062F\u0627\u062F\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F."
     });
   } catch (err) {
     handleServerError(res, err);
@@ -5754,7 +5812,7 @@ apiRouter.patch("/tasks/:id/toggle", requireAuth, async (req, res) => {
   try {
     const taskId = Number(req.params.id);
     if (!taskId) {
-      res.status(400).json({ ok: false, message: "\u0634\u0646\u0627\u0633\u0647 \u06A9\u0627\u0631 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
+      res.status(400).json({ ok: false, message: "\u0634\u0646\u0627\u0633\u0647 \u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
       return;
     }
     const pool2 = getPool();
@@ -5763,14 +5821,14 @@ apiRouter.patch("/tasks/:id/toggle", requireAuth, async (req, res) => {
       [taskId]
     );
     if (rows.length === 0) {
-      res.status(404).json({ ok: false, message: "\u0645\u0648\u0631\u062F \u06A9\u0627\u0631\u06CC \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
+      res.status(404).json({ ok: false, message: "\u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
       return;
     }
     if (req.user.role !== "manager" && Number(rows[0].user_id) !== req.user.id) {
       res.status(403).json({
         ok: false,
         code: "FORBIDDEN",
-        message: "\u0634\u0645\u0627 \u0645\u062C\u0648\u0632 \u062A\u063A\u06CC\u06CC\u0631 \u0648\u0638\u06CC\u0641\u0647 \u06A9\u0627\u0631\u0628\u0631 \u062F\u06CC\u06AF\u0631 \u0631\u0627 \u0646\u062F\u0627\u0631\u06CC\u062F."
+        message: "\u0634\u0645\u0627 \u0645\u062C\u0648\u0632 \u062A\u063A\u06CC\u06CC\u0631 \u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u06A9\u0627\u0631\u0628\u0631 \u062F\u06CC\u06AF\u0631 \u0631\u0627 \u0646\u062F\u0627\u0631\u06CC\u062F."
       });
       return;
     }
@@ -5786,7 +5844,7 @@ apiRouter.patch("/tasks/:id/toggle", requireAuth, async (req, res) => {
     res.json({
       ok: true,
       is_completed: nextCompleted,
-      message: nextCompleted ? "\u0627\u0646\u062C\u0627\u0645 \u06A9\u0627\u0631 \u062B\u0628\u062A \u0634\u062F." : "\u0648\u0636\u0639\u06CC\u062A \u06A9\u0627\u0631 \u0628\u0647 \u062D\u0627\u0644\u062A \u062F\u0631 \u0627\u0646\u062A\u0638\u0627\u0631 \u062A\u063A\u06CC\u06CC\u0631 \u06CC\u0627\u0641\u062A."
+      message: nextCompleted ? "\u0627\u0646\u062C\u0627\u0645 \u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u062B\u0628\u062A \u0634\u062F." : "\u0648\u0636\u0639\u06CC\u062A \u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u0628\u0647 \u062D\u0627\u0644\u062A \u062F\u0631 \u0627\u0646\u062A\u0638\u0627\u0631 \u062A\u063A\u06CC\u06CC\u0631 \u06CC\u0627\u0641\u062A."
     });
   } catch (err) {
     handleServerError(res, err);
@@ -5797,7 +5855,7 @@ apiRouter.delete("/tasks/:id", requireAuth, requireRole("manager"), async (req, 
     const taskId = Number(req.params.id);
     const pool2 = getPool();
     await pool2.execute("DELETE FROM work_tasks WHERE id = ?", [taskId]);
-    res.json({ ok: true, message: "\u0645\u0648\u0631\u062F \u06A9\u0627\u0631\u06CC \u0627\u0632 \u0686\u06A9\u200C\u0644\u06CC\u0633\u062A \u062D\u0630\u0641 \u0634\u062F." });
+    res.json({ ok: true, message: "\u0628\u0631\u0646\u0627\u0645\u0647 \u06A9\u0627\u0631\u06CC \u062D\u0630\u0641 \u0634\u062F." });
   } catch (err) {
     handleServerError(res, err);
   }

@@ -365,7 +365,6 @@ export async function requireAuth(
     }
 
     const enforceInitialPassChange =
-      process.env.NODE_ENV === 'production' ||
       process.env.ENFORCE_PASSWORD_CHANGE === 'true' ||
       req.headers['x-enforce-password-change'] === '1';
 

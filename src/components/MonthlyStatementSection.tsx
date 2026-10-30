@@ -188,8 +188,8 @@ export function MonthlyStatementSection({
           </div>
         </div>
 
-        {/* دراپ‌دان انتخاب ماه کاری (۱۵ام به ۱۵ام) */}
-        <div className="flex items-center gap-2 bg-[#FCF9F2] border border-[#C5A059]/50 rounded-xl px-2.5 py-1.5 shrink-0 self-start sm:self-center">
+        {/* دراپ‌دان انتخاب ماه کاری (صرفاً نام ماه، بدون ایجاد اسکرول افقی در موبایل) */}
+        <div className="flex items-center gap-2 bg-[#FCF9F2] border border-[#C5A059]/50 rounded-xl px-2.5 py-1.5 shrink-0 max-w-full self-start sm:self-center">
           <Calendar className="w-3.5 h-3.5 text-[#9A7428] shrink-0" />
           <label
             htmlFor={`period-select-${role}`}
@@ -201,20 +201,20 @@ export function MonthlyStatementSection({
             id={`period-select-${role}`}
             value={activeStatement.periodKey}
             onChange={(e) => setSelectedPeriodKey(e.target.value)}
-            className="min-h-[30px] rounded-lg border border-[#C5A059]/60 bg-white px-2 text-[11px] font-extrabold text-[#0B192C] focus:outline-none cursor-pointer"
+            className="min-h-[30px] max-w-[150px] sm:max-w-[180px] rounded-lg border border-[#C5A059]/60 bg-white px-2 text-[11px] font-extrabold text-[#0B192C] focus:outline-none cursor-pointer truncate"
           >
             {generatedPeriods.map((p) => (
               <option key={p.periodKey} value={p.periodKey}>
-                {p.title} ({p.subtitle})
+                {p.title}
               </option>
             ))}
           </select>
         </div>
       </div>
 
-      {/* نوار کارت‌های سریع ماه‌ها (۱۵ام به ۱۵ام) جهت جابجایی با یک کلیک */}
+      {/* کارت‌های سریع ماه‌ها به صورت گرید منظم دو ردیفه (بدون اسکرول افقی در موبایل) */}
       {generatedPeriods.length > 1 && (
-        <div className="flex items-center gap-2 overflow-x-auto pb-1 pt-0.5">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 pt-0.5">
           {generatedPeriods.slice(0, 6).map((p) => {
             const isSelected = p.periodKey === activeStatement.periodKey;
             return (
@@ -222,7 +222,7 @@ export function MonthlyStatementSection({
                 key={p.periodKey}
                 type="button"
                 onClick={() => setSelectedPeriodKey(p.periodKey)}
-                className={`min-w-[175px] rounded-xl border p-2.5 text-right transition-all shrink-0 cursor-pointer ${
+                className={`rounded-xl border p-2 text-right transition-all cursor-pointer min-w-0 ${
                   isSelected
                     ? 'bg-[#0B192C] text-white border-[#C5A059] shadow-2xs'
                     : 'bg-slate-50 hover:bg-[#FCF9F2] text-[#0B192C] border-slate-200'
@@ -230,29 +230,29 @@ export function MonthlyStatementSection({
               >
                 <div className="flex items-center justify-between gap-1">
                   <span
-                    className={`text-[10.5px] font-extrabold truncate ${
+                    className={`text-[11px] font-extrabold truncate ${
                       isSelected ? 'text-[#C5A059]' : 'text-[#0B192C]'
                     }`}
                   >
                     {p.title}
                   </span>
                 </div>
-                <div className="mt-1 flex items-center justify-between text-[10px] tabular-nums">
+                <div className="mt-1 flex items-center justify-between gap-1 text-[9.5px] tabular-nums">
                   <span className={isSelected ? 'text-slate-300' : 'text-slate-500'}>
-                    حقوق + اضافه‌کاری:
+                    حقوق+اضافه:
                   </span>
-                  <strong className={isSelected ? 'text-white' : 'text-[#0B192C]'}>
+                  <strong className={`truncate ${isSelected ? 'text-white' : 'text-[#0B192C]'}`}>
                     {formatToman(p.salaryPlusOvertimeToman)}
                   </strong>
                 </div>
-                <div className="mt-0.5 flex items-center justify-between text-[9.5px] tabular-nums">
+                <div className="mt-0.5 flex items-center justify-between gap-1 text-[9px] tabular-nums">
                   <span className={isSelected ? 'text-slate-300' : 'text-slate-500'}>
-                    {role === 'worker' ? 'دریافتی ماه:' : 'پرداختی ماه:'}
+                    {role === 'worker' ? 'دریافتی:' : 'پرداختی:'}
                   </span>
                   <span
-                    className={
+                    className={`truncate ${
                       isSelected ? 'text-[#C5A059]' : 'text-emerald-700 font-semibold'
-                    }
+                    }`}
                   >
                     {formatToman(p.approvedTotalPaidOrReceivedToman)}
                   </span>
@@ -268,10 +268,7 @@ export function MonthlyStatementSection({
         <div className="space-y-0.5">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs sm:text-sm font-extrabold text-[#C5A059]">
-              {activeStatement.title}
-            </span>
-            <span className="text-[10.5px] text-slate-300 tabular-nums">
-              ({activeStatement.subtitle})
+              صورتحساب {activeStatement.title}
             </span>
           </div>
           <div className="text-[10px] text-slate-300 tabular-nums flex flex-wrap items-center gap-x-3 gap-y-0.5">
