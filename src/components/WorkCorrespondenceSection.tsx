@@ -19,7 +19,7 @@ import {
   CalendarClock,
 } from 'lucide-react';
 import { DeliveryChannel, UserRole, WorkCorrespondence } from '../shared/types';
-import { apiRequest } from '../services/api';
+import { apiRequest, isConnectionErrorMessage } from '../services/api';
 import { pad2, toPersianDigits } from '../shared/jalali';
 import { ShamsiDatePicker } from './ShamsiDatePicker';
 import { FilePreviewModal, PreviewFileItem } from './FilePreviewModal';
@@ -128,50 +128,59 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
   onUnreadChangeRef.current = onUnreadChange;
   const lastReportedUnreadRef = useRef<number | null>(null);
 
-  const loadCorrespondences = useCallback(async () => {
-    try {
-      const params = new URLSearchParams();
-      if (search.trim()) params.set('search', search.trim());
-      if (senderFilter) params.set('senderRole', senderFilter);
-      if (fromShamsi.trim()) params.set('fromShamsi', fromShamsi.trim());
-      if (toShamsi.trim()) params.set('toShamsi', toShamsi.trim());
+  const loadCorrespondences = useCallback(
+    async (silentOrEvent?: boolean | unknown) => {
+      const isSilent = silentOrEvent === true;
+      try {
+        const params = new URLSearchParams();
+        if (search.trim()) params.set('search', search.trim());
+        if (senderFilter) params.set('senderRole', senderFilter);
+        if (fromShamsi.trim()) params.set('fromShamsi', fromShamsi.trim());
+        if (toShamsi.trim()) params.set('toShamsi', toShamsi.trim());
 
-      const res = await apiRequest<{
-        ok: boolean;
-        correspondences: WorkCorrespondence[];
-        unreadCount: number;
-      }>(`/api/correspondences?${params.toString()}`);
+        const res = await apiRequest<{
+          ok: boolean;
+          correspondences: WorkCorrespondence[];
+          unreadCount: number;
+        }>(`/api/correspondences?${params.toString()}`);
 
-      setItems(res.correspondences);
-      setUnreadCount(res.unreadCount);
-      if (
-        onUnreadChangeRef.current &&
-        lastReportedUnreadRef.current !== res.unreadCount
-      ) {
-        lastReportedUnreadRef.current = res.unreadCount;
-        onUnreadChangeRef.current(res.unreadCount);
+        setItems(res.correspondences);
+        setUnreadCount(res.unreadCount);
+        setFeedback((prev) =>
+          prev?.type === 'error' && isConnectionErrorMessage(prev.text) ? null : prev
+        );
+        if (
+          onUnreadChangeRef.current &&
+          lastReportedUnreadRef.current !== res.unreadCount
+        ) {
+          lastReportedUnreadRef.current = res.unreadCount;
+          onUnreadChangeRef.current(res.unreadCount);
+        }
+      } catch (err) {
+        if (!isSilent) {
+          setFeedback({ type: 'error', text: (err as Error).message });
+        }
+      } finally {
+        setLoading(false);
       }
-    } catch (err) {
-      setFeedback({ type: 'error', text: (err as Error).message });
-    } finally {
-      setLoading(false);
-    }
-  }, [search, senderFilter, fromShamsi, toShamsi]);
+    },
+    [search, senderFilter, fromShamsi, toShamsi]
+  );
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      loadCorrespondences();
+      loadCorrespondences(false);
     }, 200);
     return () => window.clearTimeout(timer);
   }, [loadCorrespondences]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
-      loadCorrespondences();
+      loadCorrespondences(true);
     }, 10000);
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
-        loadCorrespondences();
+        loadCorrespondences(true);
       }
     };
     window.addEventListener('focus', onFocusOrVisible);

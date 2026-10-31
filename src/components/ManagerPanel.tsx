@@ -25,6 +25,7 @@ import { calculateLateAndAbsenceRates } from '../shared/calculationEngine';
 import {
   apiRequest,
   EVENT_TYPE_LABELS,
+  isConnectionErrorMessage,
   STATUS_LABELS,
   TX_TYPE_LABELS,
   withAuthTokenUrl,
@@ -502,87 +503,122 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     }
   };
 
-  const loadDashboardAndSettings = useCallback(async (syncSettings = false) => {
-    try {
-      const dashRes = await apiRequest<DashboardResponse>('/api/manager/dashboard');
-      setDashboard(dashRes);
-      if (dashRes.settings) {
-        setSettingsForm((prev) =>
-          syncSettings || !settingsLoadedFromServer ? dashRes.settings : prev
-        );
-        setSettingsLoadedFromServer(true);
-      }
-    } catch (err) {
+  const loadDashboardAndSettings = useCallback(
+    async (syncSettings = false, silent = false) => {
       try {
-        const settingsRes = await apiRequest<{ ok: boolean; settings: SystemSettings }>(
-          '/api/settings'
+        const dashRes = await apiRequest<DashboardResponse>('/api/manager/dashboard');
+        setDashboard(dashRes);
+        setFeedback((prev) =>
+          prev?.type === 'error' && isConnectionErrorMessage(prev.text) ? null : prev
         );
-        if (settingsRes?.settings) {
-          setSettingsForm(settingsRes.settings);
+        if (dashRes.settings) {
+          setSettingsForm((prev) =>
+            syncSettings || !settingsLoadedFromServer ? dashRes.settings : prev
+          );
           setSettingsLoadedFromServer(true);
         }
-      } catch {
-        // Keep default settings so UI remains usable
+      } catch (err) {
+        try {
+          const settingsRes = await apiRequest<{ ok: boolean; settings: SystemSettings }>(
+            '/api/settings'
+          );
+          if (settingsRes?.settings) {
+            setSettingsForm(settingsRes.settings);
+            setSettingsLoadedFromServer(true);
+          }
+        } catch {
+          // Keep default settings so UI remains usable
+        }
+        if (!silent) {
+          setFeedback({ type: 'error', text: (err as Error).message });
+        }
       }
-      setFeedback({ type: 'error', text: (err as Error).message });
-    }
-  }, [settingsLoadedFromServer]);
+    },
+    [settingsLoadedFromServer]
+  );
 
-  const loadAttendanceList = useCallback(async () => {
-    try {
-      const params = new URLSearchParams();
-      if (attFromShamsi.trim()) params.set('fromShamsi', attFromShamsi.trim());
-      if (attToShamsi.trim()) params.set('toShamsi', attToShamsi.trim());
-      const [res, leavesRes] = await Promise.all([
-        apiRequest<{
+  const loadAttendanceList = useCallback(
+    async (silentOrEvent?: boolean | unknown) => {
+      const isSilent = silentOrEvent === true;
+      try {
+        const params = new URLSearchParams();
+        if (attFromShamsi.trim()) params.set('fromShamsi', attFromShamsi.trim());
+        if (attToShamsi.trim()) params.set('toShamsi', attToShamsi.trim());
+        const [res, leavesRes] = await Promise.all([
+          apiRequest<{
+            ok: boolean;
+            dailySummaries: DailyAttendanceSummary[];
+            historicalRecords: HistoricalWorkRecord[];
+          }>(`/api/attendance/history?${params.toString()}`),
+          apiRequest<{
+            ok: boolean;
+            leaveRequests: LeaveRequestItem[];
+            quotaSummary: LeaveQuotaSummary;
+          }>('/api/leaves'),
+        ]);
+        setAttendanceSummaries(res.dailySummaries);
+        setHistoricalRecords(res.historicalRecords || []);
+        setLeaveRequests(leavesRes.leaveRequests || []);
+        setFeedback((prev) =>
+          prev?.type === 'error' && isConnectionErrorMessage(prev.text) ? null : prev
+        );
+      } catch (err) {
+        if (!isSilent) {
+          setFeedback({ type: 'error', text: (err as Error).message });
+        }
+      }
+    },
+    [attFromShamsi, attToShamsi]
+  );
+
+  const loadReportsList = useCallback(
+    async (silentOrEvent?: boolean | unknown) => {
+      const isSilent = silentOrEvent === true;
+      try {
+        const params = new URLSearchParams();
+        if (repSearch.trim()) params.set('search', repSearch.trim());
+        if (repFromShamsi.trim()) params.set('fromShamsi', repFromShamsi.trim());
+        if (repToShamsi.trim()) params.set('toShamsi', repToShamsi.trim());
+        const res = await apiRequest<{ ok: boolean; reports: DailyWorkReport[] }>(
+          `/api/reports?${params.toString()}`
+        );
+        setReports(res.reports);
+        setFeedback((prev) =>
+          prev?.type === 'error' && isConnectionErrorMessage(prev.text) ? null : prev
+        );
+      } catch (err) {
+        if (!isSilent) {
+          setFeedback({ type: 'error', text: (err as Error).message });
+        }
+      }
+    },
+    [repSearch, repFromShamsi, repToShamsi]
+  );
+
+  const loadFinanceList = useCallback(
+    async (silentOrEvent?: boolean | unknown) => {
+      const isSilent = silentOrEvent === true;
+      try {
+        const params = new URLSearchParams();
+        if (finStatusFilter) params.set('status', finStatusFilter);
+        if (finTypeFilter) params.set('txType', finTypeFilter);
+        if (finSearch.trim()) params.set('search', finSearch.trim());
+        const res = await apiRequest<{
           ok: boolean;
-          dailySummaries: DailyAttendanceSummary[];
-          historicalRecords: HistoricalWorkRecord[];
-        }>(`/api/attendance/history?${params.toString()}`),
-        apiRequest<{
-          ok: boolean;
-          leaveRequests: LeaveRequestItem[];
-          quotaSummary: LeaveQuotaSummary;
-        }>('/api/leaves'),
-      ]);
-      setAttendanceSummaries(res.dailySummaries);
-      setHistoricalRecords(res.historicalRecords || []);
-      setLeaveRequests(leavesRes.leaveRequests || []);
-    } catch (err) {
-      setFeedback({ type: 'error', text: (err as Error).message });
-    }
-  }, [attFromShamsi, attToShamsi]);
-
-  const loadReportsList = useCallback(async () => {
-    try {
-      const params = new URLSearchParams();
-      if (repSearch.trim()) params.set('search', repSearch.trim());
-      if (repFromShamsi.trim()) params.set('fromShamsi', repFromShamsi.trim());
-      if (repToShamsi.trim()) params.set('toShamsi', repToShamsi.trim());
-      const res = await apiRequest<{ ok: boolean; reports: DailyWorkReport[] }>(
-        `/api/reports?${params.toString()}`
-      );
-      setReports(res.reports);
-    } catch (err) {
-      setFeedback({ type: 'error', text: (err as Error).message });
-    }
-  }, [repSearch, repFromShamsi, repToShamsi]);
-
-  const loadFinanceList = useCallback(async () => {
-    try {
-      const params = new URLSearchParams();
-      if (finStatusFilter) params.set('status', finStatusFilter);
-      if (finTypeFilter) params.set('txType', finTypeFilter);
-      if (finSearch.trim()) params.set('search', finSearch.trim());
-      const res = await apiRequest<{
-        ok: boolean;
-        transactions: FinancialTransaction[];
-      }>(`/api/finance?${params.toString()}`);
-      setTransactions(res.transactions);
-    } catch (err) {
-      setFeedback({ type: 'error', text: (err as Error).message });
-    }
-  }, [finStatusFilter, finTypeFilter, finSearch]);
+          transactions: FinancialTransaction[];
+        }>(`/api/finance?${params.toString()}`);
+        setTransactions(res.transactions);
+        setFeedback((prev) =>
+          prev?.type === 'error' && isConnectionErrorMessage(prev.text) ? null : prev
+        );
+      } catch (err) {
+        if (!isSilent) {
+          setFeedback({ type: 'error', text: (err as Error).message });
+        }
+      }
+    },
+    [finStatusFilter, finTypeFilter, finSearch]
+  );
 
   const hasInitialLoadedRef = useRef(false);
 
@@ -590,10 +626,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     setLoading(true);
     try {
       await Promise.all([
-        loadDashboardAndSettings(false),
-        loadAttendanceList(),
-        loadReportsList(),
-        loadFinanceList(),
+        loadDashboardAndSettings(false, false),
+        loadAttendanceList(false),
+        loadReportsList(false),
+        loadFinanceList(false),
       ]);
     } catch {
       // handled in individual loaders
@@ -612,7 +648,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   useEffect(() => {
     if (!hasInitialLoadedRef.current) return;
     const timer = window.setTimeout(() => {
-      void loadAttendanceList();
+      void loadAttendanceList(false);
     }, 250);
     return () => window.clearTimeout(timer);
   }, [loadAttendanceList]);
@@ -620,7 +656,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   useEffect(() => {
     if (!hasInitialLoadedRef.current) return;
     const timer = window.setTimeout(() => {
-      void loadReportsList();
+      void loadReportsList(false);
     }, 250);
     return () => window.clearTimeout(timer);
   }, [loadReportsList]);
@@ -628,7 +664,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   useEffect(() => {
     if (!hasInitialLoadedRef.current) return;
     const timer = window.setTimeout(() => {
-      void loadFinanceList();
+      void loadFinanceList(false);
     }, 250);
     return () => window.clearTimeout(timer);
   }, [loadFinanceList]);
@@ -636,10 +672,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const refreshAllSilent = useCallback(async () => {
     try {
       await Promise.all([
-        loadDashboardAndSettings(false),
-        loadAttendanceList(),
-        loadReportsList(),
-        loadFinanceList(),
+        loadDashboardAndSettings(false, true),
+        loadAttendanceList(true),
+        loadReportsList(true),
+        loadFinanceList(true),
       ]);
     } catch {
       // ignore background poll errors

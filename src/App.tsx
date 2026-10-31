@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { SystemSettings, UserProfile } from './shared/types';
-import { AUTH_EXPIRED_EVENT, apiRequest, setStoredToken } from './services/api';
+import {
+  AUTH_EXPIRED_EVENT,
+  CONNECTION_RESTORED_EVENT,
+  apiRequest,
+  setStoredToken,
+} from './services/api';
 import {
   authenticateWithDeviceBiometric,
   getStoredBiometricInfo,
@@ -53,9 +58,14 @@ export default function App() {
       setUser(null);
       updateAppNotificationBadge(0);
     };
+    const handleConnectionRestored = () => {
+      setConnectionError(null);
+    };
     window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    window.addEventListener(CONNECTION_RESTORED_EVENT, handleConnectionRestored);
     return () => {
       window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+      window.removeEventListener(CONNECTION_RESTORED_EVENT, handleConnectionRestored);
     };
   }, []);
 
@@ -83,6 +93,7 @@ export default function App() {
         }>('/api/health');
 
         if (mounted) {
+          setConnectionError(null);
           if (health.serverTime?.shamsiDate) {
             setServerShamsiDate(health.serverTime.shamsiDate);
           }
@@ -122,8 +133,14 @@ export default function App() {
       }
     }
     bootstrap();
+
+    const handleOnline = () => {
+      bootstrap();
+    };
+    window.addEventListener('online', handleOnline);
     return () => {
       mounted = false;
+      window.removeEventListener('online', handleOnline);
     };
   }, []);
 

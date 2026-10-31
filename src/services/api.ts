@@ -56,6 +56,17 @@ export function withAuthTokenUrl(url: string | null | undefined): string {
 }
 
 export const AUTH_EXPIRED_EVENT = 'mgammon:auth-expired';
+export const CONNECTION_RESTORED_EVENT = 'mgammon:connection-restored';
+
+export function isConnectionErrorMessage(msg: string | null | undefined): boolean {
+  if (!msg) return false;
+  return (
+    msg.includes('عدم برقراری ارتباط با سرور') ||
+    msg.includes('ارتباط با سرور برقرار نیست') ||
+    msg.includes('پایگاه داده هنوز آماده') ||
+    msg.includes('پاسخ نامعتبر از سرور')
+  );
+}
 
 export async function apiRequest<T>(
   endpoint: string,
@@ -76,28 +87,62 @@ export async function apiRequest<T>(
     headers['X-CSRF-Token'] = csrfToken;
   }
 
-  let response: Response;
-  try {
-    response = await fetch(endpoint, {
-      cache: 'no-store',
-      ...options,
-      credentials: 'include',
-      headers,
-    });
-  } catch {
-    throw new Error('عدم برقراری ارتباط با سرور. لطفاً اتصال اینترنت یا وضعیت سرور را بررسی کنید.');
+  const method = (options.method || 'GET').toUpperCase();
+  const isSafeGet = method === 'GET';
+  const maxAttempts = isSafeGet ? 3 : 1;
+
+  let response: Response | null = null;
+  let data: Record<string, unknown> | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      response = await fetch(endpoint, {
+        cache: 'no-store',
+        ...options,
+        credentials: 'include',
+        headers,
+      });
+    } catch {
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 650));
+        continue;
+      }
+      throw new Error(
+        'عدم برقراری ارتباط با سرور. لطفاً اتصال اینترنت یا وضعیت سرور را بررسی کنید.'
+      );
+    }
+
+    const headerCsrf = response.headers.get('X-CSRF-Token');
+    if (headerCsrf) {
+      inMemoryCsrfToken = headerCsrf;
+    }
+
+    try {
+      data = await response.json();
+    } catch {
+      // در هاست‌های اشتراکی/cPanel هنگام بیدار شدن سرویس Node.js ممکن است برای ۱ ثانیه پاسخ HTML 502/503 برگردد
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 750));
+        continue;
+      }
+      throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
+    }
+
+    if (
+      (response.status === 502 || response.status === 503 || response.status === 504) &&
+      attempt < maxAttempts
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 750));
+      continue;
+    }
+
+    break;
   }
 
-  const headerCsrf = response.headers.get('X-CSRF-Token');
-  if (headerCsrf) {
-    inMemoryCsrfToken = headerCsrf;
-  }
-
-  let data: Record<string, unknown>;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
+  if (!response || !data) {
+    throw new Error(
+      'عدم برقراری ارتباط با سرور. لطفاً اتصال اینترنت یا وضعیت سرور را بررسی کنید.'
+    );
   }
 
   if (typeof data.csrfToken === 'string' && data.csrfToken) {
@@ -122,6 +167,10 @@ export async function apiRequest<T>(
         ? data.message
         : 'خطایی در انجام عملیات رخ داد.';
     throw new Error(msg);
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(CONNECTION_RESTORED_EVENT));
   }
 
   return data as T;

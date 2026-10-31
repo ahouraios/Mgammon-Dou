@@ -84,6 +84,13 @@ export async function createApp() {
     if (!isDatabaseInitialized()) {
       await waitForPendingDatabaseInit();
     }
+    if (!isDatabaseInitialized() && process.env.VITEST !== 'true') {
+      try {
+        await initializeDatabase();
+      } catch {
+        // handled below
+      }
+    }
     if (!isDatabaseInitialized()) {
       res.status(503).json({
         ok: false,

@@ -387,6 +387,16 @@ export async function checkDatabaseConnection(): Promise<{
     };
   }
   if (!isDatabaseInitialized()) {
+    await waitForPendingDatabaseInit();
+  }
+  if (!isDatabaseInitialized() && process.env.VITEST !== 'true') {
+    try {
+      await initializeDatabase();
+    } catch {
+      // handled below if still not initialized
+    }
+  }
+  if (!isDatabaseInitialized()) {
     return {
       connected: false,
       initialized: false,

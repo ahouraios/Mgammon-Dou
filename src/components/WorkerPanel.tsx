@@ -16,7 +16,7 @@ import {
   WorkerLiveState,
   WorkTaskItem,
 } from '../shared/types';
-import { apiRequest } from '../services/api';
+import { apiRequest, isConnectionErrorMessage } from '../services/api';
 import {
   formatMinutesToDurationPersian,
   formatMinutesToHHMM,
@@ -412,7 +412,8 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     'profile' | 'excel_history' | 'contract' | 'storage_cleanup' | 'guide'
   >('profile');
 
-  const loadAllWorkerData = useCallback(async () => {
+  const loadAllWorkerData = useCallback(async (silentOrEvent?: boolean | unknown) => {
+    const isSilent = silentOrEvent === true;
     try {
       const [liveRes, histRes, leaveRes, repRes, finRes, taskRes] = await Promise.all([
         apiRequest<{
@@ -541,25 +542,30 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
           });
         }
       }
+      setFeedback((prev) =>
+        prev?.type === 'error' && isConnectionErrorMessage(prev.text) ? null : prev
+      );
     } catch (err) {
-      setFeedback({ type: 'error', text: (err as Error).message });
+      if (!isSilent) {
+        setFeedback({ type: 'error', text: (err as Error).message });
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    loadAllWorkerData();
+    loadAllWorkerData(false);
   }, [loadAllWorkerData]);
 
   // بروزرسانی خودکار وضعیت پنل پرسنل (هر ۱۰ ثانیه و هنگام بازگشت به صفحه) برای دریافت آنی تأییدیه‌ها، تسک‌ها و نامه‌های مدیر
   useEffect(() => {
     const interval = window.setInterval(() => {
-      loadAllWorkerData();
+      loadAllWorkerData(true);
     }, 10000);
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'visible') {
-        loadAllWorkerData();
+        loadAllWorkerData(true);
       }
     };
     window.addEventListener('focus', onFocusOrVisible);
