@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { UserRole, WorkTaskItem } from '../shared/types';
 import { apiRequest } from '../services/api';
 import { ShamsiDatePicker } from './ShamsiDatePicker';
@@ -45,12 +45,14 @@ export const DailyTasksChecklist: React.FC<DailyTasksChecklistProps> = ({
   const [newDate, setNewDate] = useState(currentShamsiDate);
   const [submitting, setSubmitting] = useState(false);
   const [taskFeedback, setTaskFeedback] = useState<string | null>(null);
+  const createFormRef = useRef<HTMLFormElement>(null);
+  const titleInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (currentShamsiDate && !newTitle && !newDesc) {
+    if (currentShamsiDate && !newDate) {
       setNewDate(currentShamsiDate);
     }
-  }, [currentShamsiDate, newTitle, newDesc]);
+  }, [currentShamsiDate, newDate]);
 
   const fetchTasks = async () => {
     try {
@@ -76,24 +78,35 @@ export const DailyTasksChecklist: React.FC<DailyTasksChecklistProps> = ({
   const pendingTasks = tasks.filter((t) => !t.is_completed);
   const completedTasks = tasks.filter((t) => t.is_completed);
 
+  const resetCreateForm = () => {
+    setNewTitle('');
+    setNewDesc('');
+    setNewDate(currentShamsiDate);
+    createFormRef.current?.reset();
+    window.setTimeout(() => {
+      titleInputRef.current?.focus();
+    }, 30);
+  };
+
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTitle.trim()) return;
     setSubmitting(true);
     setTaskFeedback(null);
+    const targetDate = newDate || currentShamsiDate;
     try {
       await apiRequest('/api/tasks', {
         method: 'POST',
         body: JSON.stringify({
           title: newTitle.trim(),
           description: newDesc.trim() || null,
-          shamsi_date: newDate,
+          shamsi_date: targetDate,
         }),
       });
-      setNewTitle('');
-      setNewDesc('');
-      setNewDate(currentShamsiDate);
-      setTaskFeedback('برنامه کاری جدید با موفقیت ثبت شد و فرم برای مورد بعدی خالی شد.');
+      resetCreateForm();
+      setTaskFeedback(
+        `برنامه کاری جدید برای تاریخ ${toPersianDigits(targetDate)} ثبت شد و فرم برای ورودی بعدی پاکسازی گردید.`
+      );
       await fetchTasks();
     } catch {
       // ignore
@@ -173,14 +186,14 @@ export const DailyTasksChecklist: React.FC<DailyTasksChecklistProps> = ({
           </span>
         </div>
       ) : (
-        <div className="space-y-2.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
           {pendingTasks.map((task) => {
             const isFutureDue =
               Boolean(currentShamsiDate) && task.shamsi_date > currentShamsiDate;
             return (
               <div
                 key={task.id}
-                className="rounded-2xl bg-white border-2 border-[#C5A059] p-3.5 space-y-2.5 shadow-2xs"
+                className="rounded-2xl bg-white border-2 border-[#C5A059] p-3.5 space-y-2.5 shadow-2xs flex flex-col justify-between"
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex items-start gap-2.5">
@@ -267,7 +280,7 @@ export const DailyTasksChecklist: React.FC<DailyTasksChecklistProps> = ({
     </div>
   );
 
-  // بخش ۲ (ویژه مدیر در حالت مستقل): فرم ثبت برنامه کاری جدید با امکان انتخاب تاریخ‌های دورتر
+  // بخش ۲ (ویژه مدیر در حالت مستقل): فرم ثبت برنامه کاری جدید با امکان انتخاب تاریخ‌های دورتر و پاکسازی کامل پس از ثبت
   const renderManagerCreateSection = () =>
     role === 'manager' && !hideCreateForm ? (
       <div className="rounded-2xl bg-white border border-[#C5A059]/50 p-4 space-y-3">
@@ -289,49 +302,73 @@ export const DailyTasksChecklist: React.FC<DailyTasksChecklistProps> = ({
 
         {showAddForm && (
           <form
+            ref={createFormRef}
             onSubmit={handleCreateTask}
             className="rounded-2xl bg-[#FCF9F2] border border-[#C5A059]/60 p-3.5 space-y-3"
           >
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  عنوان برنامه کاری
+                  عنوان برنامه کاری (تایپ مستقیم توسط مدیر)
                 </label>
                 <input
+                  ref={titleInputRef}
                   type="text"
                   required
                   value={newTitle}
                   onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder="مثلاً: تحویل سفارش X..."
-                  className="w-full min-h-[40px] rounded-xl border border-slate-200 bg-white px-3 text-xs focus:outline-none focus:border-[#0B192C]"
+                  placeholder="عنوان برنامه کاری را تایپ کنید (مثلاً: تحویل سفارش X)..."
+                  className="w-full min-h-[42px] rounded-xl border border-slate-200 bg-white px-3 text-xs focus:outline-none focus:border-[#0B192C]"
                 />
               </div>
               <ShamsiDatePicker
-                label="تاریخ تحویل / انجام (امروز یا روزهای آینده)"
+                label="تاریخ تحویل / انجام برنامه کاری (امروز یا روزهای آینده)"
                 value={newDate}
                 onChange={setNewDate}
                 todayShamsi={currentShamsiDate}
               />
             </div>
+
+            {newDate > currentShamsiDate && (
+              <div className="rounded-xl bg-indigo-50/80 border border-indigo-200 px-3 py-2 flex items-center gap-2 text-xs text-indigo-950">
+                <CalendarClock className="w-4 h-4 text-indigo-700 shrink-0" />
+                <span>
+                  این برنامه کاری برای تاریخ آینده{' '}
+                  <strong className="tabular-nums">{toPersianDigits(newDate)}</strong> زمان‌بندی و ثبت می‌شود.
+                </span>
+              </div>
+            )}
+
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
-                توضیحات تکمیلی (اختیاری)
+                شرح و جزئیات برنامه کاری (اختیاری)
               </label>
-              <input
-                type="text"
+              <textarea
+                rows={2}
                 value={newDesc}
                 onChange={(e) => setNewDesc(e.target.value)}
-                placeholder="جزئیات یا نکات لازم را تایپ کنید..."
-                className="w-full min-h-[40px] rounded-xl border border-slate-200 bg-white px-3 text-xs focus:outline-none focus:border-[#0B192C]"
+                placeholder="شرح کامل برنامه کاری، جزئیات تحویل و نکات لازم را تایپ کنید..."
+                className="w-full rounded-xl border border-slate-200 bg-white p-3 text-xs leading-6 focus:outline-none focus:border-[#0B192C]"
               />
             </div>
-            <button
-              type="submit"
-              disabled={submitting}
-              className="w-full min-h-[40px] rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold hover:bg-[#142844] cursor-pointer"
-            >
-              {submitting ? 'در حال ثبت...' : 'ثبت و ارسال برنامه کاری'}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="submit"
+                disabled={submitting}
+                className="flex-1 min-h-[42px] rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold hover:bg-[#142844] cursor-pointer"
+              >
+                {submitting ? 'در حال ثبت...' : 'ثبت و ارسال برنامه کاری جدید'}
+              </button>
+              {(newTitle || newDesc || newDate !== currentShamsiDate) && (
+                <button
+                  type="button"
+                  onClick={resetCreateForm}
+                  className="min-h-[42px] px-3.5 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-600 hover:text-slate-900 cursor-pointer"
+                >
+                  پاکسازی فرم
+                </button>
+              )}
+            </div>
             {taskFeedback && (
               <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3 py-2 text-[11px] font-bold text-emerald-900 flex items-center justify-between">
                 <span>{taskFeedback}</span>

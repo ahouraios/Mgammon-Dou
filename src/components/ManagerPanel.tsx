@@ -291,7 +291,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   onUserAvatarChange,
 }) => {
   const [activeTab, setActiveTab] = useState<ManagerTab>('dashboard');
-  const [activeDashCard, setActiveDashCard] = useState<ManagerDashCard>('approvals');
+  const [activeDashCard, setActiveDashCard] = useState<ManagerDashCard | null>('approvals');
   const [activeAttCard, setActiveAttCard] = useState<ManagerAttCard>('calendar');
   const [activeRepCard, setActiveRepCard] = useState<ManagerRepCard>('daily_reports');
   const [activeFinCard, setActiveFinCard] = useState<ManagerFinCard>('transactions');
@@ -301,6 +301,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     'today_and_recent'
   );
   const [showAllDashReports, setShowAllDashReports] = useState(false);
+
+  const toggleDashCard = (card: ManagerDashCard) => {
+    setActiveDashCard((prev) => (prev === card ? null : card));
+  };
   const [dashClaimFilter, setDashClaimFilter] = useState<
     'all' | 'pending' | 'late' | 'leaves' | 'petty_cash' | 'advance'
   >('all');
@@ -1194,7 +1198,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   }, [reports, dashReportFilter, currentShamsi]);
 
   const visibleDashReports = React.useMemo(() => {
-    return showAllDashReports ? dashboardFilteredReports : dashboardFilteredReports.slice(0, 3);
+    return showAllDashReports ? dashboardFilteredReports : dashboardFilteredReports.slice(0, 4);
   }, [dashboardFilteredReports, showAllDashReports]);
 
   // شمارش مطالبات در انتظار تأیید (مرخصی، تنخواه، مساعده، سوابق، تأخیر ورود)
@@ -1543,27 +1547,38 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               onOpenFinance={() => handleSelectTab('finance')}
             />
 
-            {/* شبکه ۲ ردیفه و ۳ ستونه کارت‌های کوچک و رنگی داشبورد */}
+            {/* شبکه ۲ ستونه کارت‌های کوچک و رنگی داشبورد مدیریت */}
             <div className="rounded-2xl bg-white border border-slate-200 p-3 shadow-2xs space-y-2.5">
-              <div className="flex items-center justify-between gap-2 px-0.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
                 <span className="text-xs font-extrabold text-[#0B192C]">
-                  بخش‌های داشبورد مدیریت (برای مشاهده روی کارت کلیک کنید)
+                  داشبورد مدیریت — برای باز یا بسته کردن جزئیات هر بخش روی کارت کلیک کنید
                 </span>
-                <button
-                  type="button"
-                  onClick={() => refreshAll()}
-                  className="text-[11px] font-bold text-[#9A7428] hover:text-[#0B192C] cursor-pointer"
-                >
-                  بروزرسانی سریع
-                </button>
+                <div className="flex items-center gap-2">
+                  {activeDashCard && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveDashCard(null)}
+                      className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-[10.5px] font-bold text-slate-700 cursor-pointer"
+                    >
+                      بستن بخش باز
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => refreshAll()}
+                    className="text-[11px] font-bold text-[#9A7428] hover:text-[#0B192C] cursor-pointer"
+                  >
+                    بروزرسانی
+                  </button>
+                </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+              <div className="grid grid-cols-2 gap-2.5">
                 {/* کارت ۱: مطالبات، مرخصی و تأخیرها */}
                 <button
                   type="button"
-                  onClick={() => setActiveDashCard('approvals')}
-                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                  onClick={() => toggleDashCard('approvals')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[80px] ${
                     activeDashCard === 'approvals'
                       ? 'bg-gradient-to-br from-amber-500 to-orange-600 text-white border-amber-600 shadow-md scale-[1.01]'
                       : 'bg-gradient-to-br from-amber-50 via-white to-orange-50/70 text-[#0B192C] border-amber-200 hover:border-amber-400'
@@ -1608,8 +1623,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 {/* کارت ۲: گزارش کار روزانه */}
                 <button
                   type="button"
-                  onClick={() => setActiveDashCard('reports_tasks')}
-                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                  onClick={() => toggleDashCard('reports_tasks')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[80px] ${
                     activeDashCard === 'reports_tasks'
                       ? 'bg-gradient-to-br from-emerald-600 to-teal-700 text-white border-emerald-700 shadow-md scale-[1.01]'
                       : 'bg-gradient-to-br from-emerald-50 via-white to-teal-50/70 text-[#0B192C] border-emerald-200 hover:border-emerald-400'
@@ -1649,11 +1664,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 </button>
 
-                {/* کارت ۳: ارسال سریع پیام و برنامه کاری (ادغام‌شده) */}
+                {/* کارت ۳: ارسال پیام و برنامه کاری (ادغام‌شده) */}
                 <button
                   type="button"
-                  onClick={() => setActiveDashCard('quick_message')}
-                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                  onClick={() => toggleDashCard('quick_message')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[80px] ${
                     activeDashCard === 'quick_message'
                       ? 'bg-gradient-to-br from-purple-600 to-indigo-700 text-white border-purple-700 shadow-md scale-[1.01]'
                       : 'bg-gradient-to-br from-purple-50 via-white to-indigo-50/70 text-[#0B192C] border-purple-200 hover:border-purple-400'
@@ -1698,8 +1713,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 {/* کارت ۴: صورتحساب ماهانه */}
                 <button
                   type="button"
-                  onClick={() => setActiveDashCard('monthly_statement')}
-                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                  onClick={() => toggleDashCard('monthly_statement')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[80px] ${
                     activeDashCard === 'monthly_statement'
                       ? 'bg-gradient-to-br from-sky-600 to-blue-700 text-white border-sky-700 shadow-md scale-[1.01]'
                       : 'bg-gradient-to-br from-sky-50 via-white to-blue-50/70 text-[#0B192C] border-sky-200 hover:border-sky-400'
@@ -1742,8 +1757,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 {/* کارت ۵: خلاصه ساعات کاری و شیفت */}
                 <button
                   type="button"
-                  onClick={() => setActiveDashCard('live_kpis')}
-                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                  onClick={() => toggleDashCard('live_kpis')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[80px] ${
                     activeDashCard === 'live_kpis'
                       ? 'bg-gradient-to-br from-[#0B192C] to-[#1D3557] text-[#C5A059] border-[#C5A059] shadow-md scale-[1.01]'
                       : 'bg-gradient-to-br from-[#FCF9F2] via-white to-amber-50/60 text-[#0B192C] border-[#C5A059]/60 hover:border-[#C5A059]'
@@ -1791,8 +1806,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 {/* کارت ۶: نمودار روند فعالیت */}
                 <button
                   type="button"
-                  onClick={() => setActiveDashCard('chart')}
-                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[82px] ${
+                  onClick={() => toggleDashCard('chart')}
+                  className={`relative rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[80px] ${
                     activeDashCard === 'chart'
                       ? 'bg-gradient-to-br from-rose-600 to-pink-700 text-white border-rose-700 shadow-md scale-[1.01]'
                       : 'bg-gradient-to-br from-rose-50 via-white to-pink-50/70 text-[#0B192C] border-rose-200 hover:border-rose-400'
@@ -1834,7 +1849,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               </div>
             </div>
 
-            {/* محتوای کارت انتخاب‌شده در داشبورد (ارسال یکپارچه پیام و برنامه کاری) */}
+            {/* محتوای کارت انتخاب‌شده در داشبورد (ارسال یکپارچه پیام و برنامه کاری بدون فیلتر مکاتبات) */}
             {activeDashCard === 'quick_message' && (
               <WorkCorrespondenceSection
                 role="manager"
@@ -1846,7 +1861,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             )}
 
             {activeDashCard === 'live_kpis' && (
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="grid grid-cols-2 gap-3">
                 <div className="rounded-2xl bg-gradient-to-br from-sky-50 via-white to-cyan-50/70 border border-sky-200 p-3.5 space-y-1 shadow-2xs">
                   <div className="text-[11px] font-semibold text-sky-800">
                     مجموع ساعات کاری خالص
@@ -1915,7 +1930,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         {effectiveDashboard.unseenAlerts.reportsAlert && <GoldenBlinkDot />}
                       </h3>
                       <p className="text-[10.5px] text-slate-500">
-                        بررسی سریع گزارش فعالیت‌های ثبت‌شده امروز ({toPersianDigits(currentShamsi)}) و سوابق روزهای گذشته
+                        نمایش کارت‌های گزارش کار ثبت‌شده امروز ({toPersianDigits(currentShamsi)}) و روزهای گذشته در شبکه ۲ ستونه
                       </p>
                     </div>
                   </div>
@@ -1966,7 +1981,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       onClick={() => handleSelectTab('reports')}
                       className="min-h-[30px] px-2.5 rounded-xl bg-[#FCF9F2] hover:bg-amber-100/70 border border-[#C5A059]/60 text-[11px] font-bold text-[#0B192C] cursor-pointer"
                     >
-                      چک‌لیست و آرشیو کامل ←
+                      برنامه‌های کاری و آرشیو کامل ←
                     </button>
                   </div>
                 </div>
@@ -1989,47 +2004,52 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     )}
                   </div>
                 ) : (
-                  <div className="space-y-2">
-                    <div className="divide-y divide-slate-100">
+                  <div className="space-y-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       {visibleDashReports.map((rep) => {
                         const isTodayReport = rep.shamsi_date === currentShamsi;
                         return (
-                          <div key={rep.id} className="py-2.5 first:pt-1 last:pb-1 space-y-1.5">
-                            <div className="flex flex-wrap items-center justify-between gap-2 text-xs tabular-nums">
-                              <div className="flex items-center gap-1.5">
-                                {!rep.is_seen_by_manager && <GoldenBlinkDot title="گزارش جدید" />}
-                                <span
-                                  className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold ${
-                                    isTodayReport
-                                      ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
-                                      : 'bg-slate-100 text-slate-700'
-                                  }`}
-                                >
-                                  {isTodayReport ? 'امروز' : 'روزهای قبل'}
-                                </span>
-                                <span className="font-bold text-[#0B192C]">
-                                  {toPersianDigits(rep.shamsi_date)}
-                                </span>
-                                <span aria-hidden="true" className="text-slate-400">
-                                  ·
-                                </span>
-                                <span className="text-slate-500">
-                                  ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}
-                                </span>
+                          <div
+                            key={rep.id}
+                            className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 space-y-1.5 flex flex-col justify-between"
+                          >
+                            <div className="space-y-1.5">
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-xs tabular-nums">
+                                <div className="flex items-center gap-1.5">
+                                  {!rep.is_seen_by_manager && <GoldenBlinkDot title="گزارش جدید" />}
+                                  <span
+                                    className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold ${
+                                      isTodayReport
+                                        ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
+                                        : 'bg-slate-200/80 text-slate-700'
+                                    }`}
+                                  >
+                                    {isTodayReport ? 'امروز' : 'روزهای قبل'}
+                                  </span>
+                                  <span className="font-bold text-[#0B192C]">
+                                    {toPersianDigits(rep.shamsi_date)}
+                                  </span>
+                                  <span aria-hidden="true" className="text-slate-400">
+                                    ·
+                                  </span>
+                                  <span className="text-slate-500">
+                                    ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}
+                                  </span>
+                                </div>
+                                {rep.duration_minutes ? (
+                                  <span className="text-[#9A7428] font-bold text-[11px]">
+                                    مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
+                                  </span>
+                                ) : null}
                               </div>
-                              {rep.duration_minutes ? (
-                                <span className="text-[#9A7428] font-bold text-[11px]">
-                                  مدت فعالیت: {formatMinutesToDurationPersian(rep.duration_minutes)}
-                                </span>
-                              ) : null}
+
+                              <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
+                                {rep.activity_description}
+                              </p>
                             </div>
 
-                            <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
-                              {rep.activity_description}
-                            </p>
-
                             {rep.photo_url && (
-                              <div>
+                              <div className="pt-1">
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -2040,7 +2060,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                       mime_type: 'image/jpeg',
                                     })
                                   }
-                                  className="inline-flex items-center gap-2 p-1 pr-2 rounded-xl bg-slate-50 hover:bg-amber-50/60 border border-slate-200 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] transition-colors cursor-pointer"
+                                  className="inline-flex items-center gap-2 p-1 pr-2 rounded-xl bg-white hover:bg-amber-50/60 border border-slate-200 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] transition-colors cursor-pointer"
                                 >
                                   <img
                                     src={rep.photo_url}
@@ -2057,7 +2077,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       })}
                     </div>
 
-                    {dashboardFilteredReports.length > 3 && (
+                    {dashboardFilteredReports.length > 4 && (
                       <button
                         type="button"
                         onClick={() => setShowAllDashReports((p) => !p)}
@@ -2066,7 +2086,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         {showAllDashReports ? (
                           <>
                             <ChevronUp className="w-3.5 h-3.5 text-[#9A7428]" />
-                            <span>بستن و نمایش ۳ گزارش آخر</span>
+                            <span>بستن و نمایش ۴ کارت اخیر</span>
                           </>
                         ) : (
                           <>
@@ -2114,12 +2134,12 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   </div>
                 </div>
 
-                {/* فیلتر دسته‌بندی مطالبات */}
-                <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                 {/* کارت‌های کوچک ۲ ستونه برای فیلتر دسته‌بندی مطالبات */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-[11px]">
                   {[
                     {
                       id: 'all' as const,
-                      label: 'همه مطالبات و سوابق اخیر',
+                      label: 'همه مطالبات اخیر',
                       count:
                         leaveRequests.length +
                         transactions.length +
@@ -2150,7 +2170,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     },
                     {
                       id: 'advance' as const,
-                      label: 'مساعده، علی‌الحساب و حقوق',
+                      label: 'مساعده و حقوق',
                       count: transactions.filter(
                         (t) =>
                           t.tx_type === 'ADVANCE' ||
@@ -2163,26 +2183,28 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       key={tab.id}
                       type="button"
                       onClick={() => setDashClaimFilter(tab.id)}
-                      className={`px-2.5 py-1 rounded-xl font-bold flex items-center gap-1 transition-colors cursor-pointer ${
+                      className={`px-3 py-2 rounded-xl font-bold flex items-center justify-between gap-1.5 border transition-colors cursor-pointer ${
                         dashClaimFilter === tab.id
-                          ? 'bg-[#0B192C] text-[#C5A059]'
-                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200/70'
+                          ? 'bg-[#0B192C] text-[#C5A059] border-[#0B192C]'
+                          : 'bg-slate-50 text-slate-700 border-slate-200 hover:border-[#C5A059]'
                       }`}
                     >
-                      {(tab.id === 'pending' || tab.id === 'late') &&
-                        ((tab.id === 'pending' && tab.count > 0) ||
-                          (tab.id === 'late' && pendingLateDays.length > 0)) && (
-                          <GoldenBlinkDot />
-                        )}
-                      <span>{tab.label}</span>
-                      <span className="opacity-80 tabular-nums">
+                      <span className="flex items-center gap-1 truncate">
+                        {(tab.id === 'pending' || tab.id === 'late') &&
+                          ((tab.id === 'pending' && tab.count > 0) ||
+                            (tab.id === 'late' && pendingLateDays.length > 0)) && (
+                            <GoldenBlinkDot />
+                          )}
+                        <span className="truncate">{tab.label}</span>
+                      </span>
+                      <span className="opacity-85 tabular-nums shrink-0">
                         ({toPersianDigits(tab.count)})
                       </span>
                     </button>
                   ))}
                 </div>
 
-                {/* لیست یکپارچه مطالبات بر اساس فیلتر انتخاب‌شده */}
+                {/* شبکه ۲ ستونه کارت‌های مطالبات بر اساس فیلتر انتخاب‌شده */}
                 {(() => {
                   const filteredLateDays = allLateDays
                     .filter((day) => {
@@ -2247,18 +2269,18 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                   const displayedLateDays = showAllDashClaims
                     ? filteredLateDays
-                    : filteredLateDays.slice(0, 3);
+                    : filteredLateDays.slice(0, 2);
                   const displayedLeaves = showAllDashClaims
                     ? filteredLeaves
                     : filteredLeaves.slice(0, 2);
                   const displayedTxs = showAllDashClaims
                     ? filteredTxs
-                    : filteredTxs.slice(0, 3);
+                    : filteredTxs.slice(0, 2);
 
                   return (
                     <div className="space-y-2.5">
                       {displayedLateDays.length > 0 && (
-                        <div className="space-y-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {displayedLateDays.map((day) => {
                             const isPendingLate =
                               day.late_status === 'PENDING' ||
@@ -2270,13 +2292,13 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                             return (
                               <div
                                 key={`late-${day.shamsi_date}`}
-                                className={`rounded-xl border p-3 flex flex-wrap items-center justify-between gap-2 text-xs ${
+                                className={`rounded-xl border p-3 flex flex-col justify-between gap-2 text-xs ${
                                   isPendingLate
                                     ? 'bg-orange-50/80 border-orange-300'
                                     : 'bg-slate-50/70 border-slate-200'
                                 }`}
                               >
-                                <div className="space-y-1 min-w-0 flex-1">
+                                <div className="space-y-1 min-w-0">
                                   <div className="flex flex-wrap items-center gap-1.5">
                                     {isPendingLate && <GoldenBlinkDot />}
                                     <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold bg-orange-600 text-white">
@@ -2287,7 +2309,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                     </span>
                                     {day.first_in_time && (
                                       <span className="text-slate-600 tabular-nums">
-                                        ورود ثبت‌شده: {toPersianDigits(day.first_in_time)}
+                                        ورود: {toPersianDigits(day.first_in_time)}
                                       </span>
                                     )}
                                     <span
@@ -2298,7 +2320,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                   </div>
                                   {day.late_reason ? (
                                     <p className="text-[11px] text-slate-800">
-                                      علت تأخیر اعلام‌شده توسط پرسنل:{' '}
+                                      علت تأخیر پرسنل:{' '}
                                       <strong className="text-[#0B192C]">{day.late_reason}</strong>
                                     </p>
                                   ) : (
@@ -2318,7 +2340,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                   ) : null}
                                 </div>
 
-                                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                                <div className="flex flex-wrap items-center justify-end gap-1.5 pt-1 border-t border-slate-200/60">
                                   <button
                                     type="button"
                                     onClick={() => openReviewLateModal(day)}
@@ -2339,11 +2361,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       )}
 
                       {displayedLeaves.length > 0 && (
-                        <div className="space-y-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {displayedLeaves.map((lv) => (
                             <div
                               key={`leave-${lv.id}`}
-                              className={`rounded-xl border p-3 flex flex-wrap items-center justify-between gap-2 text-xs ${
+                              className={`rounded-xl border p-3 flex flex-col justify-between gap-2 text-xs ${
                                 lv.status === 'PENDING'
                                   ? 'bg-teal-50/60 border-teal-300'
                                   : 'bg-slate-50/70 border-slate-200'
@@ -2377,7 +2399,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                 )}
                               </div>
 
-                              <div className="flex items-center gap-1.5">
+                              <div className="flex items-center justify-end gap-1.5 pt-1 border-t border-slate-200/60">
                                 <span
                                   className={`text-[11px] font-bold ${
                                     lv.status === 'APPROVED'
@@ -2418,17 +2440,17 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       )}
 
                       {displayedTxs.length > 0 && (
-                        <div className="space-y-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {displayedTxs.map((tx) => (
                             <div
                               key={`tx-${tx.id}`}
-                              className={`rounded-xl border p-3 flex flex-wrap items-center justify-between gap-2 text-xs ${
+                              className={`rounded-xl border p-3 flex flex-col justify-between gap-2 text-xs ${
                                 tx.status === 'PENDING'
                                   ? 'bg-amber-50/70 border-amber-300'
                                   : 'bg-slate-50/70 border-slate-200'
                               }`}
                             >
-                              <div className="space-y-1 min-w-0 flex-1">
+                              <div className="space-y-1 min-w-0">
                                 <div className="flex flex-wrap items-center gap-1.5">
                                   {tx.status === 'PENDING' && <GoldenBlinkDot />}
                                   <span
@@ -2475,7 +2497,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                 )}
                               </div>
 
-                              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                              <div className="flex flex-wrap items-center justify-end gap-1.5 pt-1 border-t border-slate-200/60">
                                 <span
                                   className={`text-[11px] font-bold ${
                                     tx.status === 'APPROVED'
@@ -2524,11 +2546,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                       )}
 
                       {filteredHistorical.length > 0 && (
-                        <div className="space-y-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {filteredHistorical.map((rec) => (
                             <div
                               key={`hist-${rec.id}`}
-                              className="rounded-xl border border-sky-300 bg-sky-50/60 p-3 flex flex-wrap items-center justify-between gap-2 text-xs"
+                              className="rounded-xl border border-sky-300 bg-sky-50/60 p-3 flex flex-col justify-between gap-2 text-xs"
                             >
                               <div className="space-y-0.5">
                                 <div className="flex items-center gap-1.5 font-bold text-[#0B192C]">
@@ -2543,7 +2565,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                   اضافه‌کاری: {formatMinutesToDurationPersian(rec.overtime_minutes)}
                                 </p>
                               </div>
-                              <div className="flex items-center gap-1.5">
+                              <div className="flex items-center justify-end gap-1.5 pt-1 border-t border-sky-200/60">
                                 <button
                                   type="button"
                                   disabled={actionLoading}
@@ -2568,7 +2590,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         </div>
                       )}
 
-                      {totalItems > 5 && (
+                      {totalItems > 4 && (
                         <button
                           type="button"
                           onClick={() => setShowAllDashClaims((p) => !p)}
@@ -2897,8 +2919,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           {/* ================= تب ۲: تردد، خلاصه ساعات کاری و اضافه‌کاری، تقویم کارکرد، مرخصی‌ها و اکسل ================= */}
           {activeTab === 'attendance' && (
             <div className="space-y-4">
-              {/* کارت‌های رنگی انتخاب بخش در تب تردد و مرخصی */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              {/* کارت‌های رنگی ۲ ستونه انتخاب بخش در تب تردد و مرخصی */}
+              <div className="grid grid-cols-2 gap-2.5">
                 <button
                   type="button"
                   onClick={() => setActiveAttCard('calendar')}
@@ -3436,61 +3458,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     </div>
                   ) : (
                     <div className="space-y-3.5">
-                      {!editingLogId && (
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-700 mb-1.5">
-                            انتخاب سریع نوع رویداد تردد
-                          </label>
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                            {(
-                              [
-                                {
-                                  type: 'WORK_START' as AttendanceEventType,
-                                  title: 'ورود (آغاز به کار)',
-                                  defaultTime:
-                                    dashboard?.settings.shift_start_time?.slice(0, 5) || '07:00',
-                                },
-                                {
-                                  type: 'WORK_END' as AttendanceEventType,
-                                  title: 'خروج (خاتمه کار)',
-                                  defaultTime:
-                                    dashboard?.settings.shift_end_time?.slice(0, 5) || '15:00',
-                                },
-                                {
-                                  type: 'MISSION_START' as AttendanceEventType,
-                                  title: 'اعزام به مأموریت',
-                                  defaultTime: '10:00',
-                                },
-                                {
-                                  type: 'MISSION_END' as AttendanceEventType,
-                                  title: 'بازگشت از مأموریت',
-                                  defaultTime: '12:00',
-                                },
-                              ] as const
-                            ).map((item) => {
-                              const active = manualEventType === item.type;
-                              return (
-                                <button
-                                  key={item.type}
-                                  type="button"
-                                  onClick={() => {
-                                    setManualEventType(item.type);
-                                    setManualTime(item.defaultTime);
-                                  }}
-                                  className={`min-h-[38px] px-2.5 py-1.5 rounded-xl border text-xs font-bold transition-all cursor-pointer ${
-                                    active
-                                      ? 'bg-[#FCF9F2] border-[#C5A059] text-[#0B192C] shadow-2xs'
-                                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:border-slate-300'
-                                  }`}
-                                >
-                                  {item.title}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-
                       <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                         {!editingLogId && (
                           <ShamsiDatePicker
@@ -4083,27 +4050,32 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     {reports.length === 0 ? (
                       <p className="text-xs text-slate-500 py-5 text-center">گزارشی یافت نشد.</p>
                     ) : (
-                      <div className="divide-y divide-slate-100">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                         {reports.map((rep) => (
-                          <div key={rep.id} className="py-3 space-y-2">
-                            <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums">
-                              <div className="flex items-center gap-2">
-                                {!rep.is_seen_by_manager && <GoldenBlinkDot title="گزارش جدید" />}
-                                <span className="font-bold text-[#0B192C]">
-                                  {toPersianDigits(rep.shamsi_date)}
-                                </span>
-                                <span aria-hidden="true">·</span>
-                                <span>ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}</span>
+                          <div
+                            key={rep.id}
+                            className="rounded-xl border border-slate-200 bg-slate-50/50 p-3 space-y-2 flex flex-col justify-between"
+                          >
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between text-xs text-slate-500 tabular-nums">
+                                <div className="flex items-center gap-2">
+                                  {!rep.is_seen_by_manager && <GoldenBlinkDot title="گزارش جدید" />}
+                                  <span className="font-bold text-[#0B192C]">
+                                    {toPersianDigits(rep.shamsi_date)}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span>ساعت {toPersianDigits(rep.recorded_time.slice(0, 5))}</span>
+                                </div>
+                                {rep.duration_minutes && (
+                                  <span className="text-[#9A7428] font-medium">
+                                    مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
+                                  </span>
+                                )}
                               </div>
-                              {rep.duration_minutes && (
-                                <span className="text-[#9A7428] font-medium">
-                                  مدت: {formatMinutesToDurationPersian(rep.duration_minutes)}
-                                </span>
-                              )}
+                              <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
+                                {rep.activity_description}
+                              </p>
                             </div>
-                            <p className="text-xs text-slate-800 leading-6 whitespace-pre-line">
-                              {rep.activity_description}
-                            </p>
                             {rep.photo_url && (
                               <div className="pt-1">
                                 <button
@@ -4115,7 +4087,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                       mime_type: 'image/jpeg',
                                     })
                                   }
-                                  className="inline-flex items-center gap-2 p-1.5 pr-2.5 rounded-xl bg-slate-50 hover:bg-amber-50/50 border border-slate-200 hover:border-[#C5A059] text-xs font-semibold text-[#0B192C] transition-colors cursor-pointer"
+                                  className="inline-flex items-center gap-2 p-1.5 pr-2.5 rounded-xl bg-white hover:bg-amber-50/50 border border-slate-200 hover:border-[#C5A059] text-xs font-semibold text-[#0B192C] transition-colors cursor-pointer"
                                 >
                                   <img
                                     src={rep.photo_url}
@@ -4140,8 +4112,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           {/* ================= تب ۴: امور مالی، مساعده، هزینه‌های متفرقه (اسنپ/وسیله) و تنخواه ================= */}
           {activeTab === 'finance' && (
             <div className="space-y-4">
-              {/* کارت‌های رنگی انتخاب بخش در تب مالی */}
-              <div className="grid grid-cols-3 gap-2.5">
+              {/* کارت‌های رنگی ۲ ستونه انتخاب بخش در تب مالی */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
                 <button
                   type="button"
                   onClick={() => setActiveFinCard('transactions')}
@@ -4382,36 +4354,39 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 {transactions.length === 0 ? (
                   <p className="text-xs text-slate-500 py-5 text-center">موردی یافت نشد.</p>
                 ) : (
-                  <div className="divide-y divide-slate-100">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                     {transactions.map((tx) => (
-                      <div key={tx.id} className="py-3 space-y-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-2 text-xs">
-                            {(tx.status === 'PENDING' || !tx.is_seen_by_manager) && (
-                              <GoldenBlinkDot />
-                            )}
-                            <span className="font-bold text-[#0B192C] tabular-nums text-sm">
-                              {formatToman(tx.amount_toman)}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span
-                              className={`font-semibold px-2 py-0.5 rounded-lg text-[11px] ${
-                                tx.tx_type === 'PETTY_CASH'
-                                  ? 'bg-amber-50 text-amber-900 border border-amber-200'
-                                  : 'bg-slate-100 text-slate-700'
-                              }`}
-                            >
-                              {TX_TYPE_LABELS[tx.tx_type]}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="text-slate-500 tabular-nums">
-                              {toPersianDigits(tx.shamsi_date)}
-                            </span>
-                          </div>
+                      <div
+                        key={tx.id}
+                        className="rounded-xl border border-slate-200 bg-slate-50/50 p-3 space-y-2 flex flex-col justify-between"
+                      >
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              {(tx.status === 'PENDING' || !tx.is_seen_by_manager) && (
+                                <GoldenBlinkDot />
+                              )}
+                              <span className="font-bold text-[#0B192C] tabular-nums text-sm">
+                                {formatToman(tx.amount_toman)}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span
+                                className={`font-semibold px-2 py-0.5 rounded-lg text-[11px] ${
+                                  tx.tx_type === 'PETTY_CASH'
+                                    ? 'bg-amber-50 text-amber-900 border border-amber-200'
+                                    : 'bg-slate-100 text-slate-700'
+                                }`}
+                              >
+                                {TX_TYPE_LABELS[tx.tx_type]}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="text-slate-500 tabular-nums">
+                                {toPersianDigits(tx.shamsi_date)}
+                              </span>
+                            </div>
 
-                          <div className="flex flex-wrap items-center gap-1.5">
                             <span
-                              className={`text-xs font-bold ml-1 ${
+                              className={`text-xs font-bold ${
                                 tx.status === 'APPROVED'
                                   ? 'text-emerald-700'
                                   : tx.status === 'REJECTED'
@@ -4421,74 +4396,76 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                             >
                               {STATUS_LABELS[tx.status]}
                             </span>
-
-                            {tx.status === 'PENDING' && (
-                              <div className="flex items-center gap-1">
-                                <button
-                                  type="button"
-                                  disabled={actionLoading}
-                                  onClick={() => handleReviewFinancialTx(tx.id, 'APPROVED')}
-                                  className="min-h-[30px] px-2.5 rounded-lg bg-emerald-700 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
-                                >
-                                  <Check className="w-3.5 h-3.5" />
-                                  <span>تأیید</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={actionLoading}
-                                  onClick={() => handleReviewFinancialTx(tx.id, 'REJECTED')}
-                                  className="min-h-[30px] px-2.5 rounded-lg bg-red-50 text-red-800 border border-red-200 text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
-                                >
-                                  <X className="w-3.5 h-3.5" />
-                                  <span>رد</span>
-                                </button>
-                              </div>
-                            )}
-
-                            <button
-                              type="button"
-                              disabled={actionLoading}
-                              onClick={() => openEditFinanceModal(tx)}
-                              title="ویرایش و اصلاح این مورد مالی"
-                              className="min-h-[30px] px-2.5 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 text-[#0B192C] border border-[#C5A059]/70 text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
-                            >
-                              <Edit3 className="w-3 h-3 text-[#9A7428]" />
-                              <span>ویرایش</span>
-                            </button>
-
-                            <button
-                              type="button"
-                              disabled={actionLoading}
-                              onClick={() => handleDeleteFinancialTx(tx.id)}
-                              title="حذف این مورد مالی"
-                              className="min-h-[30px] px-2 rounded-lg bg-slate-50 hover:bg-red-50 text-slate-500 hover:text-red-700 border border-slate-200 hover:border-red-200 text-[11px] flex items-center justify-center transition-colors cursor-pointer"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
                           </div>
+
+                          <p className="text-xs text-slate-700">{tx.description}</p>
+                          {tx.receipt_file_url && (
+                            <div className="pt-0.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setPreviewFile({
+                                    file_url: tx.receipt_file_url!,
+                                    file_name: tx.receipt_file_name || `فاکتور-${tx.shamsi_date}.jpg`,
+                                  })
+                                }
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-50/70 hover:bg-amber-100/70 border border-[#C5A059]/60 text-[11px] font-bold text-[#0B192C] transition-colors cursor-pointer"
+                              >
+                                <Receipt className="w-3.5 h-3.5 text-[#9A7428]" />
+                                <span>پیش‌نمایش فاکتور / رسید پیوست</span>
+                              </button>
+                            </div>
+                          )}
+                          {tx.manager_note && (
+                            <p className="text-[11px] text-slate-500">یادداشت: {tx.manager_note}</p>
+                          )}
                         </div>
 
-                        <p className="text-xs text-slate-700">{tx.description}</p>
-                        {tx.receipt_file_url && (
-                          <div className="pt-0.5">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setPreviewFile({
-                                  file_url: tx.receipt_file_url!,
-                                  file_name: tx.receipt_file_name || `فاکتور-${tx.shamsi_date}.jpg`,
-                                })
-                              }
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-50/70 hover:bg-amber-100/70 border border-[#C5A059]/60 text-[11px] font-bold text-[#0B192C] transition-colors cursor-pointer"
-                            >
-                              <Receipt className="w-3.5 h-3.5 text-[#9A7428]" />
-                              <span>پیش‌نمایش فاکتور / رسید پیوست</span>
-                            </button>
-                          </div>
-                        )}
-                        {tx.manager_note && (
-                          <p className="text-[11px] text-slate-500">یادداشت: {tx.manager_note}</p>
-                        )}
+                        <div className="flex flex-wrap items-center justify-end gap-1.5 pt-2 border-t border-slate-200/70">
+                          {tx.status === 'PENDING' && (
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                disabled={actionLoading}
+                                onClick={() => handleReviewFinancialTx(tx.id, 'APPROVED')}
+                                className="min-h-[30px] px-2.5 rounded-lg bg-emerald-700 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                                <span>تأیید</span>
+                              </button>
+                              <button
+                                type="button"
+                                disabled={actionLoading}
+                                onClick={() => handleReviewFinancialTx(tx.id, 'REJECTED')}
+                                className="min-h-[30px] px-2.5 rounded-lg bg-red-50 text-red-800 border border-red-200 text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                                <span>رد</span>
+                              </button>
+                            </div>
+                          )}
+
+                          <button
+                            type="button"
+                            disabled={actionLoading}
+                            onClick={() => openEditFinanceModal(tx)}
+                            title="ویرایش و اصلاح این مورد مالی"
+                            className="min-h-[30px] px-2.5 rounded-lg bg-[#FCF9F2] hover:bg-amber-100/70 text-[#0B192C] border border-[#C5A059]/70 text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                          >
+                            <Edit3 className="w-3 h-3 text-[#9A7428]" />
+                            <span>ویرایش</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={actionLoading}
+                            onClick={() => handleDeleteFinancialTx(tx.id)}
+                            title="حذف این مورد مالی"
+                            className="min-h-[30px] px-2 rounded-lg bg-white hover:bg-red-50 text-slate-500 hover:text-red-700 border border-slate-200 hover:border-red-200 text-[11px] flex items-center justify-center transition-colors cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>

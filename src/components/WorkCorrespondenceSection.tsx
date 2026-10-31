@@ -73,6 +73,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
   mode = 'full',
   onUnreadChange,
   onUnreadCleared,
+  onOpenFullCorrespondence,
 }) => {
   const effectiveRole: UserRole = role || currentUserRole || 'worker';
 
@@ -94,12 +95,13 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
   const [deliveryChannel, setDeliveryChannel] = useState<DeliveryChannel>('IN_APP');
   const [selectedFiles, setSelectedFiles] = useState<PendingUploadFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const subjectInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (todayShamsi && !subject && !messageText) {
+    if (todayShamsi && !workProgramDate) {
       setWorkProgramDate(todayShamsi);
     }
-  }, [todayShamsi, subject, messageText]);
+  }, [todayShamsi, workProgramDate]);
 
   // دوربین موبایل و پیش‌نمایش پاپ‌آپ فایل‌ها
   const [isCameraOpen, setIsCameraOpen] = useState(false);
@@ -354,6 +356,23 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
     ]);
   };
 
+  const resetComposeForm = () => {
+    setSubject('');
+    setMessageText('');
+    setWorkProgramDate(todayShamsi);
+    setReplyTo(null);
+    setSelectedFiles([]);
+    setDeliveryChannel('IN_APP');
+    clearRecordedAudio();
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+    composeFormRef.current?.reset();
+    window.setTimeout(() => {
+      subjectInputRef.current?.focus();
+    }, 30);
+  };
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isRecording) {
@@ -407,21 +426,11 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           });
         }
 
-        setSubject('');
-        setMessageText('');
-        setWorkProgramDate(todayShamsi);
-        setReplyTo(null);
-        setSelectedFiles([]);
-        setDeliveryChannel('IN_APP');
-        clearRecordedAudio();
-        if (fileInputRef.current) {
-          fileInputRef.current.value = '';
-        }
-        composeFormRef.current?.reset();
+        resetComposeForm();
         setTasksRefreshTrigger((prev) => prev + 1);
         setFeedback({
           type: 'success',
-          text: `${taskRes.message || `برنامه کاری برای تاریخ ${toPersianDigits(targetDate)} ثبت شد.`} (فرم برای ثبت بعدی آماده است)`,
+          text: `${taskRes.message || `برنامه کاری برای تاریخ ${toPersianDigits(targetDate)} ثبت شد.`} (فرم کاملاً پاکسازی شد و آماده ثبت بعدی است)`,
         });
         await loadCorrespondences();
         if (onUnreadChangeRef.current) {
@@ -455,18 +464,11 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           // ignore
         }
       }
-      setSubject('');
-      setMessageText('');
-      setWorkProgramDate(todayShamsi);
-      setReplyTo(null);
-      setSelectedFiles([]);
-      setDeliveryChannel('IN_APP');
-      clearRecordedAudio();
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
-      composeFormRef.current?.reset();
-      setFeedback({ type: 'success', text: `${res.message} (فرم برای ثبت بعدی آماده است)` });
+      resetComposeForm();
+      setFeedback({
+        type: 'success',
+        text: `${res.message} (فرم کاملاً پاکسازی شد و آماده ثبت بعدی است)`,
+      });
       await loadCorrespondences();
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
@@ -502,7 +504,29 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
         </div>
       )}
 
-      {/* ================= بخش ۱ (بالای صفحه): پیام‌های جدید دریافتی و تعیین تکلیف آن‌ها ================= */}
+      {/* در حالت داشبورد فقط اعلان جمع‌وجور پیام جدید + دکمه رفتن به بخش مدیریت مکاتبات نمایش داده می‌شود */}
+      {mode === 'dashboard_composer' && unreadIncomingItems.length > 0 && (
+        <div className="rounded-2xl bg-[#FCF9F2] border border-[#C5A059] px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 font-bold text-[#0B192C]">
+            <span className="w-2.5 h-2.5 rounded-full bg-[#C5A059] animate-ping shrink-0" />
+            <span>
+              {toPersianDigits(unreadIncomingItems.length)} پیام جدید دریافتی در انتظار بررسی است.
+            </span>
+          </div>
+          {onOpenFullCorrespondence && (
+            <button
+              type="button"
+              onClick={onOpenFullCorrespondence}
+              className="px-3 py-1 rounded-xl bg-[#0B192C] text-[#C5A059] text-[11px] font-bold cursor-pointer"
+            >
+              مدیریت مکاتبات و فیلتر پیام‌ها ←
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ================= بخش ۱ (فقط در بخش مدیریت مکاتبات): پیام‌های جدید دریافتی و تعیین تکلیف آن‌ها ================= */}
+      {mode === 'full' && (
       <div className="rounded-2xl bg-gradient-to-b from-[#FCF9F2] to-white border-2 border-[#C5A059] p-4 space-y-3 shadow-xs">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#C5A059]/30 pb-2.5">
           <div className="flex items-center gap-2">
@@ -549,7 +573,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
             </span>
           </div>
         ) : (
-          <div className="space-y-2.5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             {unreadIncomingItems.map((msg) => {
               const defaultAvatar =
                 msg.sender_role === 'manager'
@@ -736,6 +760,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           </div>
         )}
       </div>
+      )}
 
       {/* ================= بخش ۲ (وسط صفحه): فرم یکپارچه ارسال پیام و برنامه کاری + صدا، دوربین و فایل ================= */}
       <form
@@ -826,16 +851,17 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
           <div>
             <label className="block text-xs font-medium text-slate-700 mb-1">
               {effectiveRole === 'manager' && isWorkProgram
-                ? 'عنوان برنامه کاری (مثلاً: تحویل سفارش X)'
+                ? 'عنوان برنامه کاری (تایپ مستقیم توسط مدیر)'
                 : 'موضوع پیام (اختیاری)'}
             </label>
             <input
+              ref={subjectInputRef}
               type="text"
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
               placeholder={
                 effectiveRole === 'manager' && isWorkProgram
-                  ? 'عنوان برنامه کاری را تایپ کنید...'
+                  ? 'عنوان برنامه کاری را تایپ کنید (مثلاً: تحویل سفارش X)...'
                   : 'عنوان پیام...'
               }
               className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs focus:outline-none focus:border-[#0B192C]"
@@ -1139,7 +1165,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
         ) : archivedItems.length === 0 ? (
           <p className="text-xs text-slate-500 py-5 text-center">موردی در آرشیو مکاتبات یافت نشد.</p>
         ) : (
-          <div className="space-y-2.5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             {archivedItems.map((msg) => {
               const defaultAvatar =
                 msg.sender_role === 'manager'

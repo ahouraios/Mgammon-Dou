@@ -103,6 +103,28 @@ export const ShamsiDatePicker: React.FC<ShamsiDatePickerProps> = ({
     setIsOpen(false);
   };
 
+  const handleSelectFutureOffset = (daysToAdd: number) => {
+    const base = parseInitialShamsi(todayShamsi);
+    let y = base.jy;
+    let m = base.jm;
+    let d = base.jd + daysToAdd;
+    while (true) {
+      const { monthLength: mLen } = getShamsiMonthCalendar(y, m);
+      if (d <= mLen) break;
+      d -= mLen;
+      m += 1;
+      if (m > 12) {
+        m = 1;
+        y += 1;
+      }
+    }
+    const formatted = `${y}/${pad2(m)}/${pad2(d)}`;
+    onChange(formatted);
+    setViewYear(y);
+    setViewMonth(m);
+    setIsOpen(false);
+  };
+
   const daysArray = Array.from({ length: monthLength }, (_, i) => i + 1);
   const emptyCells = Array.from({ length: startDayOffset }, (_, i) => i);
 
@@ -143,8 +165,8 @@ export const ShamsiDatePicker: React.FC<ShamsiDatePickerProps> = ({
 
       {isOpen && (
         <div className="absolute z-50 mt-1.5 right-0 w-72 sm:w-80 rounded-2xl bg-white border border-[#C5A059]/60 shadow-xl p-4 select-none">
-          {/* هدر انتخاب سال و ماه شمسی */}
-          <div className="flex items-center justify-between gap-1 pb-3 border-b border-slate-100">
+          {/* هدر انتخاب سال و ماه شمسی (پشتیبانی از تاریخ‌های امروز، گذشته و آینده) */}
+          <div className="flex items-center justify-between gap-1 pb-2.5 border-b border-slate-100">
             <button
               type="button"
               onClick={handlePrevMonth}
@@ -172,7 +194,7 @@ export const ShamsiDatePicker: React.FC<ShamsiDatePickerProps> = ({
                 onChange={(e) => setViewYear(Number(e.target.value))}
                 className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-bold text-[#0B192C] bg-slate-50 tabular-nums focus:outline-none"
               >
-                {Array.from({ length: 15 }, (_, i) => 1398 + i).map((yr) => (
+                {Array.from({ length: 18 }, (_, i) => 1398 + i).map((yr) => (
                   <option key={yr} value={yr}>
                     {toPersianDigits(yr)}
                   </option>
@@ -190,8 +212,40 @@ export const ShamsiDatePicker: React.FC<ShamsiDatePickerProps> = ({
             </button>
           </div>
 
+          {/* میان‌بر انتخاب سریع روزهای آینده در تقویم */}
+          <div className="grid grid-cols-4 gap-1 pt-2 pb-1">
+            <button
+              type="button"
+              onClick={handleSelectToday}
+              className="py-1 rounded-lg bg-slate-100 hover:bg-[#FCF9F2] hover:border-[#C5A059] border border-transparent text-[10.5px] font-bold text-[#0B192C] cursor-pointer"
+            >
+              امروز
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectFutureOffset(1)}
+              className="py-1 rounded-lg bg-indigo-50/80 hover:bg-indigo-100 text-[10.5px] font-bold text-indigo-900 cursor-pointer"
+            >
+              فردا
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectFutureOffset(2)}
+              className="py-1 rounded-lg bg-indigo-50/80 hover:bg-indigo-100 text-[10.5px] font-bold text-indigo-900 cursor-pointer"
+            >
+              پس‌فردا
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectFutureOffset(7)}
+              className="py-1 rounded-lg bg-indigo-50/80 hover:bg-indigo-100 text-[10.5px] font-bold text-indigo-900 cursor-pointer"
+            >
+              هفته آینده
+            </button>
+          </div>
+
           {/* سرستون روزهای هفته */}
-          <div className="grid grid-cols-7 gap-1 text-center mt-2.5 mb-1">
+          <div className="grid grid-cols-7 gap-1 text-center mt-1.5 mb-1">
             {WEEKDAY_SHORT.map((w, idx) => (
               <div
                 key={w}
@@ -213,6 +267,7 @@ export const ShamsiDatePicker: React.FC<ShamsiDatePickerProps> = ({
               const candidate = `${viewYear}/${pad2(viewMonth)}/${pad2(day)}`;
               const isSelected = value === candidate;
               const isToday = todayShamsi === candidate;
+              const isFuture = Boolean(todayShamsi) && candidate > todayShamsi;
               const isFriday = (startDayOffset + day - 1) % 7 === 6;
 
               return (
@@ -227,7 +282,9 @@ export const ShamsiDatePicker: React.FC<ShamsiDatePickerProps> = ({
                         ? 'border border-[#C5A059] text-[#0B192C] font-bold bg-[#C5A059]/10'
                         : isFriday
                           ? 'text-rose-600 hover:bg-rose-50'
-                          : 'text-slate-700 hover:bg-slate-100'
+                          : isFuture
+                            ? 'text-indigo-900 hover:bg-indigo-50 font-semibold'
+                            : 'text-slate-700 hover:bg-slate-100'
                   }`}
                 >
                   {toPersianDigits(day)}
