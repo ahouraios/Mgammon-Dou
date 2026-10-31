@@ -636,12 +636,46 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
             <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
               <DatabaseBackup className="w-4 h-4 text-[#9A7428]" />
               <h4 className="text-sm font-bold text-[#0B192C]">
-                پشتیبان‌گیری یک‌کلیکی از کل اطلاعات
+                پشتیبان‌گیری و خروجی سریع اکسل اطلاعات
               </h4>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              دریافت نسخه کامل آرشیو شامل تمام ترددها، مرخصی‌ها، گزارش‌های کار روزانه، پرداخت‌ها و هزینه‌های تنخواه در قالب فایل اکسل چندبرگه‌ای یا فایل پشتیبان کامل.
+              دریافت نسخه کامل آرشیو یا خروجی تفکیکی ساعات کاری، اضافه‌کار، گزارش‌های کاری و لیست پرداختی‌ها (با تاریخ، مبلغ و توضیحات) در قالب اکسل استاندارد.
             </p>
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <a
+                href={withAuthTokenUrl('/api/manager/export/excel?section=work_hours')}
+                download="mgammon-work-hours.xlsx"
+                className="min-h-[38px] px-3 rounded-xl bg-slate-50 hover:bg-[#FCF9F2] border border-slate-200 hover:border-[#C5A059] text-[#0B192C] text-[11px] font-bold flex items-center justify-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5 text-[#9A7428] shrink-0" />
+                <span>اکسل ساعات کاری</span>
+              </a>
+              <a
+                href={withAuthTokenUrl('/api/manager/export/excel?section=overtime')}
+                download="mgammon-overtime.xlsx"
+                className="min-h-[38px] px-3 rounded-xl bg-slate-50 hover:bg-[#FCF9F2] border border-slate-200 hover:border-[#C5A059] text-[#0B192C] text-[11px] font-bold flex items-center justify-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                <span>اکسل اضافه‌کار</span>
+              </a>
+              <a
+                href={withAuthTokenUrl('/api/manager/export/excel?section=reports')}
+                download="mgammon-work-reports.xlsx"
+                className="min-h-[38px] px-3 rounded-xl bg-slate-50 hover:bg-[#FCF9F2] border border-slate-200 hover:border-[#C5A059] text-[#0B192C] text-[11px] font-bold flex items-center justify-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+                <span>اکسل گزارش کارها</span>
+              </a>
+              <a
+                href={withAuthTokenUrl('/api/manager/export/excel?section=payments')}
+                download="mgammon-payments-list.xlsx"
+                className="min-h-[38px] px-3 rounded-xl bg-slate-50 hover:bg-[#FCF9F2] border border-slate-200 hover:border-[#C5A059] text-[#0B192C] text-[11px] font-bold flex items-center justify-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                <span>اکسل لیست پرداختی‌ها</span>
+              </a>
+            </div>
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <a
                 href={withAuthTokenUrl('/api/manager/backup/excel')}

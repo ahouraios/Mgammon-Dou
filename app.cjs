@@ -53,7 +53,6 @@ var currentPoolDbName = "";
 var dbInitialized = false;
 var dbInitializingPromise = null;
 var lastDbError = null;
-var localMariaDbBootstrapped = false;
 var localMariaDbBootstrapPromise = null;
 var simulatedDisconnect = false;
 var simulatedMidTxFailureTag = null;
@@ -102,13 +101,11 @@ async function hasMariadbdBinary() {
 }
 async function ensureLocalMariaDbRunningIfNeeded() {
   if (isCpanelOrProductionEnvironment(process.env)) {
-    localMariaDbBootstrapped = true;
     return;
   }
   const cfg = getDbConfig();
   const isLocalHost = cfg.host === "127.0.0.1" || cfg.host === "localhost";
   if (!isLocalHost || cfg.user !== "root") {
-    localMariaDbBootstrapped = true;
     return;
   }
   const safeDbName = cfg.database.replace(/[^a-zA-Z0-9_]/g, "");
@@ -124,7 +121,6 @@ async function ensureLocalMariaDbRunningIfNeeded() {
       `CREATE DATABASE IF NOT EXISTS \`${safeDbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
     );
     await probeConn.end();
-    localMariaDbBootstrapped = true;
     return;
   } catch {
   }
@@ -256,7 +252,6 @@ async function ensureLocalMariaDbRunningIfNeeded() {
       }
     } catch {
     } finally {
-      localMariaDbBootstrapped = true;
       localMariaDbBootstrapPromise = null;
     }
   })();
@@ -6944,39 +6939,242 @@ apiRouter.get(
     }
   }
 );
-apiRouter.get(
-  "/manager/backup/excel",
-  requireAuth,
-  requireRole("manager"),
-  async (_req, res) => {
-    try {
-      const pool2 = getPool();
-      const workerId = await getWorkerUserId(pool2);
-      const [attRows] = await pool2.execute(
-        "SELECT shamsi_date, event_type, recorded_time, note, is_manual_override FROM attendance_logs WHERE user_id = ? AND is_deleted = 0 ORDER BY work_date DESC, recorded_time ASC",
-        [workerId]
+var handleManagerExcelExport = async (req, res) => {
+  try {
+    const pool2 = getPool();
+    const workerId = await getWorkerUserId(pool2);
+    const currentSettings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(currentSettings.timezone);
+    const rawSection = String(req.query?.section || "all").trim().toLowerCase();
+    const section = rawSection === "work_hours" || rawSection === "overtime" || rawSection === "reports" || rawSection === "payments" ? rawSection : "all";
+    const rawFrom = req.query?.fromShamsi ? toEnglishDigits(String(req.query.fromShamsi)).trim() : "";
+    const rawTo = req.query?.toShamsi ? toEnglishDigits(String(req.query.toShamsi)).trim() : "";
+    const fromShamsi = rawFrom && isValidShamsiDate(rawFrom) ? normalizeShamsiDate(rawFrom) : null;
+    const toShamsi = rawTo && isValidShamsiDate(rawTo) ? normalizeShamsiDate(rawTo) : null;
+    const inDateRange = (shamsi) => {
+      if (!shamsi) return true;
+      const norm = isValidShamsiDate(shamsi) ? normalizeShamsiDate(shamsi) : String(shamsi).trim();
+      if (fromShamsi && norm < fromShamsi) return false;
+      if (toShamsi && norm > toShamsi) return false;
+      return true;
+    };
+    const [allLogRows] = await pool2.execute(
+      "SELECT * FROM attendance_logs WHERE user_id = ? AND is_deleted = 0 ORDER BY work_date DESC, recorded_time ASC, id ASC",
+      [workerId]
+    );
+    const allLogs = allLogRows.map(mapRowToAttendanceLog).filter((l) => inDateRange(l.shamsi_date));
+    const [histAllRows] = await pool2.execute(
+      `SELECT h.*, u.role AS creator_role
+       FROM historical_work_records h
+       LEFT JOIN users u ON u.id = h.created_by_user_id
+       WHERE h.user_id = ?
+       ORDER BY h.work_date DESC, h.id DESC`,
+      [workerId]
+    );
+    const historicalRecords = histAllRows.map(mapRowToHistoricalWork).filter((r) => inDateRange(r.shamsi_date));
+    const byDate = /* @__PURE__ */ new Map();
+    for (const log of allLogs) {
+      const list = byDate.get(log.work_date) || [];
+      list.push(log);
+      byDate.set(log.work_date, list);
+    }
+    const dailySummaries = [];
+    for (const [workDate, dayLogs] of byDate.entries()) {
+      const shamsiDate = normalizeShamsiDate(
+        dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate)
       );
-      const [histRows] = await pool2.execute(
-        "SELECT shamsi_date, title, work_days_count, net_work_minutes, overtime_minutes, status, note FROM historical_work_records WHERE user_id = ? ORDER BY work_date DESC",
-        [workerId]
-      );
-      const [finRows] = await pool2.execute(
-        "SELECT shamsi_date, tx_type, amount_toman, status, description, manager_note FROM financial_transactions WHERE user_id = ? ORDER BY tx_date DESC",
-        [workerId]
-      );
-      const [leaveRows] = await pool2.execute(
-        "SELECT shamsi_date, leave_type, start_time, end_time, duration_minutes, status, reason, manager_note FROM leave_requests WHERE user_id = ? ORDER BY work_date DESC",
-        [workerId]
-      );
-      const [repRows] = await pool2.execute(
-        "SELECT shamsi_date, recorded_time, duration_minutes, activity_description FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC",
-        [workerId]
-      );
-      const workbook = XLSX.utils.book_new();
+      const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
+      const summary = calculateDailyAttendance(workDate, shamsiDate, dayLogs, effectiveSettings, {
+        isToday: workDate === nowInfo.workDate,
+        currentTimeHHMM: nowInfo.timeHHMM
+      });
+      dailySummaries.push(summary);
+    }
+    const mergedDailySummaries = mergeApprovedHistoricalIntoDailySummaries(
+      dailySummaries,
+      historicalRecords,
+      fromShamsi,
+      toShamsi
+    );
+    const [finAllRows] = await pool2.execute(
+      `SELECT f.*, u.full_name AS creator_name, u.role AS creator_role
+       FROM financial_transactions f
+       LEFT JOIN users u ON u.id = f.created_by_user_id
+       WHERE f.user_id = ?
+       ORDER BY f.tx_date DESC, f.id DESC`,
+      [workerId]
+    );
+    const finRows = finAllRows.filter((r) => inDateRange(String(r.shamsi_date || "")));
+    const [leaveAllRows] = await pool2.execute(
+      "SELECT shamsi_date, leave_type, start_time, end_time, duration_minutes, status, reason, manager_note FROM leave_requests WHERE user_id = ? ORDER BY work_date DESC",
+      [workerId]
+    );
+    const leaveRows = leaveAllRows.filter((r) => inDateRange(String(r.shamsi_date || "")));
+    const [repAllRows] = await pool2.execute(
+      "SELECT shamsi_date, recorded_time, duration_minutes, activity_description, materials_used, report_image_url FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC, id DESC",
+      [workerId]
+    );
+    const repRows = repAllRows.filter((r) => inDateRange(String(r.shamsi_date || "")));
+    const workbook = XLSX.utils.book_new();
+    if (section === "all" || section === "work_hours") {
+      let totalNetMins = 0;
+      let totalOtMins = 0;
+      let totalLateMins = 0;
+      let totalLateDeduct = 0;
+      const workHoursSheetRows = mergedDailySummaries.map((d, idx) => {
+        totalNetMins += d.net_work_minutes || 0;
+        totalOtMins += d.overtime_minutes || 0;
+        totalLateMins += d.late_minutes || 0;
+        totalLateDeduct += d.late_deduction_toman || 0;
+        const lateStatusLabel = d.late_status === "EXCUSED" ? "\u0628\u062E\u0634\u0634 \u062A\u0623\u062E\u06CC\u0631" : d.late_status === "APPROVED_DELAY" ? "\u06A9\u0633\u0631 \u062C\u0631\u06CC\u0645\u0647 \u062A\u0623\u062E\u06CC\u0631" : d.late_status === "DEDUCT_LEAVE" ? "\u06A9\u0633\u0631 \u0627\u0632 \u0645\u0631\u062E\u0635\u06CC" : d.late_status === "ABSENCE" ? "\u062B\u0628\u062A \u063A\u06CC\u0628\u062A" : d.late_status === "PENDING" ? "\u062F\u0631 \u0627\u0646\u062A\u0638\u0627\u0631 \u062A\u0635\u0645\u06CC\u0645 \u0645\u062F\u06CC\u0631" : "\u0639\u0627\u062F\u06CC";
+        return {
+          "\u0631\u062F\u06CC\u0641": idx + 1,
+          "\u062A\u0627\u0631\u06CC\u062E \u0634\u0645\u0633\u06CC": d.shamsi_date,
+          "\u0631\u0648\u0632 \u0647\u0641\u062A\u0647": d.day_name,
+          "\u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F": d.first_in_time || "-",
+          "\u0633\u0627\u0639\u062A \u062E\u0631\u0648\u062C": d.last_out_time || "-",
+          "\u0633\u0627\u0639\u0627\u062A \u06A9\u0627\u0631\u06CC \u062E\u0627\u0644\u0635": formatDurationPersian(d.net_work_minutes || 0),
+          "\u06A9\u0627\u0631\u06A9\u0631\u062F \u062E\u0627\u0644\u0635 (\u062F\u0642\u06CC\u0642\u0647)": d.net_work_minutes || 0,
+          "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC \u0631\u0648\u0632\u0627\u0646\u0647": formatDurationPersian(d.overtime_minutes || 0),
+          "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC (\u062F\u0642\u06CC\u0642\u0647)": d.overtime_minutes || 0,
+          "\u062A\u0623\u062E\u06CC\u0631 \u0648\u0631\u0648\u062F (\u062F\u0642\u06CC\u0642\u0647)": d.late_minutes || 0,
+          "\u0648\u0636\u0639\u06CC\u062A \u062A\u0623\u062E\u06CC\u0631": lateStatusLabel,
+          "\u06A9\u0633\u0631 \u062A\u0623\u062E\u06CC\u0631 (\u062A\u0648\u0645\u0627\u0646)": d.late_deduction_toman || 0,
+          "\u0648\u0636\u0639\u06CC\u062A \u0648 \u062A\u0648\u0636\u06CC\u062D\u0627\u062A": d.status_label || ""
+        };
+      });
+      if (workHoursSheetRows.length > 0) {
+        workHoursSheetRows.push({
+          "\u0631\u062F\u06CC\u0641": workHoursSheetRows.length + 1,
+          "\u062A\u0627\u0631\u06CC\u062E \u0634\u0645\u0633\u06CC": "\u062C\u0645\u0639 \u06A9\u0644 \u062F\u0648\u0631\u0647",
+          "\u0631\u0648\u0632 \u0647\u0641\u062A\u0647": `${mergedDailySummaries.length} \u0631\u0648\u0632`,
+          "\u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F": "-",
+          "\u0633\u0627\u0639\u062A \u062E\u0631\u0648\u062C": "-",
+          "\u0633\u0627\u0639\u0627\u062A \u06A9\u0627\u0631\u06CC \u062E\u0627\u0644\u0635": formatDurationPersian(totalNetMins),
+          "\u06A9\u0627\u0631\u06A9\u0631\u062F \u062E\u0627\u0644\u0635 (\u062F\u0642\u06CC\u0642\u0647)": totalNetMins,
+          "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC \u0631\u0648\u0632\u0627\u0646\u0647": formatDurationPersian(totalOtMins),
+          "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC (\u062F\u0642\u06CC\u0642\u0647)": totalOtMins,
+          "\u062A\u0623\u062E\u06CC\u0631 \u0648\u0631\u0648\u062F (\u062F\u0642\u06CC\u0642\u0647)": totalLateMins,
+          "\u0648\u0636\u0639\u06CC\u062A \u062A\u0623\u062E\u06CC\u0631": "-",
+          "\u06A9\u0633\u0631 \u062A\u0623\u062E\u06CC\u0631 (\u062A\u0648\u0645\u0627\u0646)": totalLateDeduct,
+          "\u0648\u0636\u0639\u06CC\u062A \u0648 \u062A\u0648\u0636\u06CC\u062D\u0627\u062A": "\u062C\u0645\u0639 \u06A9\u0644 \u0633\u0627\u0639\u0627\u062A \u06A9\u0627\u0631\u06CC \u0648 \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC"
+        });
+      }
       XLSX.utils.book_append_sheet(
         workbook,
         XLSX.utils.json_to_sheet(
-          attRows.map((r) => ({
+          workHoursSheetRows.length > 0 ? workHoursSheetRows : [{ "\u067E\u06CC\u0627\u0645": "\u0631\u06A9\u0648\u0631\u062F\u06CC \u062F\u0631 \u0627\u06CC\u0646 \u0628\u0627\u0632\u0647 \u0632\u0645\u0627\u0646\u06CC \u062B\u0628\u062A \u0646\u0634\u062F\u0647 \u0627\u0633\u062A" }]
+        ),
+        "\u0633\u0627\u0639\u0627\u062A \u06A9\u0627\u0631\u06CC \u0648 \u06A9\u0627\u0631\u06A9\u0631\u062F"
+      );
+    }
+    if (section === "all" || section === "overtime") {
+      const overtimeDays = mergedDailySummaries.filter((d) => (d.overtime_minutes || 0) > 0);
+      let sumOtMins = 0;
+      let sumOtPayToman = 0;
+      const overtimeRows = [];
+      for (let i = 0; i < overtimeDays.length; i++) {
+        const d = overtimeDays[i];
+        const effSet = await getSystemSettingsFromDb(d.shamsi_date);
+        const calc = calculateSalaryAndOvertimeRates(effSet, d.overtime_minutes);
+        sumOtMins += d.overtime_minutes;
+        sumOtPayToman += calc.totalOvertimePayToman;
+        overtimeRows.push({
+          "\u0631\u062F\u06CC\u0641": i + 1,
+          "\u062A\u0627\u0631\u06CC\u062E \u0634\u0645\u0633\u06CC": d.shamsi_date,
+          "\u0631\u0648\u0632 \u0647\u0641\u062A\u0647": d.day_name,
+          "\u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F": d.first_in_time || "-",
+          "\u0633\u0627\u0639\u062A \u062E\u0631\u0648\u062C": d.last_out_time || "-",
+          "\u0645\u062F\u062A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC": formatDurationPersian(d.overtime_minutes),
+          "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC (\u062F\u0642\u06CC\u0642\u0647)": d.overtime_minutes,
+          "\u0646\u0631\u062E \u0647\u0631 \u0633\u0627\u0639\u062A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC (\u062A\u0648\u0645\u0627\u0646)": calc.effectiveOvertimeHourlyRateToman,
+          "\u0645\u0628\u0644\u063A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC \u0631\u0648\u0632 (\u062A\u0648\u0645\u0627\u0646)": calc.totalOvertimePayToman,
+          "\u062A\u0648\u0636\u06CC\u062D\u0627\u062A": d.status_label || ""
+        });
+      }
+      if (overtimeRows.length > 0) {
+        overtimeRows.push({
+          "\u0631\u062F\u06CC\u0641": overtimeRows.length + 1,
+          "\u062A\u0627\u0631\u06CC\u062E \u0634\u0645\u0633\u06CC": "\u062C\u0645\u0639 \u06A9\u0644 \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC",
+          "\u0631\u0648\u0632 \u0647\u0641\u062A\u0647": `${overtimeDays.length} \u0631\u0648\u0632`,
+          "\u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F": "-",
+          "\u0633\u0627\u0639\u062A \u062E\u0631\u0648\u062C": "-",
+          "\u0645\u062F\u062A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC": formatDurationPersian(sumOtMins),
+          "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC (\u062F\u0642\u06CC\u0642\u0647)": sumOtMins,
+          "\u0646\u0631\u062E \u0647\u0631 \u0633\u0627\u0639\u062A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC (\u062A\u0648\u0645\u0627\u0646)": "-",
+          "\u0645\u0628\u0644\u063A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC \u0631\u0648\u0632 (\u062A\u0648\u0645\u0627\u0646)": sumOtPayToman,
+          "\u062A\u0648\u0636\u06CC\u062D\u0627\u062A": "\u062C\u0645\u0639 \u06A9\u0644 \u0632\u0645\u0627\u0646 \u0648 \u0645\u0628\u0644\u063A \u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC"
+        });
+      }
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          overtimeRows.length > 0 ? overtimeRows : [{ "\u067E\u06CC\u0627\u0645": "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC \u062B\u0628\u062A\u200C\u0634\u062F\u0647\u200C\u0627\u06CC \u062F\u0631 \u0627\u06CC\u0646 \u0628\u0627\u0632\u0647 \u0632\u0645\u0627\u0646\u06CC \u0648\u062C\u0648\u062F \u0646\u062F\u0627\u0631\u062F" }]
+        ),
+        "\u0627\u0636\u0627\u0641\u0647\u200C\u06A9\u0627\u0631\u06CC\u200C\u0647\u0627"
+      );
+    }
+    if (section === "all" || section === "reports") {
+      const reportSheetRows = repRows.map((r, idx) => ({
+        "\u0631\u062F\u06CC\u0641": idx + 1,
+        "\u062A\u0627\u0631\u06CC\u062E \u0634\u0645\u0633\u06CC": r.shamsi_date,
+        "\u0633\u0627\u0639\u062A \u062B\u0628\u062A": r.recorded_time,
+        "\u0645\u062F\u062A (\u062F\u0642\u06CC\u0642\u0647)": r.duration_minutes || "",
+        "\u0634\u0631\u062D \u06A9\u0627\u0645\u0644 \u06AF\u0632\u0627\u0631\u0634 \u06A9\u0627\u0631": r.activity_description || "",
+        "\u0645\u0635\u0627\u0631\u0641 \u06A9\u0627\u0631\u06AF\u0627\u0647 / \u0645\u062A\u0631\u06CC\u0627\u0644 \u0645\u0635\u0631\u0641\u06CC": r.materials_used || "-",
+        "\u062A\u0635\u0648\u06CC\u0631 \u067E\u06CC\u0648\u0633\u062A": r.report_image_url ? "\u062F\u0627\u0631\u062F" : "\u0646\u062F\u0627\u0631\u062F"
+      }));
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          reportSheetRows.length > 0 ? reportSheetRows : [{ "\u067E\u06CC\u0627\u0645": "\u06AF\u0632\u0627\u0631\u0634 \u06A9\u0627\u0631\u06CC \u062F\u0631 \u0627\u06CC\u0646 \u0628\u0627\u0632\u0647 \u0632\u0645\u0627\u0646\u06CC \u062B\u0628\u062A \u0646\u0634\u062F\u0647 \u0627\u0633\u062A" }]
+        ),
+        "\u06AF\u0632\u0627\u0631\u0634 \u06A9\u0627\u0631\u0647\u0627"
+      );
+    }
+    if (section === "all" || section === "payments") {
+      let approvedSumToman = 0;
+      let pendingSumToman = 0;
+      const financeSheetRows = finRows.map((r, idx) => {
+        const amt = Number(r.amount_toman || 0);
+        if (r.status === "APPROVED") approvedSumToman += amt;
+        else if (r.status === "PENDING") pendingSumToman += amt;
+        return {
+          "\u0631\u062F\u06CC\u0641": idx + 1,
+          "\u062A\u0627\u0631\u06CC\u062E": r.shamsi_date,
+          "\u0646\u0648\u0639 \u062A\u0631\u0627\u06A9\u0646\u0634": r.tx_type === "ADVANCE" ? "\u0645\u0633\u0627\u0639\u062F\u0647" : r.tx_type === "SALARY" ? "\u062D\u0642\u0648\u0642" : r.tx_type === "ON_ACCOUNT" ? "\u0639\u0644\u06CC\u200C\u0627\u0644\u062D\u0633\u0627\u0628" : r.tx_type === "PETTY_CASH" ? "\u0647\u0632\u06CC\u0646\u0647 \u062A\u0646\u062E\u0648\u0627\u0647 / \u062E\u0631\u06CC\u062F \u06A9\u0627\u0631\u06AF\u0627\u0647\u06CC" : "\u0633\u0627\u06CC\u0631 \u0647\u0632\u06CC\u0646\u0647\u200C\u0647\u0627 (\u0627\u0633\u0646\u067E / \u0627\u0628\u0632\u0627\u0631 \u0648...)",
+          "\u0645\u0628\u0644\u063A (\u062A\u0648\u0645\u0627\u0646)": amt,
+          "\u0648\u0636\u0639\u06CC\u062A": r.status === "APPROVED" ? "\u062A\u0623\u06CC\u06CC\u062F\u0634\u062F\u0647 (\u0642\u0637\u0639\u06CC)" : r.status === "PENDING" ? "\u062F\u0631 \u0627\u0646\u062A\u0638\u0627\u0631 \u062A\u0623\u06CC\u06CC\u062F" : "\u0631\u062F\u0634\u062F\u0647",
+          "\u062B\u0628\u062A\u200C\u06A9\u0646\u0646\u062F\u0647": r.creator_name || (r.creator_role === "manager" ? "\u0645\u062F\u06CC\u0631\u06CC\u062A" : "\u067E\u0631\u0633\u0646\u0644"),
+          "\u0634\u0631\u062D \u0648 \u062A\u0648\u0636\u06CC\u062D\u0627\u062A": r.description || "",
+          "\u06CC\u0627\u062F\u062F\u0627\u0634\u062A \u0645\u062F\u06CC\u0631\u06CC\u062A": r.manager_note || ""
+        };
+      });
+      if (financeSheetRows.length > 0) {
+        financeSheetRows.push({
+          "\u0631\u062F\u06CC\u0641": financeSheetRows.length + 1,
+          "\u062A\u0627\u0631\u06CC\u062E": "\u062C\u0645\u0639 \u06A9\u0644 \u067E\u0631\u062F\u0627\u062E\u062A\u06CC\u200C\u0647\u0627\u06CC \u062A\u0623\u06CC\u06CC\u062F\u0634\u062F\u0647",
+          "\u0646\u0648\u0639 \u062A\u0631\u0627\u06A9\u0646\u0634": "-",
+          "\u0645\u0628\u0644\u063A (\u062A\u0648\u0645\u0627\u0646)": approvedSumToman,
+          "\u0648\u0636\u0639\u06CC\u062A": "\u062A\u0623\u06CC\u06CC\u062F\u0634\u062F\u0647 (\u0642\u0637\u0639\u06CC)",
+          "\u062B\u0628\u062A\u200C\u06A9\u0646\u0646\u062F\u0647": "-",
+          "\u0634\u0631\u062D \u0648 \u062A\u0648\u0636\u06CC\u062D\u0627\u062A": pendingSumToman > 0 ? `\u062C\u0645\u0639 \u0645\u0648\u0627\u0631\u062F \u062F\u0631 \u0627\u0646\u062A\u0638\u0627\u0631 \u062A\u0623\u06CC\u06CC\u062F: ${pendingSumToman.toLocaleString("en-US")} \u062A\u0648\u0645\u0627\u0646` : "\u062C\u0645\u0639 \u06A9\u0644 \u0645\u0628\u0627\u0644\u063A \u0642\u0637\u0639\u06CC \u062B\u0628\u062A\u200C\u0634\u062F\u0647 \u062F\u0631 \u0627\u06CC\u0646 \u0628\u0627\u0632\u0647",
+          "\u06CC\u0627\u062F\u062F\u0627\u0634\u062A \u0645\u062F\u06CC\u0631\u06CC\u062A": ""
+        });
+      }
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          financeSheetRows.length > 0 ? financeSheetRows : [{ "\u067E\u06CC\u0627\u0645": "\u062A\u0631\u0627\u06A9\u0646\u0634 \u0645\u0627\u0644\u06CC \u06CC\u0627 \u067E\u0631\u062F\u0627\u062E\u062A\u06CC \u062F\u0631 \u0627\u06CC\u0646 \u0628\u0627\u0632\u0647 \u0632\u0645\u0627\u0646\u06CC \u062B\u0628\u062A \u0646\u0634\u062F\u0647 \u0627\u0633\u062A" }]
+        ),
+        "\u0644\u06CC\u0633\u062A \u067E\u0631\u062F\u0627\u062E\u062A\u06CC\u200C\u0647\u0627 \u0648 \u0645\u0627\u0644\u06CC"
+      );
+    }
+    if (section === "all") {
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          allLogs.map((r) => ({
             "\u062A\u0627\u0631\u06CC\u062E": r.shamsi_date,
             "\u0646\u0648\u0639 \u062A\u0631\u062F\u062F": r.event_type === "WORK_START" ? "\u0634\u0631\u0648\u0639 \u06A9\u0627\u0631" : r.event_type === "WORK_END" ? "\u067E\u0627\u06CC\u0627\u0646 \u06A9\u0627\u0631" : r.event_type === "MISSION_START" ? "\u0634\u0631\u0648\u0639 \u0645\u0623\u0645\u0648\u0631\u06CC\u062A" : "\u067E\u0627\u06CC\u0627\u0646 \u0645\u0623\u0645\u0648\u0631\u06CC\u062A",
             "\u0633\u0627\u0639\u062A": r.recorded_time,
@@ -6989,7 +7187,7 @@ apiRouter.get(
       XLSX.utils.book_append_sheet(
         workbook,
         XLSX.utils.json_to_sheet(
-          histRows.map((r) => ({
+          historicalRecords.map((r) => ({
             "\u062A\u0627\u0631\u06CC\u062E": r.shamsi_date,
             "\u0639\u0646\u0648\u0627\u0646": r.title,
             "\u062A\u0639\u062F\u0627\u062F \u0631\u0648\u0632": r.work_days_count,
@@ -7000,20 +7198,6 @@ apiRouter.get(
           }))
         ),
         "\u0633\u0648\u0627\u0628\u0642 \u0642\u0628\u0644\u06CC"
-      );
-      XLSX.utils.book_append_sheet(
-        workbook,
-        XLSX.utils.json_to_sheet(
-          finRows.map((r) => ({
-            "\u062A\u0627\u0631\u06CC\u062E": r.shamsi_date,
-            "\u0646\u0648\u0639 \u062A\u0631\u0627\u06A9\u0646\u0634": r.tx_type === "ADVANCE" ? "\u0645\u0633\u0627\u0639\u062F\u0647" : r.tx_type === "SALARY" ? "\u062D\u0642\u0648\u0642" : r.tx_type === "ON_ACCOUNT" ? "\u0639\u0644\u06CC\u200C\u0627\u0644\u062D\u0633\u0627\u0628" : r.tx_type === "PETTY_CASH" ? "\u0647\u0632\u06CC\u0646\u0647 \u062A\u0646\u062E\u0648\u0627\u0647 / \u062E\u0631\u06CC\u062F \u06A9\u0627\u0631\u06AF\u0627\u0647\u06CC" : "\u0633\u0627\u06CC\u0631",
-            "\u0645\u0628\u0644\u063A (\u062A\u0648\u0645\u0627\u0646)": Number(r.amount_toman),
-            "\u0648\u0636\u0639\u06CC\u062A": r.status === "APPROVED" ? "\u062A\u0623\u06CC\u06CC\u062F\u0634\u062F\u0647" : r.status === "PENDING" ? "\u062F\u0631 \u0627\u0646\u062A\u0638\u0627\u0631" : "\u0631\u062F\u0634\u062F\u0647",
-            "\u0634\u0631\u062D": r.description,
-            "\u06CC\u0627\u062F\u062F\u0627\u0634\u062A \u0645\u062F\u06CC\u0631\u06CC\u062A": r.manager_note || ""
-          }))
-        ),
-        "\u0627\u0645\u0648\u0631 \u0645\u0627\u0644\u06CC \u0648 \u062A\u0646\u062E\u0648\u0627\u0647"
       );
       XLSX.utils.book_append_sheet(
         workbook,
@@ -7030,32 +7214,39 @@ apiRouter.get(
         ),
         "\u0645\u0631\u062E\u0635\u06CC\u200C\u0647\u0627"
       );
-      XLSX.utils.book_append_sheet(
-        workbook,
-        XLSX.utils.json_to_sheet(
-          repRows.map((r) => ({
-            "\u062A\u0627\u0631\u06CC\u062E": r.shamsi_date,
-            "\u0633\u0627\u0639\u062A \u062B\u0628\u062A": r.recorded_time,
-            "\u0645\u062F\u062A (\u062F\u0642\u06CC\u0642\u0647)": r.duration_minutes || "",
-            "\u0634\u0631\u062D \u0641\u0639\u0627\u0644\u06CC\u062A": r.activity_description
-          }))
-        ),
-        "\u06AF\u0632\u0627\u0631\u0634 \u06A9\u0627\u0631\u0647\u0627"
-      );
-      const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      );
-      res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="mgammon-full-backup.xlsx"'
-      );
-      res.send(buffer);
-    } catch (err) {
-      handleServerError(res, err);
     }
+    const fileNameMap = {
+      all: "mgammon-full-backup.xlsx",
+      work_hours: "mgammon-work-hours.xlsx",
+      overtime: "mgammon-overtime.xlsx",
+      reports: "mgammon-work-reports.xlsx",
+      payments: "mgammon-payments-list.xlsx"
+    };
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${fileNameMap[section]}"`
+    );
+    res.send(buffer);
+  } catch (err) {
+    handleServerError(res, err);
   }
+};
+apiRouter.get(
+  "/manager/backup/excel",
+  requireAuth,
+  requireRole("manager"),
+  handleManagerExcelExport
+);
+apiRouter.get(
+  "/manager/export/excel",
+  requireAuth,
+  requireRole("manager"),
+  handleManagerExcelExport
 );
 apiRouter.get(
   "/manager/backup/json",

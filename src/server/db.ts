@@ -14,7 +14,6 @@ let currentPoolDbName = '';
 let dbInitialized = false;
 let dbInitializingPromise: Promise<void> | null = null;
 let lastDbError: string | null = null;
-let localMariaDbBootstrapped = false;
 let localMariaDbBootstrapPromise: Promise<void> | null = null;
 
 let simulatedDisconnect = false;
@@ -79,14 +78,12 @@ async function hasMariadbdBinary(): Promise<boolean> {
  */
 async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
   if (isCpanelOrProductionEnvironment(process.env)) {
-    localMariaDbBootstrapped = true;
     return;
   }
 
   const cfg = getDbConfig();
   const isLocalHost = cfg.host === '127.0.0.1' || cfg.host === 'localhost';
   if (!isLocalHost || cfg.user !== 'root') {
-    localMariaDbBootstrapped = true;
     return;
   }
 
@@ -105,7 +102,6 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
       `CREATE DATABASE IF NOT EXISTS \`${safeDbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
     );
     await probeConn.end();
-    localMariaDbBootstrapped = true;
     return;
   } catch {
     // سرویس محلی هنوز بالا نیامده است؛ ادامه برای راه‌اندازی سندباکس توسعه
@@ -274,7 +270,6 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
     } catch {
       // در محیط هاست واقعی سرویس از قبل توسط سرور مدیریت می‌شود
     } finally {
-      localMariaDbBootstrapped = true;
       localMariaDbBootstrapPromise = null;
     }
   })();

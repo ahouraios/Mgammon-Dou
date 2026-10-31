@@ -5184,44 +5184,325 @@ apiRouter.get(
 );
 
 // ============================================================================
-// ۸-الف. پشتیبان‌گیری یک‌کلیکی (Backup) برای مدیر (اکسل جامع و فایل JSON)
+// ۸-الف. خروجی اکسل بخش‌بندی‌شده و پشتیبان‌گیری یک‌کلیکی (Backup) برای مدیر
 // ============================================================================
-apiRouter.get(
-  '/manager/backup/excel',
-  requireAuth,
-  requireRole('manager'),
-  async (_req: AuthenticatedRequest, res: Response) => {
-    try {
-      const pool = getPool();
-      const workerId = await getWorkerUserId(pool);
+const handleManagerExcelExport = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const pool = getPool();
+    const workerId = await getWorkerUserId(pool);
+    const currentSettings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(currentSettings.timezone);
 
-      const [attRows] = await pool.execute<mysql.RowDataPacket[]>(
-        'SELECT shamsi_date, event_type, recorded_time, note, is_manual_override FROM attendance_logs WHERE user_id = ? AND is_deleted = 0 ORDER BY work_date DESC, recorded_time ASC',
-        [workerId]
-      );
-      const [histRows] = await pool.execute<mysql.RowDataPacket[]>(
-        'SELECT shamsi_date, title, work_days_count, net_work_minutes, overtime_minutes, status, note FROM historical_work_records WHERE user_id = ? ORDER BY work_date DESC',
-        [workerId]
-      );
-      const [finRows] = await pool.execute<mysql.RowDataPacket[]>(
-        'SELECT shamsi_date, tx_type, amount_toman, status, description, manager_note FROM financial_transactions WHERE user_id = ? ORDER BY tx_date DESC',
-        [workerId]
-      );
-      const [leaveRows] = await pool.execute<mysql.RowDataPacket[]>(
-        'SELECT shamsi_date, leave_type, start_time, end_time, duration_minutes, status, reason, manager_note FROM leave_requests WHERE user_id = ? ORDER BY work_date DESC',
-        [workerId]
-      );
-      const [repRows] = await pool.execute<mysql.RowDataPacket[]>(
-        'SELECT shamsi_date, recorded_time, duration_minutes, activity_description FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC',
-        [workerId]
-      );
+    const rawSection = String(req.query?.section || 'all').trim().toLowerCase();
+    const section: 'all' | 'work_hours' | 'overtime' | 'reports' | 'payments' =
+      rawSection === 'work_hours' ||
+      rawSection === 'overtime' ||
+      rawSection === 'reports' ||
+      rawSection === 'payments'
+        ? rawSection
+        : 'all';
 
-      const workbook = XLSX.utils.book_new();
+    const rawFrom = req.query?.fromShamsi ? toEnglishDigits(String(req.query.fromShamsi)).trim() : '';
+    const rawTo = req.query?.toShamsi ? toEnglishDigits(String(req.query.toShamsi)).trim() : '';
+    const fromShamsi = rawFrom && isValidShamsiDate(rawFrom) ? normalizeShamsiDate(rawFrom) : null;
+    const toShamsi = rawTo && isValidShamsiDate(rawTo) ? normalizeShamsiDate(rawTo) : null;
+
+    const inDateRange = (shamsi: string | null | undefined): boolean => {
+      if (!shamsi) return true;
+      const norm = isValidShamsiDate(shamsi) ? normalizeShamsiDate(shamsi) : String(shamsi).trim();
+      if (fromShamsi && norm < fromShamsi) return false;
+      if (toShamsi && norm > toShamsi) return false;
+      return true;
+    };
+
+    const [allLogRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT * FROM attendance_logs WHERE user_id = ? AND is_deleted = 0 ORDER BY work_date DESC, recorded_time ASC, id ASC',
+      [workerId]
+    );
+    const allLogs = allLogRows.map(mapRowToAttendanceLog).filter((l) => inDateRange(l.shamsi_date));
+
+    const [histAllRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT h.*, u.role AS creator_role
+       FROM historical_work_records h
+       LEFT JOIN users u ON u.id = h.created_by_user_id
+       WHERE h.user_id = ?
+       ORDER BY h.work_date DESC, h.id DESC`,
+      [workerId]
+    );
+    const historicalRecords = histAllRows
+      .map(mapRowToHistoricalWork)
+      .filter((r) => inDateRange(r.shamsi_date));
+
+    // محاسبه خلاصه روزانه دقیق (ترکیب ترددهای ثبت‌شده + سوابق تأییدشده)
+    const byDate = new Map<string, AttendanceLog[]>();
+    for (const log of allLogs) {
+      const list = byDate.get(log.work_date) || [];
+      list.push(log);
+      byDate.set(log.work_date, list);
+    }
+
+    const dailySummaries: DailyAttendanceSummary[] = [];
+    for (const [workDate, dayLogs] of byDate.entries()) {
+      const shamsiDate = normalizeShamsiDate(
+        dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate)
+      );
+      const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
+      const summary = calculateDailyAttendance(workDate, shamsiDate, dayLogs, effectiveSettings, {
+        isToday: workDate === nowInfo.workDate,
+        currentTimeHHMM: nowInfo.timeHHMM,
+      });
+      dailySummaries.push(summary);
+    }
+
+    const mergedDailySummaries = mergeApprovedHistoricalIntoDailySummaries(
+      dailySummaries,
+      historicalRecords,
+      fromShamsi,
+      toShamsi
+    );
+
+    const [finAllRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT f.*, u.full_name AS creator_name, u.role AS creator_role
+       FROM financial_transactions f
+       LEFT JOIN users u ON u.id = f.created_by_user_id
+       WHERE f.user_id = ?
+       ORDER BY f.tx_date DESC, f.id DESC`,
+      [workerId]
+    );
+    const finRows = finAllRows.filter((r) => inDateRange(String(r.shamsi_date || '')));
+
+    const [leaveAllRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT shamsi_date, leave_type, start_time, end_time, duration_minutes, status, reason, manager_note FROM leave_requests WHERE user_id = ? ORDER BY work_date DESC',
+      [workerId]
+    );
+    const leaveRows = leaveAllRows.filter((r) => inDateRange(String(r.shamsi_date || '')));
+
+    const [repAllRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT shamsi_date, recorded_time, duration_minutes, activity_description, materials_used, report_image_url FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC, id DESC',
+      [workerId]
+    );
+    const repRows = repAllRows.filter((r) => inDateRange(String(r.shamsi_date || '')));
+
+    const workbook = XLSX.utils.book_new();
+
+    // ۱. شیت ساعات کاری و کارکرد روزانه
+    if (section === 'all' || section === 'work_hours') {
+      let totalNetMins = 0;
+      let totalOtMins = 0;
+      let totalLateMins = 0;
+      let totalLateDeduct = 0;
+
+      const workHoursSheetRows = mergedDailySummaries.map((d, idx) => {
+        totalNetMins += d.net_work_minutes || 0;
+        totalOtMins += d.overtime_minutes || 0;
+        totalLateMins += d.late_minutes || 0;
+        totalLateDeduct += d.late_deduction_toman || 0;
+
+        const lateStatusLabel =
+          d.late_status === 'EXCUSED'
+            ? 'بخشش تأخیر'
+            : d.late_status === 'APPROVED_DELAY'
+              ? 'کسر جریمه تأخیر'
+              : d.late_status === 'DEDUCT_LEAVE'
+                ? 'کسر از مرخصی'
+                : d.late_status === 'ABSENCE'
+                  ? 'ثبت غیبت'
+                  : d.late_status === 'PENDING'
+                    ? 'در انتظار تصمیم مدیر'
+                    : 'عادی';
+
+        return {
+          'ردیف': idx + 1,
+          'تاریخ شمسی': d.shamsi_date,
+          'روز هفته': d.day_name,
+          'ساعت ورود': d.first_in_time || '-',
+          'ساعت خروج': d.last_out_time || '-',
+          'ساعات کاری خالص': formatDurationPersian(d.net_work_minutes || 0),
+          'کارکرد خالص (دقیقه)': d.net_work_minutes || 0,
+          'اضافه‌کاری روزانه': formatDurationPersian(d.overtime_minutes || 0),
+          'اضافه‌کاری (دقیقه)': d.overtime_minutes || 0,
+          'تأخیر ورود (دقیقه)': d.late_minutes || 0,
+          'وضعیت تأخیر': lateStatusLabel,
+          'کسر تأخیر (تومان)': d.late_deduction_toman || 0,
+          'وضعیت و توضیحات': d.status_label || '',
+        };
+      });
+
+      if (workHoursSheetRows.length > 0) {
+        workHoursSheetRows.push({
+          'ردیف': workHoursSheetRows.length + 1,
+          'تاریخ شمسی': 'جمع کل دوره',
+          'روز هفته': `${mergedDailySummaries.length} روز`,
+          'ساعت ورود': '-',
+          'ساعت خروج': '-',
+          'ساعات کاری خالص': formatDurationPersian(totalNetMins),
+          'کارکرد خالص (دقیقه)': totalNetMins,
+          'اضافه‌کاری روزانه': formatDurationPersian(totalOtMins),
+          'اضافه‌کاری (دقیقه)': totalOtMins,
+          'تأخیر ورود (دقیقه)': totalLateMins,
+          'وضعیت تأخیر': '-',
+          'کسر تأخیر (تومان)': totalLateDeduct,
+          'وضعیت و توضیحات': 'جمع کل ساعات کاری و اضافه‌کاری',
+        });
+      }
 
       XLSX.utils.book_append_sheet(
         workbook,
         XLSX.utils.json_to_sheet(
-          attRows.map((r) => ({
+          workHoursSheetRows.length > 0
+            ? workHoursSheetRows
+            : [{ 'پیام': 'رکوردی در این بازه زمانی ثبت نشده است' }]
+        ),
+        'ساعات کاری و کارکرد'
+      );
+    }
+
+    // ۲. شیت اختصاصی اضافه‌کاری‌ها
+    if (section === 'all' || section === 'overtime') {
+      const overtimeDays = mergedDailySummaries.filter((d) => (d.overtime_minutes || 0) > 0);
+      let sumOtMins = 0;
+      let sumOtPayToman = 0;
+
+      const overtimeRows: Record<string, string | number>[] = [];
+      for (let i = 0; i < overtimeDays.length; i++) {
+        const d = overtimeDays[i];
+        const effSet = await getSystemSettingsFromDb(d.shamsi_date);
+        const calc = calculateSalaryAndOvertimeRates(effSet, d.overtime_minutes);
+        sumOtMins += d.overtime_minutes;
+        sumOtPayToman += calc.totalOvertimePayToman;
+
+        overtimeRows.push({
+          'ردیف': i + 1,
+          'تاریخ شمسی': d.shamsi_date,
+          'روز هفته': d.day_name,
+          'ساعت ورود': d.first_in_time || '-',
+          'ساعت خروج': d.last_out_time || '-',
+          'مدت اضافه‌کاری': formatDurationPersian(d.overtime_minutes),
+          'اضافه‌کاری (دقیقه)': d.overtime_minutes,
+          'نرخ هر ساعت اضافه‌کاری (تومان)': calc.effectiveOvertimeHourlyRateToman,
+          'مبلغ اضافه‌کاری روز (تومان)': calc.totalOvertimePayToman,
+          'توضیحات': d.status_label || '',
+        });
+      }
+
+      if (overtimeRows.length > 0) {
+        overtimeRows.push({
+          'ردیف': overtimeRows.length + 1,
+          'تاریخ شمسی': 'جمع کل اضافه‌کاری',
+          'روز هفته': `${overtimeDays.length} روز`,
+          'ساعت ورود': '-',
+          'ساعت خروج': '-',
+          'مدت اضافه‌کاری': formatDurationPersian(sumOtMins),
+          'اضافه‌کاری (دقیقه)': sumOtMins,
+          'نرخ هر ساعت اضافه‌کاری (تومان)': '-',
+          'مبلغ اضافه‌کاری روز (تومان)': sumOtPayToman,
+          'توضیحات': 'جمع کل زمان و مبلغ اضافه‌کاری',
+        });
+      }
+
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          overtimeRows.length > 0
+            ? overtimeRows
+            : [{ 'پیام': 'اضافه‌کاری ثبت‌شده‌ای در این بازه زمانی وجود ندارد' }]
+        ),
+        'اضافه‌کاری‌ها'
+      );
+    }
+
+    // ۳. شیت گزارش‌های کاری روزانه (همراه با مصارف کارگاه)
+    if (section === 'all' || section === 'reports') {
+      const reportSheetRows = repRows.map((r, idx) => ({
+        'ردیف': idx + 1,
+        'تاریخ شمسی': r.shamsi_date,
+        'ساعت ثبت': r.recorded_time,
+        'مدت (دقیقه)': r.duration_minutes || '',
+        'شرح کامل گزارش کار': r.activity_description || '',
+        'مصارف کارگاه / متریال مصرفی': r.materials_used || '-',
+        'تصویر پیوست': r.report_image_url ? 'دارد' : 'ندارد',
+      }));
+
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          reportSheetRows.length > 0
+            ? reportSheetRows
+            : [{ 'پیام': 'گزارش کاری در این بازه زمانی ثبت نشده است' }]
+        ),
+        'گزارش کارها'
+      );
+    }
+
+    // ۴. شیت لیست پرداختی‌ها و تراکنش‌های مالی (با تاریخ، مبلغ و توضیحات کامل)
+    if (section === 'all' || section === 'payments') {
+      let approvedSumToman = 0;
+      let pendingSumToman = 0;
+
+      const financeSheetRows = finRows.map((r, idx) => {
+        const amt = Number(r.amount_toman || 0);
+        if (r.status === 'APPROVED') approvedSumToman += amt;
+        else if (r.status === 'PENDING') pendingSumToman += amt;
+
+        return {
+          'ردیف': idx + 1,
+          'تاریخ': r.shamsi_date,
+          'نوع تراکنش':
+            r.tx_type === 'ADVANCE'
+              ? 'مساعده'
+              : r.tx_type === 'SALARY'
+                ? 'حقوق'
+                : r.tx_type === 'ON_ACCOUNT'
+                  ? 'علی‌الحساب'
+                  : r.tx_type === 'PETTY_CASH'
+                    ? 'هزینه تنخواه / خرید کارگاهی'
+                    : 'سایر هزینه‌ها (اسنپ / ابزار و...)',
+          'مبلغ (تومان)': amt,
+          'وضعیت':
+            r.status === 'APPROVED'
+              ? 'تأییدشده (قطعی)'
+              : r.status === 'PENDING'
+                ? 'در انتظار تأیید'
+                : 'ردشده',
+          'ثبت‌کننده': r.creator_name || (r.creator_role === 'manager' ? 'مدیریت' : 'پرسنل'),
+          'شرح و توضیحات': r.description || '',
+          'یادداشت مدیریت': r.manager_note || '',
+        };
+      });
+
+      if (financeSheetRows.length > 0) {
+        financeSheetRows.push({
+          'ردیف': financeSheetRows.length + 1,
+          'تاریخ': 'جمع کل پرداختی‌های تأییدشده',
+          'نوع تراکنش': '-',
+          'مبلغ (تومان)': approvedSumToman,
+          'وضعیت': 'تأییدشده (قطعی)',
+          'ثبت‌کننده': '-',
+          'شرح و توضیحات':
+            pendingSumToman > 0
+              ? `جمع موارد در انتظار تأیید: ${pendingSumToman.toLocaleString('en-US')} تومان`
+              : 'جمع کل مبالغ قطعی ثبت‌شده در این بازه',
+          'یادداشت مدیریت': '',
+        });
+      }
+
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          financeSheetRows.length > 0
+            ? financeSheetRows
+            : [{ 'پیام': 'تراکنش مالی یا پرداختی در این بازه زمانی ثبت نشده است' }]
+        ),
+        'لیست پرداختی‌ها و مالی'
+      );
+    }
+
+    // ۵. شیت‌های تکمیلی هنگام دریافت خروجی جامع (ریز ترددها، سوابق قبلی، مرخصی‌ها)
+    if (section === 'all') {
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(
+          allLogs.map((r) => ({
             'تاریخ': r.shamsi_date,
             'نوع تردد':
               r.event_type === 'WORK_START'
@@ -5242,41 +5523,22 @@ apiRouter.get(
       XLSX.utils.book_append_sheet(
         workbook,
         XLSX.utils.json_to_sheet(
-          histRows.map((r) => ({
+          historicalRecords.map((r) => ({
             'تاریخ': r.shamsi_date,
             'عنوان': r.title,
             'تعداد روز': r.work_days_count,
             'کارکرد خالص': formatDurationPersian(Number(r.net_work_minutes || 0)),
             'اضافه‌کاری': formatDurationPersian(Number(r.overtime_minutes || 0)),
-            'وضعیت': r.status === 'APPROVED' ? 'تأییدشده' : r.status === 'PENDING' ? 'در انتظار' : 'ردشده',
+            'وضعیت':
+              r.status === 'APPROVED'
+                ? 'تأییدشده'
+                : r.status === 'PENDING'
+                  ? 'در انتظار'
+                  : 'ردشده',
             'توضیحات': r.note || '',
           }))
         ),
         'سوابق قبلی'
-      );
-
-      XLSX.utils.book_append_sheet(
-        workbook,
-        XLSX.utils.json_to_sheet(
-          finRows.map((r) => ({
-            'تاریخ': r.shamsi_date,
-            'نوع تراکنش':
-              r.tx_type === 'ADVANCE'
-                ? 'مساعده'
-                : r.tx_type === 'SALARY'
-                  ? 'حقوق'
-                  : r.tx_type === 'ON_ACCOUNT'
-                    ? 'علی‌الحساب'
-                    : r.tx_type === 'PETTY_CASH'
-                      ? 'هزینه تنخواه / خرید کارگاهی'
-                      : 'سایر',
-            'مبلغ (تومان)': Number(r.amount_toman),
-            'وضعیت': r.status === 'APPROVED' ? 'تأییدشده' : r.status === 'PENDING' ? 'در انتظار' : 'ردشده',
-            'شرح': r.description,
-            'یادداشت مدیریت': r.manager_note || '',
-          }))
-        ),
-        'امور مالی و تنخواه'
       );
 
       XLSX.utils.book_append_sheet(
@@ -5288,40 +5550,54 @@ apiRouter.get(
             'از ساعت': r.start_time || '-',
             'تا ساعت': r.end_time || '-',
             'مدت': formatDurationPersian(Number(r.duration_minutes || 0)),
-            'وضعیت': r.status === 'APPROVED' ? 'تأییدشده' : r.status === 'PENDING' ? 'در انتظار' : 'ردشده',
+            'وضعیت':
+              r.status === 'APPROVED'
+                ? 'تأییدشده'
+                : r.status === 'PENDING'
+                  ? 'در انتظار'
+                  : 'ردشده',
             'علت': r.reason,
           }))
         ),
         'مرخصی‌ها'
       );
-
-      XLSX.utils.book_append_sheet(
-        workbook,
-        XLSX.utils.json_to_sheet(
-          repRows.map((r) => ({
-            'تاریخ': r.shamsi_date,
-            'ساعت ثبت': r.recorded_time,
-            'مدت (دقیقه)': r.duration_minutes || '',
-            'شرح فعالیت': r.activity_description,
-          }))
-        ),
-        'گزارش کارها'
-      );
-
-      const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-      res.setHeader(
-        'Content-Type',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-      );
-      res.setHeader(
-        'Content-Disposition',
-        'attachment; filename="mgammon-full-backup.xlsx"'
-      );
-      res.send(buffer);
-    } catch (err) {
-      handleServerError(res, err);
     }
+
+    const fileNameMap: Record<typeof section, string> = {
+      all: 'mgammon-full-backup.xlsx',
+      work_hours: 'mgammon-work-hours.xlsx',
+      overtime: 'mgammon-overtime.xlsx',
+      reports: 'mgammon-work-reports.xlsx',
+      payments: 'mgammon-payments-list.xlsx',
+    };
+
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${fileNameMap[section]}"`
+    );
+    res.send(buffer);
+  } catch (err) {
+    handleServerError(res, err);
   }
+};
+
+apiRouter.get(
+  '/manager/backup/excel',
+  requireAuth,
+  requireRole('manager'),
+  handleManagerExcelExport
+);
+
+apiRouter.get(
+  '/manager/export/excel',
+  requireAuth,
+  requireRole('manager'),
+  handleManagerExcelExport
 );
 
 apiRouter.get(

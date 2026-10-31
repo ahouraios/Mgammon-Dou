@@ -1,6 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App.tsx';
+import App from './App';
 import './index.css';
 
 // پاک‌سازی سرویس‌ورکرهای قدیمی کش‌شده در محیط توسعه برای جلوگیری از صفحه سفید
@@ -21,6 +21,9 @@ class RootErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { hasError: boolean; errorText: string }
 > {
+  declare props: Readonly<{ children: React.ReactNode }>;
+  state: { hasError: boolean; errorText: string } = { hasError: false, errorText: '' };
+
   constructor(props: { children: React.ReactNode }) {
     super(props);
     this.state = { hasError: false, errorText: '' };

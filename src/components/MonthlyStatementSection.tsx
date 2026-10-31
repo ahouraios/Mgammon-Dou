@@ -99,7 +99,7 @@ export function MonthlyStatementSection({
   transactions,
   settings,
   cumulativeBalanceToman,
-}: MonthlyStatementSectionProps) {
+}: MonthlyStatementSectionProps): React.ReactElement | null {
   const effectiveSettings = settings || DEFAULT_FALLBACK_SETTINGS;
   const [selectedPeriodKey, setSelectedPeriodKey] = useState<string>('');
   const [activeDetailTab, setActiveDetailTab] = useState<

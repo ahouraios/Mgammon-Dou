@@ -335,7 +335,6 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const [lateReasonInput, setLateReasonInput] = useState('');
   const [pendingLateMinutesPreview, setPendingLateMinutesPreview] = useState(0);
   const [unseenLateDecisions, setUnseenLateDecisions] = useState<DailyAttendanceSummary[]>([]);
-  const [recentLateDecisions, setRecentLateDecisions] = useState<DailyAttendanceSummary[]>([]);
   const notifiedKeysRef = useRef<Set<string>>(new Set());
   const isFirstPollDoneRef = useRef(false);
   const [externalLeaveRequestType, setExternalLeaveRequestType] = useState<LeaveType | null>(null);
@@ -452,7 +451,6 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
       setUnreadMessagesCount(liveRes.unreadMessagesCount);
       setLatestUnreadMessage(liveRes.latestUnreadMessage || null);
       setUnseenLateDecisions(liveRes.unseenLateDecisions || []);
-      setRecentLateDecisions(liveRes.recentLateDecisions || []);
       if (liveRes.workerKpis) {
         setWorkerKpis(liveRes.workerKpis);
       }

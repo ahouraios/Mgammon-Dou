@@ -25,6 +25,7 @@ import {
   EVENT_TYPE_LABELS,
   STATUS_LABELS,
   TX_TYPE_LABELS,
+  withAuthTokenUrl,
 } from '../services/api';
 import {
   formatMinutesToDurationPersian,
@@ -85,7 +86,7 @@ type ManagerTab =
   | 'correspondence'
   | 'settings';
 
-type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms' | 'guide';
+type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms' | 'export' | 'guide';
 
 type ManagerDashCard =
   | 'approvals'
@@ -313,7 +314,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [attendanceSummaries, setAttendanceSummaries] = useState<DailyAttendanceSummary[]>([]);
   const [historicalRecords, setHistoricalRecords] = useState<HistoricalWorkRecord[]>([]);
   const [leaveRequests, setLeaveRequests] = useState<LeaveRequestItem[]>([]);
-  const [leaveQuota, setLeaveQuota] = useState<LeaveQuotaSummary | null>(null);
   const [reports, setReports] = useState<DailyWorkReport[]>([]);
   const [transactions, setTransactions] = useState<FinancialTransaction[]>([]);
   const [settingsForm, setSettingsForm] = useState<SystemSettings>(DEFAULT_MANAGER_SETTINGS);
@@ -382,10 +382,12 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [editFinNote, setEditFinNote] = useState('');
   const [editFinStatus, setEditFinStatus] = useState<FinancialStatus>('APPROVED');
 
-  // تعطیل رسمی جدید در تنظیمات + پاپ‌آپ راهنمای پیامک
+  // تعطیل رسمی جدید در تنظیمات + پاپ‌آپ راهنمای پیامک + فیلتر بازه زمانی خروجی اکسل
   const [newHolidayShamsi, setNewHolidayShamsi] = useState('');
   const [testingSms, setTestingSms] = useState(false);
   const [showSmsHelpModal, setShowSmsHelpModal] = useState(false);
+  const [exportFromShamsi, setExportFromShamsi] = useState('');
+  const [exportToShamsi, setExportToShamsi] = useState('');
 
   // پاپ‌آپ بررسی و تعیین تکلیف تأخیر ورود پرسنل توسط مدیر
   const [reviewingLateDay, setReviewingLateDay] = useState<DailyAttendanceSummary | null>(null);
@@ -492,7 +494,6 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
       setAttendanceSummaries(res.dailySummaries);
       setHistoricalRecords(res.historicalRecords || []);
       setLeaveRequests(leavesRes.leaveRequests || []);
-      setLeaveQuota(leavesRes.quotaSummary || null);
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     }
@@ -4488,8 +4489,8 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           {/* ================= تب ۶: تنظیمات (تب‌های افقی کنار هم) ================= */}
           {activeTab === 'settings' && settingsForm && (
             <div className="space-y-4">
-              {/* تب‌های افقی کنار هم برای بخش‌های مختلف تنظیمات */}
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 p-1.5 rounded-2xl bg-white border border-slate-200 shadow-2xs">
+              {/* تب‌های افقی کنار هم برای بخش‌های مختلف تنظیمات (۶ کارت منظم در دو ردیف موبایل و یک ردیف دسکتاپ) */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 p-1.5 rounded-2xl bg-white border border-slate-200 shadow-2xs">
                 <button
                   type="button"
                   onClick={() => setSettingsSubTab('schedule')}
@@ -4531,6 +4532,19 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                 <button
                   type="button"
+                  onClick={() => setSettingsSubTab('export')}
+                  className={`min-h-[42px] px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+                    settingsSubTab === 'export'
+                      ? 'bg-[#0B192C] text-[#C5A059]'
+                      : 'text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 shrink-0" />
+                  <span>خروجی اطلاعات (اکسل)</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setSettingsSubTab('account')}
                   className={`min-h-[42px] px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
                     settingsSubTab === 'account'
@@ -4556,6 +4570,220 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 </button>
               </div>
 
+              {/* زیرتب خروجی اکسل بخش‌بندی‌شده اطلاعات برای مدیر */}
+              {settingsSubTab === 'export' && (() => {
+                const buildExportUrl = (
+                  sec: 'all' | 'work_hours' | 'overtime' | 'reports' | 'payments'
+                ) => {
+                  const params = new URLSearchParams();
+                  params.set('section', sec);
+                  if (exportFromShamsi.trim()) params.set('fromShamsi', exportFromShamsi.trim());
+                  if (exportToShamsi.trim()) params.set('toShamsi', exportToShamsi.trim());
+                  return withAuthTokenUrl(`/api/manager/export/excel?${params.toString()}`);
+                };
+
+                const inSelectedRange = (shamsi: string) => {
+                  if (exportFromShamsi.trim() && shamsi < exportFromShamsi.trim()) return false;
+                  if (exportToShamsi.trim() && shamsi > exportToShamsi.trim()) return false;
+                  return true;
+                };
+
+                const filteredDays = attendanceSummaries.filter((d) =>
+                  inSelectedRange(d.shamsi_date)
+                );
+                const filteredOvertimeDays = filteredDays.filter(
+                  (d) => (d.overtime_minutes || 0) > 0
+                );
+                const filteredReports = reports.filter((r) => inSelectedRange(r.shamsi_date));
+                const filteredPayments = transactions.filter((t) =>
+                  inSelectedRange(t.shamsi_date)
+                );
+
+                return (
+                  <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-5 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-8 h-8 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059]/60 flex items-center justify-center shrink-0">
+                          <FileSpreadsheet className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h4 className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
+                            مرکز دریافت خروجی اکسل اطلاعات (ساعات کاری، اضافه‌کار، گزارش‌ها و پرداختی‌ها)
+                          </h4>
+                          <p className="text-[11px] text-slate-500 mt-0.5">
+                            در هر زمان می‌توانید اطلاعات ثبت‌شده هر بخش را به‌صورت مجزا یا یکجا در قالب فایل استاندارد Excel (.xlsx) دانلود کنید.
+                          </p>
+                        </div>
+                      </div>
+                      {(exportFromShamsi || exportToShamsi) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExportFromShamsi('');
+                            setExportToShamsi('');
+                          }}
+                          className="min-h-[34px] px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-[#0B192C] text-[11px] font-bold cursor-pointer"
+                        >
+                          نمایش و خروجی کل تاریخ‌ها
+                        </button>
+                      )}
+                    </div>
+
+                    {/* فیلتر اختیاری بازه تاریخ شمسی برای خروجی */}
+                    <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/50 p-3.5 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-[#0B192C]">
+                          فیلتر بازه زمانی خروجی (اختیاری — در صورت خالی بودن، کل اطلاعات از ابتدا خروجی گرفته می‌شود):
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <ShamsiDatePicker
+                          label="از تاریخ شمسی (اختیاری)"
+                          value={exportFromShamsi}
+                          onChange={setExportFromShamsi}
+                          placeholder="از ابتدای همکاری"
+                          todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                        />
+                        <ShamsiDatePicker
+                          label="تا تاریخ شمسی (اختیاری)"
+                          value={exportToShamsi}
+                          onChange={setExportToShamsi}
+                          placeholder="تا امروز"
+                          todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                        />
+                      </div>
+                    </div>
+
+                    {/* کارت‌های ۴ گانه خروجی تفکیکی هر بخش */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {/* ۱. ساعات کاری */}
+                      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 flex flex-col justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-extrabold text-[#0B192C] flex items-center gap-1.5">
+                              <Clock className="w-3.5 h-3.5 text-[#9A7428]" />
+                              <span>۱. خروجی ساعات کاری و کارکرد روزانه</span>
+                            </span>
+                            <span className="px-2 py-0.5 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-700 tabular-nums">
+                              {toPersianDigits(filteredDays.length)} روز
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-600 leading-5">
+                            شامل تاریخ شمسی، روز هفته، ساعت ورود و خروج، ساعات کاری خالص، تأخیر ورود و توضیحات روزانه به همراه جمع کل.
+                          </p>
+                        </div>
+                        <a
+                          href={buildExportUrl('work_hours')}
+                          download="mgammon-work-hours.xlsx"
+                          className="min-h-[40px] px-3.5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center justify-center gap-2 hover:bg-[#142844] transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>دانلود اکسل ساعات کاری</span>
+                        </a>
+                      </div>
+
+                      {/* ۲. اضافه‌کار */}
+                      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 flex flex-col justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-extrabold text-[#0B192C] flex items-center gap-1.5">
+                              <CalendarClock className="w-3.5 h-3.5 text-emerald-700" />
+                              <span>۲. خروجی اختصاصی اضافه‌کاری‌ها</span>
+                            </span>
+                            <span className="px-2 py-0.5 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-emerald-800 tabular-nums">
+                              {toPersianDigits(filteredOvertimeDays.length)} روز دارای اضافه‌کار
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-600 leading-5">
+                            شامل فهرست روزهای دارای اضافه‌کار، ساعت ورود و خروج، مدت دقیق اضافه‌کاری، نرخ ساعتی و مبلغ اضافه‌کاری هر روز + جمع کل.
+                          </p>
+                        </div>
+                        <a
+                          href={buildExportUrl('overtime')}
+                          download="mgammon-overtime.xlsx"
+                          className="min-h-[40px] px-3.5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center justify-center gap-2 hover:bg-[#142844] transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>دانلود اکسل اضافه‌کاری‌ها</span>
+                        </a>
+                      </div>
+
+                      {/* ۳. گزارش‌های کاری */}
+                      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 flex flex-col justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-extrabold text-[#0B192C] flex items-center gap-1.5">
+                              <FileText className="w-3.5 h-3.5 text-sky-700" />
+                              <span>۳. خروجی گزارش‌های کاری روزانه</span>
+                            </span>
+                            <span className="px-2 py-0.5 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-sky-900 tabular-nums">
+                              {toPersianDigits(filteredReports.length)} گزارش
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-600 leading-5">
+                            شامل تاریخ شمسی، ساعت ثبت، شرح کامل فعالیت‌های انجام‌شده توسط پرسنل و فهرست متریال و مصارف کارگاه.
+                          </p>
+                        </div>
+                        <a
+                          href={buildExportUrl('reports')}
+                          download="mgammon-work-reports.xlsx"
+                          className="min-h-[40px] px-3.5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center justify-center gap-2 hover:bg-[#142844] transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>دانلود اکسل گزارش‌های کاری</span>
+                        </a>
+                      </div>
+
+                      {/* ۴. لیست پرداختی‌ها */}
+                      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 flex flex-col justify-between gap-3">
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-extrabold text-[#0B192C] flex items-center gap-1.5">
+                              <Wallet className="w-3.5 h-3.5 text-amber-700" />
+                              <span>۴. خروجی لیست پرداختی‌ها و امور مالی</span>
+                            </span>
+                            <span className="px-2 py-0.5 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-amber-900 tabular-nums">
+                              {toPersianDigits(filteredPayments.length)} تراکنش
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-600 leading-5">
+                            شامل تاریخ شمسی، مبلغ دقیق (تومان)، نوع پرداخت (حقوق، مساعده، علی‌الحساب، تنخواه)، وضعیت، شرح و توضیحات کامل + جمع کل پرداختی‌ها.
+                          </p>
+                        </div>
+                        <a
+                          href={buildExportUrl('payments')}
+                          download="mgammon-payments-list.xlsx"
+                          className="min-h-[40px] px-3.5 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold flex items-center justify-center gap-2 hover:bg-[#142844] transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>دانلود اکسل لیست پرداختی‌ها</span>
+                        </a>
+                      </div>
+                    </div>
+
+                    {/* دکمه خروجی جامع یکجا (فایل اکسل چندبرگه‌ای شامل تمامی بخش‌ها) */}
+                    <div className="rounded-xl bg-gradient-to-l from-[#0B192C] to-[#152944] border border-[#C5A059] p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-white">
+                      <div className="space-y-0.5">
+                        <div className="text-xs font-extrabold text-[#C5A059]">
+                          دریافت خروجی جامع یکپارچه (همه بخش‌ها در یک فایل اکسل چندبرگه‌ای)
+                        </div>
+                        <p className="text-[11px] text-slate-300">
+                          شامل برگه‌های مجزا برای ساعات کاری، اضافه‌کار، گزارش‌های کاری، لیست پرداختی‌ها، مرخصی‌ها و ریز ترددها
+                        </p>
+                      </div>
+                      <a
+                        href={buildExportUrl('all')}
+                        download="mgammon-full-backup.xlsx"
+                        className="min-h-[42px] px-4 rounded-xl bg-[#C5A059] text-[#0B192C] text-xs font-extrabold flex items-center justify-center gap-2 shrink-0 hover:bg-[#d4b06a] transition-colors"
+                      >
+                        <FileSpreadsheet className="w-4 h-4" />
+                        <span>دانلود اکسل جامع همه بخش‌ها</span>
+                      </a>
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* زیرتب حساب کاربری مدیر (تغییر تصویر، رمز عبور، اثر انگشت و پشتیبان‌گیری) */}
               {settingsSubTab === 'account' && (
                 <AccountSettingsPanel
@@ -4573,7 +4801,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               )}
 
               {/* زیرتب‌های ساعات کاری، حقوق و پیامک */}
-              {settingsSubTab !== 'account' && settingsSubTab !== 'guide' && (
+              {settingsSubTab !== 'account' &&
+                settingsSubTab !== 'guide' &&
+                settingsSubTab !== 'export' && (
                 <form onSubmit={handleSaveSettings} className="space-y-4">
                   {/* ۱. ساعات کاری، پنجشنبه‌ها، سهمیه مرخصی و تاریخ شروع قرارداد */}
                   {settingsSubTab === 'schedule' && (

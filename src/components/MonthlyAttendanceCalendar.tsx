@@ -25,7 +25,7 @@ interface MonthlyAttendanceCalendarProps {
 }
 
 function inferTimesFromHistoricalRow(
-  shamsiDate: string,
+  _shamsiDate: string,
   netMins: number,
   otMins: number,
   note?: string,

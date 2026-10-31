@@ -4,8 +4,6 @@ import {
   BellRing,
   CheckCircle2,
   HelpCircle,
-  ShieldAlert,
-  Smartphone,
   Volume2,
   Zap,
 } from 'lucide-react';

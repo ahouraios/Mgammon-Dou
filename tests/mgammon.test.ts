@@ -3,7 +3,6 @@ import {
   calculateDailyAttendance,
   calculateMonthlyPayrollPeriod,
   calculatePeriodStatement,
-  calculateSalaryAndOvertimeRates,
   evaluateWorkerLiveState,
   generateStatementPeriods,
   validateAttendanceSequence,
@@ -117,8 +116,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
   let managerToken = '';
   let workerToken = '';
 
-  let savedSettingsRow: Record<string, unknown> | null = null;
-
   const origDbName = process.env.DB_NAME;
   const origMediaDir = process.env.PRIVATE_MEDIA_DIR;
   const origBackupDir = process.env.BACKUP_DIR;
@@ -136,11 +133,6 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     for (const tbl of [...BACKUP_TABLES_ORDERED].reverse()) {
       if (tbl === 'users' || tbl === 'system_settings' || tbl === 'schema_migrations') continue;
       await pool.execute(`DELETE FROM \`${tbl}\``);
-    }
-
-    const [sRows] = await pool.execute('SELECT * FROM system_settings ORDER BY id ASC LIMIT 1');
-    if (Array.isArray(sRows) && sRows.length > 0) {
-      savedSettingsRow = sRows[0] as Record<string, unknown>;
     }
 
     const app = await createApp();
