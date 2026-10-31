@@ -1089,6 +1089,248 @@ export interface StatementDayDetail {
   workDaysCount: number;
 }
 
+export interface InstallmentPeriodShare {
+  tx: FinancialTransaction;
+  totalAmountToman: number;
+  monthlyInstallmentToman: number;
+  installmentNumber: number;
+  totalInstallments: number;
+  deductedThisPeriodToman: number;
+  amortizedUpToPeriodToman: number;
+  remainingAfterPeriodToman: number;
+  isOriginatedInThisPeriod: boolean;
+}
+
+/**
+ * استخراج سال و ماه دوره مالی (۱۵ام به ۱۵ام یا تقویمی) برای تاریخ یک تراکنش مالی
+ */
+export function getFinancialCycleYearMonthForShamsiDate(
+  shamsiDate: string,
+  anchorDay = 15,
+  collabStartShamsi = '1405/06/15',
+  calendarMode = false
+): { jy: number; jm: number } {
+  const norm = isValidShamsiDate(shamsiDate)
+    ? normalizeShamsiDate(shamsiDate)
+    : '1405/08/01';
+  const [jy, jm, jd] = norm.split('/').map(Number);
+  if (calendarMode) {
+    return { jy, jm };
+  }
+  const safeAnchor = Math.min(29, Math.max(1, Math.round(Number(anchorDay) || 15)));
+  const normCollab = isValidShamsiDate(collabStartShamsi)
+    ? normalizeShamsiDate(collabStartShamsi)
+    : '1405/06/15';
+  if (jd > safeAnchor || (jd === safeAnchor && norm <= normCollab)) {
+    return { jy, jm };
+  }
+  const prevJm = jm === 1 ? 12 : jm - 1;
+  const prevJy = jm === 1 ? jy - 1 : jy;
+  return { jy: prevJy, jm: prevJm };
+}
+
+/**
+ * محاسبه سهم قسط ماهانه یک تعهد مالی تقسیطی در یک دوره مشخص (ماه کاری)
+ */
+export function evaluateInstallmentForPeriod(params: {
+  tx: FinancialTransaction;
+  periodStartYear: number;
+  periodStartMonth: number;
+  anchorDay?: number;
+  collabStartShamsi?: string;
+  calendarMode?: boolean;
+}): InstallmentPeriodShare | null {
+  const {
+    tx,
+    periodStartYear,
+    periodStartMonth,
+    anchorDay = 15,
+    collabStartShamsi = '1405/06/15',
+    calendarMode = false,
+  } = params;
+
+  if (
+    tx.tx_type === 'PETTY_CASH' ||
+    tx.settlement_mode !== 'INSTALLMENT' ||
+    !tx.monthly_deduction_toman ||
+    Number(tx.monthly_deduction_toman) <= 0
+  ) {
+    return null;
+  }
+
+  const totalAmountToman = Math.max(0, Math.round(Number(tx.amount_toman) || 0));
+  if (totalAmountToman <= 0) return null;
+
+  const monthlyInstallmentToman = Math.max(
+    1,
+    Math.min(totalAmountToman, Math.round(Number(tx.monthly_deduction_toman) || totalAmountToman))
+  );
+  const totalInstallments = Math.max(
+    1,
+    Math.ceil(totalAmountToman / monthlyInstallmentToman)
+  );
+
+  const effectiveStartShamsi =
+    tx.installment_start_shamsi && isValidShamsiDate(tx.installment_start_shamsi)
+      ? normalizeShamsiDate(tx.installment_start_shamsi)
+      : isValidShamsiDate(tx.shamsi_date)
+        ? normalizeShamsiDate(tx.shamsi_date)
+        : '1405/08/01';
+
+  const startCycle = getFinancialCycleYearMonthForShamsiDate(
+    effectiveStartShamsi,
+    anchorDay,
+    collabStartShamsi,
+    calendarMode
+  );
+
+  const monthDiff =
+    (periodStartYear - startCycle.jy) * 12 + (periodStartMonth - startCycle.jm);
+
+  if (monthDiff < 0) {
+    return null;
+  }
+
+  const priorAmortized = Math.min(
+    totalAmountToman,
+    monthDiff * monthlyInstallmentToman
+  );
+  const remBefore = Math.max(0, totalAmountToman - priorAmortized);
+  if (remBefore <= 0) {
+    return null;
+  }
+
+  const deductedThisPeriodToman = Math.min(remBefore, monthlyInstallmentToman);
+  const amortizedUpToPeriodToman = priorAmortized + deductedThisPeriodToman;
+  const remainingAfterPeriodToman = Math.max(
+    0,
+    totalAmountToman - amortizedUpToPeriodToman
+  );
+
+  return {
+    tx,
+    totalAmountToman,
+    monthlyInstallmentToman,
+    installmentNumber: monthDiff + 1,
+    totalInstallments,
+    deductedThisPeriodToman,
+    amortizedUpToPeriodToman,
+    remainingAfterPeriodToman,
+    isOriginatedInThisPeriod: monthDiff === 0,
+  };
+}
+
+/**
+ * محاسبه وضعیت تجمعی مالی تا تاریخ روز جاری با لحاظ استهلاک تدریجی اقساط ماهانه
+ * - تعهدات تقسیطی (INSTALLMENT) فقط به میزان اقساط سررسیدشده تا دوره جاری از حساب حقوق کسر می‌شوند
+ *   و مانده مستهلک‌نشده به دوره‌های ماهانه آتی منتقل می‌گردد.
+ */
+export function calculateCumulativeFinancialSummaryAsOf(params: {
+  transactions: FinancialTransaction[];
+  currentShamsiDate: string;
+  collabStartShamsi?: string;
+  anchorDay?: number;
+}): {
+  approvedTotalGrossToman: number;
+  approvedMaturedReceivedToman: number;
+  approvedPettyCashToman: number;
+  unamortizedDeferredDebtToman: number;
+  activeInstallmentsCount: number;
+  pendingTotalToman: number;
+  pendingCount: number;
+} {
+  const {
+    transactions = [],
+    currentShamsiDate,
+    collabStartShamsi = '1405/06/15',
+    anchorDay = 15,
+  } = params;
+
+  const normNow = isValidShamsiDate(currentShamsiDate)
+    ? normalizeShamsiDate(currentShamsiDate)
+    : '1405/08/01';
+  const curCycleKey = getMonthlyCycleKeyForShamsiDate(normNow, anchorDay);
+  const [curJy, curJm] = curCycleKey.split('/').map(Number);
+
+  let approvedTotalGrossToman = 0;
+  let approvedMaturedReceivedToman = 0;
+  let approvedPettyCashToman = 0;
+  let unamortizedDeferredDebtToman = 0;
+  let activeInstallmentsCount = 0;
+  let pendingTotalToman = 0;
+  let pendingCount = 0;
+
+  for (const tx of transactions) {
+    const amt = Math.max(0, Math.round(Number(tx.amount_toman) || 0));
+    if (amt <= 0) continue;
+
+    if (tx.status === 'PENDING') {
+      pendingTotalToman += amt;
+      pendingCount += 1;
+      continue;
+    }
+    if (tx.status !== 'APPROVED') {
+      continue;
+    }
+
+    approvedTotalGrossToman += amt;
+
+    if (tx.tx_type === 'PETTY_CASH') {
+      approvedPettyCashToman += amt;
+      continue;
+    }
+
+    const isInstallment =
+      tx.settlement_mode === 'INSTALLMENT' &&
+      tx.monthly_deduction_toman &&
+      Number(tx.monthly_deduction_toman) > 0;
+
+    if (!isInstallment) {
+      approvedMaturedReceivedToman += amt;
+    } else {
+      const monthlyInst = Math.max(
+        1,
+        Math.min(amt, Math.round(Number(tx.monthly_deduction_toman) || amt))
+      );
+      const startShamsi =
+        tx.installment_start_shamsi && isValidShamsiDate(tx.installment_start_shamsi)
+          ? normalizeShamsiDate(tx.installment_start_shamsi)
+          : isValidShamsiDate(tx.shamsi_date)
+            ? normalizeShamsiDate(tx.shamsi_date)
+            : normNow;
+
+      const startCycle = getFinancialCycleYearMonthForShamsiDate(
+        startShamsi,
+        anchorDay,
+        collabStartShamsi,
+        false
+      );
+      const rawDiff = (curJy - startCycle.jy) * 12 + (curJm - startCycle.jm);
+      const effectiveElapsedCycles =
+        startShamsi <= normNow ? Math.max(1, rawDiff + 1) : Math.max(0, rawDiff + 1);
+
+      const maturedAmt = Math.min(amt, effectiveElapsedCycles * monthlyInst);
+      const unamortizedAmt = Math.max(0, amt - maturedAmt);
+
+      approvedMaturedReceivedToman += maturedAmt;
+      if (unamortizedAmt > 0) {
+        unamortizedDeferredDebtToman += unamortizedAmt;
+        activeInstallmentsCount += 1;
+      }
+    }
+  }
+
+  return {
+    approvedTotalGrossToman,
+    approvedMaturedReceivedToman,
+    approvedPettyCashToman,
+    unamortizedDeferredDebtToman,
+    activeInstallmentsCount,
+    pendingTotalToman,
+    pendingCount,
+  };
+}
+
 export interface PeriodStatementSummary {
   periodKey: string;
   title: string;
@@ -1115,6 +1357,9 @@ export interface PeriodStatementSummary {
   salaryPaidToman: number;
   advanceAndOnAccountPaidToman: number;
   otherPaidForWorkerToman: number;
+  installmentDeductionThisPeriodToman?: number;
+  remainingDeferredDebtAfterPeriodToman?: number;
+  installmentShares?: InstallmentPeriodShare[];
   pendingAmountToman: number;
   pendingCount: number;
   periodBalanceToman: number;
@@ -1128,6 +1373,8 @@ export interface PeriodStatementSummary {
  * - در صورتی که حقوق پایه ماهانه (base_salary_toman) تنظیم شده باشد و قرارداد ساعتی دستی نباشد،
  *   حقوق کارکرد ماه به صورت ماهانه (مبلغ کامل حقوق پایه ماهانه به ازای هر ماه کاری فعال ۱۵ام به ۱۵ام) محاسبه می‌شود
  *   و نه روزبه‌روز، و اضافه‌کاری کل ماه به آن اضافه می‌گردد.
+ * - برای تعهدات مالی و پرداخت‌های غیرحقوق با شیوه تسویه تقسیطی (INSTALLMENT)، در هر دوره ماهانه صرفاً
+ *   مبلغ قسط همان ماه (monthly_deduction_toman) به صورت خودکار کسر شده و مانده مستهلک‌نشده به ماه‌های بعد منتقل می‌شود.
  */
 export function calculatePeriodStatement(params: {
   periodKey: string;
@@ -1137,6 +1384,8 @@ export function calculatePeriodStatement(params: {
   toShamsi: string;
   txFromShamsi?: string;
   txToShamsi?: string;
+  calendarMode?: boolean;
+  collabStartShamsi?: string;
   dailySummaries: DailyAttendanceSummary[];
   historicalRecords?: HistoricalWorkRecord[];
   transactions: FinancialTransaction[];
@@ -1151,6 +1400,8 @@ export function calculatePeriodStatement(params: {
     toShamsi,
     txFromShamsi,
     txToShamsi,
+    calendarMode = false,
+    collabStartShamsi,
     dailySummaries = [],
     historicalRecords = [],
     transactions = [],
@@ -1162,6 +1413,12 @@ export function calculatePeriodStatement(params: {
   const normTo = isValidShamsiDate(toShamsi) ? normalizeShamsiDate(toShamsi) : toShamsi;
   const normTxFrom = txFromShamsi && isValidShamsiDate(txFromShamsi) ? normalizeShamsiDate(txFromShamsi) : normFrom;
   const normTxTo = txToShamsi && isValidShamsiDate(txToShamsi) ? normalizeShamsiDate(txToShamsi) : normTo;
+  const effectiveCollabStart =
+    collabStartShamsi || settings.collaboration_start_shamsi || '1405/06/15';
+
+  const [periodStartYear, periodStartMonth] = (normFrom || '1405/08/15')
+    .split('/')
+    .map(Number);
 
   const refSettings = resolveEffectiveSettingsForShamsiDate(normTo || normFrom, settings, snapshots);
   const refRates = calculateSalaryAndOvertimeRates(refSettings, 0);
@@ -1365,16 +1622,60 @@ export function calculatePeriodStatement(params: {
     }
   }
 
-  // فیلتر تراکنش‌های مالی در این بازه زمانی
-  const periodTransactions = transactions
-    .filter((tx) => {
-      if (!tx.shamsi_date) return false;
-      const normTxDate = isValidShamsiDate(tx.shamsi_date)
-        ? normalizeShamsiDate(tx.shamsi_date)
-        : tx.shamsi_date;
-      return normTxDate >= normTxFrom && normTxDate <= normTxTo;
-    })
-    .sort((a, b) => b.shamsi_date.localeCompare(a.shamsi_date) || b.id - a.id);
+  // ۱. تراکنش‌های یکجا (LUMP_SUM) و تنخواه ثبت‌شده در این بازه زمانی
+  const directPeriodTransactions = transactions.filter((tx) => {
+    if (!tx.shamsi_date) return false;
+    const isInst =
+      tx.tx_type !== 'PETTY_CASH' &&
+      tx.settlement_mode === 'INSTALLMENT' &&
+      tx.monthly_deduction_toman &&
+      Number(tx.monthly_deduction_toman) > 0;
+    if (isInst && tx.status === 'APPROVED') {
+      return false; // در حلقه اقساط ماهانه بررسی می‌شود
+    }
+    const normTxDate = isValidShamsiDate(tx.shamsi_date)
+      ? normalizeShamsiDate(tx.shamsi_date)
+      : tx.shamsi_date;
+    return normTxDate >= normTxFrom && normTxDate <= normTxTo;
+  });
+
+  // ۲. بررسی تمام تعهدات تقسیطی (INSTALLMENT) که در این دوره ماهانه دارای قسط فعال هستند
+  const installmentShares: InstallmentPeriodShare[] = [];
+  const installmentTransactionsForDisplay: FinancialTransaction[] = [];
+  let installmentDeductionThisPeriodToman = 0;
+  let remainingDeferredDebtAfterPeriodToman = 0;
+
+  for (const tx of transactions) {
+    if (tx.status !== 'APPROVED') continue;
+    const share = evaluateInstallmentForPeriod({
+      tx,
+      periodStartYear,
+      periodStartMonth,
+      anchorDay: 15,
+      collabStartShamsi: effectiveCollabStart,
+      calendarMode,
+    });
+    if (share && share.deductedThisPeriodToman > 0) {
+      installmentShares.push(share);
+      installmentDeductionThisPeriodToman += share.deductedThisPeriodToman;
+      remainingDeferredDebtAfterPeriodToman += share.remainingAfterPeriodToman;
+      installmentTransactionsForDisplay.push({
+        ...tx,
+        amount_toman: share.deductedThisPeriodToman,
+        description: `${tx.description} — قسط ${toPersianDigits(
+          share.installmentNumber
+        )} از ${toPersianDigits(share.totalInstallments)} (اصل تعهد: ${toPersianDigits(
+          share.totalAmountToman.toLocaleString('en-US')
+        )} تومان${
+          share.remainingAfterPeriodToman > 0
+            ? ` | مانده تعهد آتی: ${toPersianDigits(
+                share.remainingAfterPeriodToman.toLocaleString('en-US')
+              )} تومان`
+            : ' | تسویه کامل تعهد'
+        })`,
+      });
+    }
+  }
 
   let approvedPettyCashToman = 0;
   let approvedTotalPaidOrReceivedToman = 0;
@@ -1384,7 +1685,7 @@ export function calculatePeriodStatement(params: {
   let pendingAmountToman = 0;
   let pendingCount = 0;
 
-  for (const tx of periodTransactions) {
+  for (const tx of directPeriodTransactions) {
     const amt = Math.max(0, Math.round(Number(tx.amount_toman) || 0));
     if (tx.status === 'PENDING') {
       pendingAmountToman += amt;
@@ -1408,6 +1709,24 @@ export function calculatePeriodStatement(params: {
       }
     }
   }
+
+  // افزودن سهم اقساط ماهانه فعال در این دوره به جمع کسورات / دریافتی‌های دوره
+  for (const share of installmentShares) {
+    const instAmt = share.deductedThisPeriodToman;
+    approvedTotalPaidOrReceivedToman += instAmt;
+    if (share.tx.tx_type === 'SALARY') {
+      salaryPaidToman += instAmt;
+    } else if (share.tx.tx_type === 'ADVANCE' || share.tx.tx_type === 'ON_ACCOUNT') {
+      advanceAndOnAccountPaidToman += instAmt;
+    } else {
+      otherPaidForWorkerToman += instAmt;
+    }
+  }
+
+  const periodTransactions = [
+    ...directPeriodTransactions,
+    ...installmentTransactionsForDisplay,
+  ].sort((a, b) => b.shamsi_date.localeCompare(a.shamsi_date) || b.id - a.id);
 
   const salaryPlusOvertimeToman = Math.max(
     0,
@@ -1448,6 +1767,9 @@ export function calculatePeriodStatement(params: {
     salaryPaidToman,
     advanceAndOnAccountPaidToman,
     otherPaidForWorkerToman,
+    installmentDeductionThisPeriodToman,
+    remainingDeferredDebtAfterPeriodToman,
+    installmentShares,
     pendingAmountToman,
     pendingCount,
     periodBalanceToman,
@@ -1491,6 +1813,9 @@ export function generateStatementPeriods(params: {
   const normCollabStart = isValidShamsiDate(rawCollabStart)
     ? normalizeShamsiDate(rawCollabStart)
     : '1405/06/15';
+  const normNow = isValidShamsiDate(currentShamsiDate)
+    ? normalizeShamsiDate(currentShamsiDate)
+    : '1405/08/01';
 
   // جمع‌آوری تمام سال/ماه‌های شمسی موجود در داده‌ها + ماه جاری و ماه شروع همکاری
   const yearMonthSet = new Set<string>();
@@ -1525,6 +1850,41 @@ export function generateStatementPeriods(params: {
   }
   for (const t of transactions) {
     addYearMonthFromDate(t.shamsi_date);
+    if (t.installment_start_shamsi) {
+      addYearMonthFromDate(t.installment_start_shamsi);
+    }
+    // افزودن دوره‌های ماهانه اقساط تا ماه جاری
+    if (
+      t.status === 'APPROVED' &&
+      t.tx_type !== 'PETTY_CASH' &&
+      t.settlement_mode === 'INSTALLMENT' &&
+      t.monthly_deduction_toman &&
+      Number(t.monthly_deduction_toman) > 0
+    ) {
+      const totalInstallments = Math.min(
+        36,
+        Math.max(1, Math.ceil(Number(t.amount_toman) / Number(t.monthly_deduction_toman)))
+      );
+      const startCycle = getFinancialCycleYearMonthForShamsiDate(
+        t.installment_start_shamsi || t.shamsi_date,
+        safeAnchorDay,
+        normCollabStart,
+        mode === 'CALENDAR_MONTH'
+      );
+      const [nowY, nowM] = normNow.split('/').map(Number);
+      let cy = startCycle.jy;
+      let cm = startCycle.jm;
+      for (let k = 0; k < totalInstallments; k++) {
+        if (cy < nowY || (cy === nowY && cm <= nowM)) {
+          yearMonthSet.add(`${cy}/${pad2(cm)}`);
+        }
+        cm += 1;
+        if (cm > 12) {
+          cm = 1;
+          cy += 1;
+        }
+      }
+    }
   }
 
   const sortedYearMonths = Array.from(yearMonthSet)
@@ -1552,6 +1912,8 @@ export function generateStatementPeriods(params: {
         subtitle,
         fromShamsi,
         toShamsi,
+        calendarMode: true,
+        collabStartShamsi: normCollabStart,
         dailySummaries,
         historicalRecords,
         transactions,
@@ -1592,6 +1954,8 @@ export function generateStatementPeriods(params: {
         toShamsi: workToShamsi,
         txFromShamsi,
         txToShamsi: displayEndShamsi,
+        calendarMode: false,
+        collabStartShamsi: normCollabStart,
         dailySummaries,
         historicalRecords,
         transactions,
@@ -1603,10 +1967,6 @@ export function generateStatementPeriods(params: {
       results.push(stmt);
     }
   }
-
-  const normNow = isValidShamsiDate(currentShamsiDate)
-    ? normalizeShamsiDate(currentShamsiDate)
-    : '1405/08/01';
 
   const filtered = results.filter((stmt, idx) => {
     const isCurrentPeriod = normNow >= stmt.fromShamsi && normNow <= stmt.toShamsi;

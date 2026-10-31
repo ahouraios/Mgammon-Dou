@@ -75,6 +75,8 @@ export interface AttendanceLog {
   created_at: string;
 }
 
+export type SettlementMode = 'LUMP_SUM' | 'INSTALLMENT';
+
 export interface HistoricalWorkRowItem {
   shamsi_date: string;
   title: string;
@@ -84,6 +86,10 @@ export interface HistoricalWorkRowItem {
   check_in?: string;
   check_out?: string;
   note?: string;
+  late_status?: LateArrivalDisposition;
+  manager_late_note?: string | null;
+  custom_deduction_toman?: number | null;
+  late_deduction_toman?: number;
 }
 
 export interface HistoricalWorkRecord {
@@ -182,6 +188,10 @@ export interface FinancialTransaction {
   reviewed_by_user_id: number | null;
   reviewed_at: string | null;
   manager_note: string | null;
+  settlement_mode?: SettlementMode; // LUMP_SUM (یکجا) | INSTALLMENT (تقسیط خودکار ماهانه)
+  monthly_deduction_toman?: number | null; // مبلغ کسر خودکار در هر دوره ماهانه
+  installment_count?: number | null; // تعداد کل اقساط / دوره‌های ماهانه
+  installment_start_shamsi?: string | null; // تاریخ / دوره شروع استهلاک
   idempotency_key: string | null;
   created_at: string;
 }
@@ -328,3 +338,40 @@ export interface SystemSettingsSnapshot {
   created_at?: string;
 }
 
+export type MediaSourceType =
+  | 'CORRESPONDENCE_AUDIO'
+  | 'CORRESPONDENCE_ATTACHMENT'
+  | 'REPORT_PHOTO'
+  | 'FINANCE_RECEIPT'
+  | 'HISTORICAL_EXCEL'
+  | 'ORPHAN_FILE';
+
+export interface MediaStorageItem {
+  id: string;
+  source_type: MediaSourceType;
+  category: 'AUDIO' | 'IMAGE' | 'DOCUMENT';
+  record_id: number | null;
+  file_url: string;
+  file_name: string;
+  size_bytes: number;
+  shamsi_date: string;
+  recorded_time?: string;
+  title_or_context: string;
+  sender_or_creator: string;
+  exists_on_disk: boolean;
+  created_at: string;
+}
+
+export interface MediaStorageSummary {
+  total_files_count: number;
+  total_size_bytes: number;
+  audio_files_count: number;
+  audio_size_bytes: number;
+  image_files_count: number;
+  image_size_bytes: number;
+  document_files_count: number;
+  document_size_bytes: number;
+  items: MediaStorageItem[];
+}
+
+export type FlexibleClockEntryMode = 'START_ONLY' | 'END_ONLY' | 'FULL_SHIFT';

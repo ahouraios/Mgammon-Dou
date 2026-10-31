@@ -945,6 +945,36 @@ const SCHEMA_MIGRATIONS: SchemaMigrationSpec[] = [
       );
     },
   },
+  {
+    version: 7,
+    name: 'v7_financial_installment_amortization',
+    up: async (p) => {
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'settlement_mode',
+        "ENUM('LUMP_SUM', 'INSTALLMENT') NOT NULL DEFAULT 'LUMP_SUM'"
+      );
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'monthly_deduction_toman',
+        'DECIMAL(15, 0) NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'installment_count',
+        'INT UNSIGNED NULL DEFAULT NULL'
+      );
+      await ensureColumnExists(
+        p,
+        'financial_transactions',
+        'installment_start_shamsi',
+        'VARCHAR(10) NULL DEFAULT NULL'
+      );
+    },
+  },
 ];
 
 async function createPreMigrationSafetySnapshot(

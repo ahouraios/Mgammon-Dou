@@ -128,11 +128,11 @@ export async function apiRequest<T>(
 }
 
 export const TX_TYPE_LABELS: Record<string, string> = {
-  ADVANCE: 'مساعده',
-  ON_ACCOUNT: 'علی‌الحساب',
-  SALARY: 'حقوق',
-  PETTY_CASH: 'خرید کارگاهی / هزینه تنخواه (طلب پرسنل)',
-  OTHER: 'خرید وسیله / اسنپ / هزینه متفرقه (طلب پرسنل)',
+  ADVANCE: 'مساعده تعهدی',
+  ON_ACCOUNT: 'پرداخت علی‌الحساب',
+  SALARY: 'تسویه حقوق و مزایا',
+  PETTY_CASH: 'خرید کارگاهی / هزینه تنخواه (بستانکاری پرسنل)',
+  OTHER: 'واگذاری ملزومات / پرداخت خارج از حکم حقوق (تعهد پرسنلی)',
 };
 
 export const EVENT_TYPE_LABELS: Record<string, string> = {

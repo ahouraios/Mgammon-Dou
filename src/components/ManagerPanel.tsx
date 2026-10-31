@@ -13,8 +13,10 @@ import {
   LateDeductionUnit,
   LeaveQuotaSummary,
   LeaveRequestItem,
+  MediaSourceType,
   MissionPolicy,
   OvertimeCalcMode,
+  SettlementMode,
   SystemSettings,
   UserProfile,
   WorkerLiveState,
@@ -76,7 +78,9 @@ import {
   ChevronDown,
   ChevronUp,
   HelpCircle,
+  HardDrive,
 } from 'lucide-react';
+import { MediaStorageCleanupPanel } from './MediaStorageCleanupPanel';
 
 type ManagerTab =
   | 'dashboard'
@@ -86,7 +90,7 @@ type ManagerTab =
   | 'correspondence'
   | 'settings';
 
-type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms' | 'export' | 'guide';
+type SettingsSubTab = 'account' | 'schedule' | 'salary' | 'sms' | 'export' | 'storage' | 'guide';
 
 type ManagerDashCard =
   | 'approvals'
@@ -344,6 +348,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [manualTime, setManualTime] = useState('07:00');
   const [manualCheckInTime, setManualCheckInTime] = useState('07:00');
   const [manualCheckOutTime, setManualCheckOutTime] = useState('15:00');
+  const [manualStartOnly, setManualStartOnly] = useState(false);
   const [manualReason, setManualReason] = useState('');
   const [editingLogId, setEditingLogId] = useState<number | null>(null);
 
@@ -365,7 +370,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [repFromShamsi, setRepFromShamsi] = useState('');
   const [repToShamsi, setRepToShamsi] = useState('');
 
-  // فیلتر و فرم مالی مدیر + ویرایش موارد پرداخت‌شده
+  // فیلتر و فرم مالی مدیر + ویرایش موارد پرداخت‌شده + استهلاک تدریجی تعهدات پرسنلی
   const [finStatusFilter, setFinStatusFilter] = useState('');
   const [finTypeFilter, setFinTypeFilter] = useState('');
   const [finSearch, setFinSearch] = useState('');
@@ -374,6 +379,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [mgrShamsiDate, setMgrShamsiDate] = useState(initialShamsiDate);
   const [mgrDesc, setMgrDesc] = useState('');
   const [mgrNote, setMgrNote] = useState('');
+  const [mgrSettlementMode, setMgrSettlementMode] = useState<SettlementMode>('LUMP_SUM');
+  const [mgrMonthlyDeduction, setMgrMonthlyDeduction] = useState('');
+  const [mgrInstallmentStartDate, setMgrInstallmentStartDate] = useState(initialShamsiDate);
+
   const [editingFinTx, setEditingFinTx] = useState<FinancialTransaction | null>(null);
   const [editFinAmount, setEditFinAmount] = useState('');
   const [editFinType, setEditFinType] = useState<FinancialTxType>('SALARY');
@@ -381,6 +390,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const [editFinDesc, setEditFinDesc] = useState('');
   const [editFinNote, setEditFinNote] = useState('');
   const [editFinStatus, setEditFinStatus] = useState<FinancialStatus>('APPROVED');
+  const [editFinSettlementMode, setEditFinSettlementMode] = useState<SettlementMode>('LUMP_SUM');
+  const [editFinMonthlyDeduction, setEditFinMonthlyDeduction] = useState('');
+  const [editFinInstallmentStartDate, setEditFinInstallmentStartDate] = useState(initialShamsiDate);
 
   // تعطیل رسمی جدید در تنظیمات + پاپ‌آپ راهنمای پیامک + فیلتر بازه زمانی خروجی اکسل
   const [newHolidayShamsi, setNewHolidayShamsi] = useState('');
@@ -395,11 +407,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     useState<Exclude<LateArrivalDisposition, 'NONE' | 'PENDING'>>('EXCUSED');
   const [lateManagerNote, setLateManagerNote] = useState('');
   const [lateCustomDeduction, setLateCustomDeduction] = useState('');
+  const [lateModalError, setLateModalError] = useState<string | null>(null);
+  const [showSettledLateInDash, setShowSettledLateInDash] = useState(false);
 
   const openReviewLateModal = (
     day: DailyAttendanceSummary,
     presetDecision?: Exclude<LateArrivalDisposition, 'NONE' | 'PENDING'>
   ) => {
+    setLateModalError(null);
     setReviewingLateDay(day);
     const currentStatus = day.late_status;
     if (presetDecision) {
@@ -420,7 +435,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
   const handleSubmitLateReview = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!reviewingLateDay) return;
+    const targetShamsi = reviewingLateDay.shamsi_date;
+    const chosenDecision = lateDecisionChoice;
+    const chosenNote = lateManagerNote.trim() || null;
+    const chosenCustomDeduction =
+      chosenDecision === 'CUSTOM' && lateCustomDeduction ? Number(lateCustomDeduction) : 0;
+
     setFeedback(null);
+    setLateModalError(null);
     setActionLoading(true);
     try {
       const res = await apiRequest<{ ok: boolean; message: string }>(
@@ -428,21 +450,53 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         {
           method: 'POST',
           body: JSON.stringify({
-            shamsi_date: reviewingLateDay.shamsi_date,
-            decision: lateDecisionChoice,
-            manager_note: lateManagerNote,
+            shamsi_date: targetShamsi,
+            decision: chosenDecision,
+            manager_note: chosenNote,
             custom_deduction_toman:
-              lateDecisionChoice === 'CUSTOM' && lateCustomDeduction
+              chosenDecision === 'CUSTOM' && lateCustomDeduction
                 ? Number(lateCustomDeduction)
                 : null,
           }),
         }
       );
+
+      // بروزرسانی آنی لیست در کلاینت و بستن فوری پاپ‌آپ تعیین تکلیف
+      setAttendanceSummaries((prev) =>
+        prev.map((item) => {
+          if (item.shamsi_date !== targetShamsi) return item;
+          const isStillCountedLate =
+            chosenDecision === 'APPROVED_DELAY' ||
+            chosenDecision === 'ABSENCE' ||
+            chosenDecision === 'CUSTOM';
+          const badgeInfo = LATE_STATUS_BADGE_MAP[chosenDecision];
+          return {
+            ...item,
+            late_status: chosenDecision,
+            is_late: isStillCountedLate,
+            late_minutes:
+              chosenDecision === 'EXCUSED' || chosenDecision === 'DEDUCT_LEAVE'
+                ? 0
+                : item.raw_late_minutes || item.late_minutes,
+            manager_late_note: chosenNote,
+            late_deduction_toman:
+              chosenDecision === 'CUSTOM'
+                ? chosenCustomDeduction
+                : chosenDecision === 'EXCUSED' || chosenDecision === 'DEDUCT_LEAVE'
+                  ? 0
+                  : item.late_deduction_toman,
+            status_label: badgeInfo ? badgeInfo.label : item.status_label,
+          };
+        })
+      );
+
       setReviewingLateDay(null);
       setFeedback({ type: 'success', text: res.message });
       await Promise.all([loadDashboardAndSettings(), loadAttendanceList()]);
     } catch (err) {
-      setFeedback({ type: 'error', text: (err as Error).message });
+      const errMsg = (err as Error).message;
+      setLateModalError(errMsg);
+      setFeedback({ type: 'error', text: errMsg });
     } finally {
       setActionLoading(false);
     }
@@ -665,7 +719,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               action: 'ADD_SHIFT',
               shamsi_date: manualShamsiDate,
               check_in_time: manualCheckInTime,
-              check_out_time: manualCheckOutTime,
+              check_out_time: manualStartOnly ? '' : manualCheckOutTime,
               reason: manualReason,
             }),
           }
@@ -691,6 +745,29 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
       setShowAddLogForm(false);
       setManualReason('');
       await Promise.all([loadDashboardAndSettings(), loadAttendanceList()]);
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleManagerDeleteMediaItem = async (
+    sourceType: MediaSourceType,
+    recordId: number,
+    fileUrl: string
+  ) => {
+    setFeedback(null);
+    setActionLoading(true);
+    try {
+      const res = await apiRequest<{ ok: boolean; message: string }>('/api/media/cleanup', {
+        method: 'POST',
+        body: JSON.stringify({
+          items: [{ source_type: sourceType, record_id: recordId, file_url: fileUrl }],
+        }),
+      });
+      setFeedback({ type: 'success', text: res.message });
+      await refreshAllSilent();
     } catch (err) {
       setFeedback({ type: 'error', text: (err as Error).message });
     } finally {
@@ -774,6 +851,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           body: JSON.stringify({ decision }),
         }
       );
+      setHistoricalRecords((prev) =>
+        prev.map((rec) => (rec.id === id ? { ...rec, status: decision } : rec))
+      );
       setFeedback({ type: 'success', text: res.message });
       await Promise.all([loadDashboardAndSettings(), loadAttendanceList()]);
     } catch (err) {
@@ -791,6 +871,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
         method: 'POST',
         body: JSON.stringify({ decision }),
       });
+      setLeaveRequests((prev) =>
+        prev.map((lv) => (lv.id === id ? { ...lv, status: decision } : lv))
+      );
       setFeedback({ type: 'success', text: res.message });
       await Promise.all([loadDashboardAndSettings(), loadAttendanceList()]);
     } catch (err) {
@@ -846,6 +929,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     setFeedback(null);
     setActionLoading(true);
     try {
+      const supportsInstallment =
+        mgrTxType === 'OTHER' || mgrTxType === 'ADVANCE' || mgrTxType === 'ON_ACCOUNT';
+      const effectiveMode: SettlementMode =
+        supportsInstallment && mgrSettlementMode === 'INSTALLMENT' ? 'INSTALLMENT' : 'LUMP_SUM';
       const res = await apiRequest<{ ok: boolean; message: string }>(
         '/api/finance/manager-direct',
         {
@@ -856,12 +943,22 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             shamsi_date: mgrShamsiDate,
             description: mgrDesc,
             manager_note: mgrNote,
+            settlement_mode: effectiveMode,
+            monthly_deduction_toman:
+              effectiveMode === 'INSTALLMENT' ? mgrMonthlyDeduction : null,
+            installment_start_shamsi:
+              effectiveMode === 'INSTALLMENT'
+                ? mgrInstallmentStartDate || mgrShamsiDate
+                : null,
           }),
         }
       );
       setMgrAmount('');
       setMgrDesc('');
       setMgrNote('');
+      setMgrSettlementMode('LUMP_SUM');
+      setMgrMonthlyDeduction('');
+      setActiveFinCard('transactions');
       setFeedback({ type: 'success', text: res.message });
       await Promise.all([loadDashboardAndSettings(), loadFinanceList()]);
     } catch (err) {
@@ -882,6 +979,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
           body: JSON.stringify({ decision }),
         }
       );
+      setTransactions((prev) =>
+        prev.map((tx) => (tx.id === txId ? { ...tx, status: decision } : tx))
+      );
       setFeedback({ type: 'success', text: res.message });
       await Promise.all([loadDashboardAndSettings(), loadFinanceList()]);
     } catch (err) {
@@ -899,6 +999,13 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     setEditFinDesc(tx.description);
     setEditFinNote(tx.manager_note || '');
     setEditFinStatus(tx.status);
+    setEditFinSettlementMode(tx.settlement_mode === 'INSTALLMENT' ? 'INSTALLMENT' : 'LUMP_SUM');
+    setEditFinMonthlyDeduction(
+      tx.monthly_deduction_toman && tx.monthly_deduction_toman > 0
+        ? String(tx.monthly_deduction_toman)
+        : ''
+    );
+    setEditFinInstallmentStartDate(tx.installment_start_shamsi || tx.shamsi_date);
   };
 
   const handleUpdateFinancialTx = async (e: React.FormEvent) => {
@@ -907,6 +1014,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
     setFeedback(null);
     setActionLoading(true);
     try {
+      const supportsInstallment =
+        editFinType === 'OTHER' || editFinType === 'ADVANCE' || editFinType === 'ON_ACCOUNT';
+      const effectiveMode: SettlementMode =
+        supportsInstallment && editFinSettlementMode === 'INSTALLMENT' ? 'INSTALLMENT' : 'LUMP_SUM';
       const res = await apiRequest<{ ok: boolean; message: string }>(
         `/api/finance/${editingFinTx.id}`,
         {
@@ -918,6 +1029,13 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             description: editFinDesc,
             manager_note: editFinNote,
             status: editFinStatus,
+            settlement_mode: effectiveMode,
+            monthly_deduction_toman:
+              effectiveMode === 'INSTALLMENT' ? editFinMonthlyDeduction : null,
+            installment_start_shamsi:
+              effectiveMode === 'INSTALLMENT'
+                ? editFinInstallmentStartDate || editFinShamsiDate
+                : null,
           }),
         }
       );
@@ -2145,7 +2263,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         leaveRequests.length +
                         transactions.length +
                         historicalRecords.length +
-                        allLateDays.length,
+                        pendingLateDays.length,
                     },
                     {
                       id: 'pending' as const,
@@ -2155,7 +2273,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     {
                       id: 'late' as const,
                       label: 'تأخیرهای ورود پرسنل',
-                      count: allLateDays.length,
+                      count: pendingLateDays.length,
                     },
                     {
                       id: 'leaves' as const,
@@ -2164,7 +2282,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     },
                     {
                       id: 'petty_cash' as const,
-                      label: 'تنخواه و هزینه متفرقه',
+                      label: 'تنخواه و تعهدات متفرقه',
                       count: transactions.filter(
                         (t) => t.tx_type === 'PETTY_CASH' || t.tx_type === 'OTHER'
                       ).length,
@@ -2207,22 +2325,25 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                 {/* شبکه ۲ ستونه کارت‌های مطالبات بر اساس فیلتر انتخاب‌شده */}
                 {(() => {
-                  const filteredLateDays = allLateDays
-                    .filter((day) => {
-                      if (dashClaimFilter === 'pending') {
-                        return (
-                          day.late_status === 'PENDING' ||
-                          (day.is_late && (!day.late_status || day.late_status === 'NONE'))
-                        );
-                      }
-                      if (dashClaimFilter === 'late' || dashClaimFilter === 'all') return true;
-                      return false;
-                    })
-                    .sort(
-                      (a, b) =>
-                        (a.late_status === 'PENDING' ? 0 : 1) -
-                        (b.late_status === 'PENDING' ? 0 : 1)
-                    );
+                  const isDayPendingLate = (day: DailyAttendanceSummary) =>
+                    day.late_status === 'PENDING' ||
+                    (day.is_late && (!day.late_status || day.late_status === 'NONE'));
+
+                  const pendingFilteredLateDays = allLateDays.filter((day) => {
+                    if (
+                      dashClaimFilter === 'pending' ||
+                      dashClaimFilter === 'late' ||
+                      dashClaimFilter === 'all'
+                    ) {
+                      return isDayPendingLate(day);
+                    }
+                    return false;
+                  });
+
+                  const settledFilteredLateDays =
+                    dashClaimFilter === 'late'
+                      ? allLateDays.filter((day) => !isDayPendingLate(day))
+                      : [];
 
                   const filteredLeaves = leaveRequests
                     .filter((lv) => {
@@ -2255,22 +2376,22 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   });
 
                   const totalItems =
-                    filteredLateDays.length +
+                    pendingFilteredLateDays.length +
                     filteredLeaves.length +
                     filteredTxs.length +
                     filteredHistorical.length;
 
-                  if (totalItems === 0) {
+                  if (totalItems === 0 && settledFilteredLateDays.length === 0) {
                     return (
                       <div className="rounded-xl bg-slate-50 border border-slate-200/70 p-4 text-center text-xs text-slate-500">
-                        موردی در این بخش از مطالبات یافت نشد.
+                        موردی در انتظار تعیین تکلیف در این بخش یافت نشد.
                       </div>
                     );
                   }
 
                   const displayedLateDays = showAllDashClaims
-                    ? filteredLateDays
-                    : filteredLateDays.slice(0, 2);
+                    ? pendingFilteredLateDays
+                    : pendingFilteredLateDays.slice(0, 2);
                   const displayedLeaves = showAllDashClaims
                     ? filteredLeaves
                     : filteredLeaves.slice(0, 2);
@@ -2280,12 +2401,18 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                   return (
                     <div className="space-y-2.5">
+                      {dashClaimFilter === 'late' &&
+                        pendingFilteredLateDays.length === 0 &&
+                        settledFilteredLateDays.length > 0 && (
+                          <div className="rounded-xl bg-emerald-50/80 border border-emerald-200 p-3 text-center text-xs font-bold text-emerald-900">
+                            تمامی تأخیرهای ورود پرسنل تعیین تکلیف شده‌اند.
+                          </div>
+                        )}
+
                       {displayedLateDays.length > 0 && (
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                           {displayedLateDays.map((day) => {
-                            const isPendingLate =
-                              day.late_status === 'PENDING' ||
-                              (day.is_late && (!day.late_status || day.late_status === 'NONE'));
+                            const isPendingLate = isDayPendingLate(day);
                             const lateMins = day.raw_late_minutes || day.late_minutes || 0;
                             const badge =
                               LATE_STATUS_BADGE_MAP[day.late_status || 'PENDING'] ||
@@ -2358,6 +2485,79 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                               </div>
                             );
                           })}
+                        </div>
+                      )}
+
+                      {dashClaimFilter === 'late' && settledFilteredLateDays.length > 0 && (
+                        <div className="pt-1 space-y-2">
+                          <button
+                            type="button"
+                            onClick={() => setShowSettledLateInDash((p) => !p)}
+                            className="w-full min-h-[32px] rounded-xl bg-slate-50 hover:bg-slate-100 border border-slate-200 text-[11px] font-bold text-slate-700 flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            {showSettledLateInDash ? (
+                              <>
+                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                                <span>بستن فهرست تأخیرهای تعیین تکلیف شده</span>
+                              </>
+                            ) : (
+                              <>
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                                <span>
+                                  مشاهده تأخیرهای تعیین تکلیف شده (
+                                  {toPersianDigits(settledFilteredLateDays.length)} مورد)
+                                </span>
+                              </>
+                            )}
+                          </button>
+
+                          {showSettledLateInDash && (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                              {settledFilteredLateDays.map((day) => {
+                                const lateMins = day.raw_late_minutes || day.late_minutes || 0;
+                                const badge =
+                                  LATE_STATUS_BADGE_MAP[day.late_status || 'EXCUSED'] ||
+                                  LATE_STATUS_BADGE_MAP.EXCUSED;
+                                return (
+                                  <div
+                                    key={`settled-late-${day.shamsi_date}`}
+                                    className="rounded-xl border border-slate-200 bg-slate-50/70 p-3 flex flex-col justify-between gap-2 text-xs"
+                                  >
+                                    <div className="space-y-1 min-w-0">
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-200 text-slate-800">
+                                          تأخیر ({toPersianDigits(lateMins)} دقیقه)
+                                        </span>
+                                        <span className="font-bold text-[#0B192C] tabular-nums">
+                                          {toPersianDigits(day.shamsi_date)} ({day.day_name})
+                                        </span>
+                                        <span
+                                          className={`px-2 py-0.5 rounded border text-[10px] font-bold ${badge.className}`}
+                                        >
+                                          {badge.label}
+                                        </span>
+                                      </div>
+                                      {day.manager_late_note && (
+                                        <p className="text-[11px] text-[#9A7428] font-bold">
+                                          یادداشت مدیر: {day.manager_late_note}
+                                        </p>
+                                      )}
+                                    </div>
+                                    <div className="flex justify-end pt-1 border-t border-slate-200/60">
+                                      <button
+                                        type="button"
+                                        onClick={() => openReviewLateModal(day)}
+                                        className="min-h-[28px] px-2.5 rounded-lg bg-white border border-slate-300 text-[10.5px] font-bold text-[#0B192C] flex items-center gap-1 cursor-pointer"
+                                      >
+                                        <Edit3 className="w-3 h-3 text-[#9A7428]" />
+                                        <span>ویرایش تصمیم مدیر</span>
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -2480,6 +2680,19 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                 <p className="text-[11px] text-slate-700 truncate">
                                   {tx.description}
                                 </p>
+                                {tx.settlement_mode === 'INSTALLMENT' &&
+                                  tx.monthly_deduction_toman &&
+                                  tx.monthly_deduction_toman > 0 && (
+                                    <div className="rounded-lg bg-indigo-50/90 border border-indigo-200 px-2 py-1 text-[10.5px] font-bold text-indigo-950 tabular-nums">
+                                      استهلاک تدریجی ماهانه — کسر خودکار هر دوره:{' '}
+                                      {formatToman(tx.monthly_deduction_toman)} (طی{' '}
+                                      {toPersianDigits(
+                                        tx.installment_count ||
+                                          Math.ceil(tx.amount_toman / tx.monthly_deduction_toman)
+                                      )}{' '}
+                                      دوره)
+                                    </div>
+                                  )}
                                 {tx.receipt_file_url && (
                                   <button
                                     type="button"
@@ -3392,6 +3605,20 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                   {!editingLogId && manualEntryMode === 'SHIFT_PAIR' ? (
                     <div className="space-y-3.5">
+                      <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                        <label className="inline-flex items-center gap-2 text-xs font-extrabold text-[#0B192C] cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={manualStartOnly}
+                            onChange={(e) => setManualStartOnly(e.target.checked)}
+                            className="w-4 h-4 accent-[#0B192C] rounded cursor-pointer"
+                          />
+                          <span>
+                            ثبت صرفاً ساعت آغاز به کار (فعال‌سازی نوبت کاری در جریان — بدون الزام به تکمیل هم‌زمان ساعت پایان)
+                          </span>
+                        </label>
+                      </div>
+
                       <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                         <ShamsiDatePicker
                           label="تاریخ کارکرد"
@@ -3404,11 +3631,17 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                           value={manualCheckInTime}
                           onChange={setManualCheckInTime}
                         />
-                        <TimePickerInput
-                          label="ساعت خاتمه کار (خروج)"
-                          value={manualCheckOutTime}
-                          onChange={setManualCheckOutTime}
-                        />
+                        {!manualStartOnly ? (
+                          <TimePickerInput
+                            label="ساعت خاتمه کار (خروج)"
+                            value={manualCheckOutTime}
+                            onChange={setManualCheckOutTime}
+                          />
+                        ) : (
+                          <div className="rounded-xl bg-emerald-50/80 border border-emerald-200 p-2.5 text-[11px] text-emerald-950 flex items-center">
+                            نوبت کاری با ساعت ورود فوق <strong>«در جریان»</strong> ثبت می‌شود تا خروج بعداً از داشبورد یا دستی ثبت گردد.
+                          </div>
+                        )}
                         <div>
                           <label className="block text-xs font-medium text-slate-700 mb-1.5">
                             شرح یا علت ثبت مدیریتی (الزامی)
@@ -3424,7 +3657,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                         </div>
                       </div>
 
-                      {(() => {
+                      {!manualStartOnly && (() => {
                         const inMins = parseTimeToMinutes(manualCheckInTime);
                         const outMins = parseTimeToMinutes(manualCheckOutTime);
                         const diff = outMins - inMins;
@@ -4078,7 +4311,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                               </p>
                             </div>
                             {rep.photo_url && (
-                              <div className="pt-1">
+                              <div className="pt-1 flex flex-wrap items-center gap-2">
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -4097,6 +4330,22 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                                   />
                                   <ImageIcon className="w-3.5 h-3.5 text-[#9A7428]" />
                                   <span>پیش‌نمایش تصویر کار انجام‌شده</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={actionLoading}
+                                  onClick={() =>
+                                    handleManagerDeleteMediaItem(
+                                      'REPORT_PHOTO',
+                                      rep.id,
+                                      rep.photo_url!
+                                    )
+                                  }
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-bold cursor-pointer"
+                                  title="حذف تصویر جهت آزادسازی فضای هاست (متن گزارش حفظ می‌شود)"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                  <span>حذف تصویر پیوست</span>
                                 </button>
                               </div>
                             )}
@@ -4211,75 +4460,273 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               {activeFinCard === 'add_payment' && (
               <form
                 onSubmit={handleManagerAddPayment}
-                className="rounded-2xl bg-white border border-[#C5A059]/50 p-4 space-y-3"
+                className="rounded-2xl bg-white border border-[#C5A059]/50 p-4 space-y-3.5"
               >
-                <div className="border-b border-slate-100 pb-2">
-                  <h3 className="text-xs sm:text-sm font-bold text-[#0B192C]">
-                    ثبت پرداخت مستقیم یا هزینه انجام‌شده برای پرسنل (امید میثمی)
+                <div className="border-b border-slate-100 pb-2.5">
+                  <h3 className="text-xs sm:text-sm font-extrabold text-[#0B192C]">
+                    ثبت پرداخت مستقیم، واگذاری ملزومات و مدیریت تعهدات مالی پرسنل (امید میثمی)
                   </h3>
-                  <p className="text-[10.5px] text-slate-500 mt-0.5">
-                    می‌توانید علاوه بر حقوق و مساعده، هزینه‌های جانبی انجام‌شده برای پرسنل (مانند اسنپ، تهیه وسیله و...) یا بستانکاری تنخواه را در لیست پرداختی‌ها ثبت نمایید.
+                  <p className="text-[10.5px] text-slate-500 mt-0.5 leading-5">
+                    ثبت تسویه حقوق و مزایا، مساعده تعهدی، واگذاری ملزومات یا مبالغ پرداختی خارج از حکم کارگزینی، با امکان انتخاب سیاست «تسویه یکجا در دوره جاری» یا «استهلاک تدریجی و کسر خودکار ماهانه از استحقاق حقوق».
                   </p>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-start">
                   <TomanInput
-                    label="مبلغ پرداختی یا هزینه (تومان)"
+                    label="مبلغ کل پرداختی یا اصل تعهد مالی (تومان)"
                     value={mgrAmount}
                     onChange={setMgrAmount}
                     required
                   />
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                      نوع پرداخت / هزینه
+                      نوع پرداخت / سرفصل تعهد مالی
                     </label>
                     <select
                       value={mgrTxType}
-                      onChange={(e) => setMgrTxType(e.target.value as FinancialTxType)}
+                      onChange={(e) => {
+                        const nextType = e.target.value as FinancialTxType;
+                        setMgrTxType(nextType);
+                        if (nextType === 'SALARY' || nextType === 'PETTY_CASH') {
+                          setMgrSettlementMode('LUMP_SUM');
+                        }
+                      }}
                       className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white"
                     >
-                      <option value="SALARY">حقوق</option>
-                      <option value="ADVANCE">مساعده</option>
-                      <option value="ON_ACCOUNT">علی‌الحساب</option>
+                      <option value="SALARY">تسویه حقوق و مزایای دوره‌ای</option>
+                      <option value="ADVANCE">مساعده تعهدی پرسنل</option>
+                      <option value="ON_ACCOUNT">پرداخت علی‌الحساب</option>
                       <option value="OTHER">
-                        هزینه متفرقه انجام‌شده برای پرسنل (اسنپ، تهیه وسیله و...)
+                        واگذاری ملزومات / پرداخت خارج از حکم حقوق (تعهد مالی پرسنل)
                       </option>
                       <option value="PETTY_CASH">
-                        ثبت بستانکاری تنخواه / هزینه متفرقه به حساب پرسنل
+                        تسویه تنخواه / ثبت بستانکاری هزینه‌های کارگاهی پرسنل
                       </option>
                     </select>
                   </div>
                   <ShamsiDatePicker
-                    label="تاریخ پرداخت"
+                    label="تاریخ ثبت تراکنش"
                     value={mgrShamsiDate}
-                    onChange={setMgrShamsiDate}
+                    onChange={(d) => {
+                      setMgrShamsiDate(d);
+                      if (!mgrInstallmentStartDate || mgrInstallmentStartDate === mgrShamsiDate) {
+                        setMgrInstallmentStartDate(d);
+                      }
+                    }}
                     todayShamsi={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
                   />
                 </div>
 
+                {/* بخش سیاست تسویه و نحوه استهلاک تعهد در حساب پرسنل */}
+                {(mgrTxType === 'OTHER' ||
+                  mgrTxType === 'ADVANCE' ||
+                  mgrTxType === 'ON_ACCOUNT') && (
+                  <div className="rounded-2xl bg-[#FCF9F2] border border-[#C5A059]/60 p-3.5 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h4 className="text-xs font-extrabold text-[#0B192C]">
+                          سیاست تسویه و نحوه استهلاک تعهد در صورتحساب پرسنل
+                        </h4>
+                        <p className="text-[10.5px] text-slate-600 mt-0.5">
+                          تعیین نمایید مبلغ واگذارشده یا پرداخت‌شده به‌صورت یکجا در همین ماه کسر گردد یا طی دوره‌های ماهانه به‌طور خودکار مستهلک شود.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <label
+                        className={`rounded-xl border p-3 cursor-pointer transition-all ${
+                          mgrSettlementMode === 'LUMP_SUM'
+                            ? 'bg-[#0B192C] text-white border-[#0B192C] shadow-xs'
+                            : 'bg-white text-[#0B192C] border-slate-200 hover:border-[#C5A059]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            name="mgrSettlementMode"
+                            checked={mgrSettlementMode === 'LUMP_SUM'}
+                            onChange={() => setMgrSettlementMode('LUMP_SUM')}
+                            className="accent-[#C5A059]"
+                          />
+                          <span className="text-xs font-extrabold">
+                            تسویه و کسر یکجا در دوره مالی جاری
+                          </span>
+                        </div>
+                        <p
+                          className={`text-[10.5px] pr-5 mt-1 leading-5 ${
+                            mgrSettlementMode === 'LUMP_SUM' ? 'text-slate-200' : 'text-slate-500'
+                          }`}
+                        >
+                          کل مبلغ ثبت‌شده در همان دوره مالی مربوط به تاریخ تراکنش، یکجا از استحقاق حقوق و مزایای پرسنل کسر و تسویه می‌گردد.
+                        </p>
+                      </label>
+
+                      <label
+                        className={`rounded-xl border p-3 cursor-pointer transition-all ${
+                          mgrSettlementMode === 'INSTALLMENT'
+                            ? 'bg-[#0B192C] text-white border-[#0B192C] shadow-xs'
+                            : 'bg-white text-[#0B192C] border-slate-200 hover:border-[#C5A059]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="radio"
+                            name="mgrSettlementMode"
+                            checked={mgrSettlementMode === 'INSTALLMENT'}
+                            onChange={() => {
+                              setMgrSettlementMode('INSTALLMENT');
+                              if (!mgrInstallmentStartDate) {
+                                setMgrInstallmentStartDate(mgrShamsiDate);
+                              }
+                            }}
+                            className="accent-[#C5A059]"
+                          />
+                          <span className="text-xs font-extrabold">
+                            استهلاک تدریجی و کسر خودکار ماهانه (تقسیط تعهدات)
+                          </span>
+                        </div>
+                        <p
+                          className={`text-[10.5px] pr-5 mt-1 leading-5 ${
+                            mgrSettlementMode === 'INSTALLMENT'
+                              ? 'text-slate-200'
+                              : 'text-slate-500'
+                          }`}
+                        >
+                          در هر دوره مالی ماهانه، صرفاً مبلغ تعیین‌شده به‌صورت خودکار از حقوق و مزایا کسر شده و مانده تعهد به دوره‌های آتی منتقل می‌گردد.
+                        </p>
+                      </label>
+                    </div>
+
+                    {mgrSettlementMode === 'INSTALLMENT' && (
+                      <div className="rounded-xl bg-white border border-[#C5A059]/50 p-3 space-y-3">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-start">
+                          <div className="space-y-1.5">
+                            <TomanInput
+                              label="مبلغ کسر خودکار در هر دوره ماهانه (تومان)"
+                              value={mgrMonthlyDeduction}
+                              onChange={setMgrMonthlyDeduction}
+                              placeholder="مثلاً 2,000,000"
+                              required
+                            />
+                            {Number(mgrAmount) > 0 && (
+                              <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                                <span className="text-[10px] text-slate-500">
+                                  تقسیم خودکار بر اساس دوره استهلاک:
+                                </span>
+                                {[2, 3, 4, 6, 12].map((monthsCount) => {
+                                  const suggestedMonthly = Math.ceil(
+                                    Number(mgrAmount) / monthsCount
+                                  );
+                                  return (
+                                    <button
+                                      key={monthsCount}
+                                      type="button"
+                                      onClick={() =>
+                                        setMgrMonthlyDeduction(String(suggestedMonthly))
+                                      }
+                                      className="px-2 py-0.5 rounded-lg bg-slate-100 hover:bg-[#0B192C] hover:text-[#C5A059] text-[10px] font-bold text-[#0B192C] border border-slate-200 transition-colors cursor-pointer"
+                                    >
+                                      {toPersianDigits(monthsCount)} دوره
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          <ShamsiDatePicker
+                            label="تاریخ شروع اولین دوره استهلاک و کسر ماهانه"
+                            value={mgrInstallmentStartDate || mgrShamsiDate}
+                            onChange={setMgrInstallmentStartDate}
+                            todayShamsi={
+                              effectiveDashboard.serverTime.shamsiDate || initialShamsiDate
+                            }
+                          />
+                        </div>
+
+                        {Number(mgrAmount) > 0 && Number(mgrMonthlyDeduction) > 0 && (
+                          <div className="rounded-xl bg-indigo-50/70 border border-indigo-200 p-2.5 text-[11px] text-indigo-950 space-y-1">
+                            <div className="font-extrabold text-[#0B192C]">
+                              جدول زمان‌بندی و خلاصه برنامه استهلاک تعهد مالی پرسنل:
+                            </div>
+                            {(() => {
+                              const totalPrincipal = Math.round(Number(mgrAmount));
+                              const monthlyShare = Math.min(
+                                totalPrincipal,
+                                Math.round(Number(mgrMonthlyDeduction))
+                              );
+                              const totalPeriods = Math.max(
+                                1,
+                                Math.ceil(totalPrincipal / monthlyShare)
+                              );
+                              const lastPeriodAmount =
+                                totalPrincipal - monthlyShare * (totalPeriods - 1);
+                              return (
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 tabular-nums">
+                                  <div className="rounded-lg bg-white p-2 border border-indigo-100">
+                                    <div className="text-[10px] text-slate-500">اصل تعهد مالی</div>
+                                    <div className="font-extrabold text-[#0B192C]">
+                                      {formatToman(totalPrincipal)}
+                                    </div>
+                                  </div>
+                                  <div className="rounded-lg bg-white p-2 border border-indigo-100">
+                                    <div className="text-[10px] text-slate-500">
+                                      کسر خودکار هر ماه
+                                    </div>
+                                    <div className="font-extrabold text-indigo-800">
+                                      {formatToman(monthlyShare)}
+                                    </div>
+                                  </div>
+                                  <div className="rounded-lg bg-white p-2 border border-indigo-100">
+                                    <div className="text-[10px] text-slate-500">
+                                      تعداد دوره‌های استهلاک
+                                    </div>
+                                    <div className="font-extrabold text-[#0B192C]">
+                                      {toPersianDigits(totalPeriods)} دوره ماهانه
+                                    </div>
+                                  </div>
+                                  <div className="rounded-lg bg-white p-2 border border-indigo-100">
+                                    <div className="text-[10px] text-slate-500">
+                                      سهم دوره پایانی
+                                    </div>
+                                    <div className="font-extrabold text-emerald-800">
+                                      {formatToman(lastPeriodAmount)}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
-                      شرح پرداخت یا هزینه انجام‌شده برای پرسنل
+                      شرح پرداخت یا موضوع تعهد مالی پرسنل
                     </label>
                     <input
                       type="text"
                       required
                       value={mgrDesc}
                       onChange={(e) => setMgrDesc(e.target.value)}
-                      placeholder="مثلاً هزینه اسنپ پرسنل، تهیه وسیله، واریز حقوق یا تسویه تنخواه..."
+                      placeholder="مثلاً واگذاری ابزار و ملزومات، پرداخت خارج از حکم حقوق، مساعده یا تسویه حقوق..."
                       className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs"
                     />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
-                      یادداشت مدیریت (اختیاری)
+                      یادداشت کارگزینی / شماره سند (اختیاری)
                     </label>
                     <input
                       type="text"
                       value={mgrNote}
                       onChange={(e) => setMgrNote(e.target.value)}
-                      placeholder="شماره پیگیری یا توضیحات..."
+                      placeholder="شماره پیگیری، شرح توافق استهلاک یا توضیحات مدیریتی..."
                       className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs"
                     />
                   </div>
@@ -4290,7 +4737,14 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   disabled={actionLoading}
                   className="min-h-[40px] px-6 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
                 >
-                  {actionLoading ? 'در حال ثبت...' : 'ثبت قطعی در لیست پرداختی‌ها'}
+                  {actionLoading
+                    ? 'در حال ثبت...'
+                    : mgrSettlementMode === 'INSTALLMENT' &&
+                        (mgrTxType === 'OTHER' ||
+                          mgrTxType === 'ADVANCE' ||
+                          mgrTxType === 'ON_ACCOUNT')
+                      ? 'ثبت قطعی تعهد مالی و فعال‌سازی کسر خودکار ماهانه'
+                      : 'ثبت قطعی در فهرست پرداخت‌ها و تعهدات'}
                 </button>
               </form>
               )}
@@ -4320,11 +4774,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     className="w-full min-h-[40px] rounded-xl border border-slate-200 px-2.5 text-xs bg-white"
                   >
                     <option value="">همه</option>
-                    <option value="SALARY">حقوق</option>
-                    <option value="ADVANCE">مساعده</option>
-                    <option value="ON_ACCOUNT">علی‌الحساب</option>
-                    <option value="PETTY_CASH">هزینه متفرقه / تنخواه (طلب پرسنل)</option>
-                    <option value="OTHER">هزینه متفرقه برای پرسنل (اسنپ، وسیله و...)</option>
+                    <option value="SALARY">تسویه حقوق و مزایا</option>
+                    <option value="ADVANCE">مساعده تعهدی</option>
+                    <option value="ON_ACCOUNT">پرداخت علی‌الحساب</option>
+                    <option value="PETTY_CASH">خرید کارگاهی / هزینه تنخواه (بستانکاری پرسنل)</option>
+                    <option value="OTHER">واگذاری ملزومات / پرداخت خارج از حکم حقوق (تعهد پرسنلی)</option>
                   </select>
                 </div>
                 <div className="col-span-2 sm:col-span-1">
@@ -4333,7 +4787,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     type="text"
                     value={finSearch}
                     onChange={(e) => setFinSearch(e.target.value)}
-                    placeholder="مثلاً اسنپ، وسیله، حقوق..."
+                    placeholder="مثلاً ملزومات، مساعده، حقوق..."
                     className="w-full min-h-[40px] rounded-xl border border-slate-200 px-3 text-xs"
                   />
                 </div>
@@ -4400,8 +4854,35 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                           </div>
 
                           <p className="text-xs text-slate-700">{tx.description}</p>
+                          {tx.settlement_mode === 'INSTALLMENT' &&
+                            tx.monthly_deduction_toman &&
+                            tx.monthly_deduction_toman > 0 && (
+                              <div className="rounded-xl bg-indigo-50/90 border border-indigo-200 p-2 text-[11px] text-indigo-950 space-y-0.5 tabular-nums">
+                                <div className="font-extrabold text-indigo-900">
+                                  سیاست تسویه: استهلاک تدریجی و کسر خودکار ماهانه از استحقاق حقوق
+                                </div>
+                                <div>
+                                  سهم کسر خودکار هر دوره ماهانه:{' '}
+                                  <strong>{formatToman(tx.monthly_deduction_toman)}</strong> | تعداد
+                                  کل دوره‌ها:{' '}
+                                  <strong>
+                                    {toPersianDigits(
+                                      tx.installment_count ||
+                                        Math.ceil(tx.amount_toman / tx.monthly_deduction_toman)
+                                    )}{' '}
+                                    دوره ماهانه
+                                  </strong>{' '}
+                                  | شروع استهلاک:{' '}
+                                  <strong>
+                                    {toPersianDigits(
+                                      tx.installment_start_shamsi || tx.shamsi_date
+                                    )}
+                                  </strong>
+                                </div>
+                              </div>
+                            )}
                           {tx.receipt_file_url && (
-                            <div className="pt-0.5">
+                            <div className="pt-0.5 flex flex-wrap items-center gap-2">
                               <button
                                 type="button"
                                 onClick={() =>
@@ -4414,6 +4895,22 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                               >
                                 <Receipt className="w-3.5 h-3.5 text-[#9A7428]" />
                                 <span>پیش‌نمایش فاکتور / رسید پیوست</span>
+                              </button>
+                              <button
+                                type="button"
+                                disabled={actionLoading}
+                                onClick={() =>
+                                  handleManagerDeleteMediaItem(
+                                    'FINANCE_RECEIPT',
+                                    tx.id,
+                                    tx.receipt_file_url!
+                                  )
+                                }
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-bold cursor-pointer"
+                                title="حذف فایل رسید جهت آزادسازی فضای هاست (مبلغ و شرح مالی حفظ می‌شود)"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>حذف فایل رسید</span>
                               </button>
                             </div>
                           )}
@@ -4545,6 +5042,19 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                 <button
                   type="button"
+                  onClick={() => setSettingsSubTab('storage')}
+                  className={`min-h-[42px] px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+                    settingsSubTab === 'storage'
+                      ? 'bg-[#0B192C] text-[#C5A059]'
+                      : 'text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  <HardDrive className="w-3.5 h-3.5 shrink-0" />
+                  <span>فضای هاست و پاکسازی فایل‌ها</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setSettingsSubTab('account')}
                   className={`min-h-[42px] px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap cursor-pointer ${
                     settingsSubTab === 'account'
@@ -4569,6 +5079,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   <span>راهنما و اعلان</span>
                 </button>
               </div>
+
+              {/* زیرتب مدیریت فضای ذخیره‌سازی هاست و پاکسازی فایل‌های چندرسانه‌ای (مشترک مدیر و پرسنل) */}
+              {settingsSubTab === 'storage' && (
+                <MediaStorageCleanupPanel role="manager" onDataChanged={refreshAllSilent} />
+              )}
 
               {/* زیرتب خروجی اکسل بخش‌بندی‌شده اطلاعات برای مدیر */}
               {settingsSubTab === 'export' && (() => {
@@ -5589,10 +6104,10 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
               </button>
             </div>
 
-            <form onSubmit={handleUpdateFinancialTx} className="space-y-3">
+            <form onSubmit={handleUpdateFinancialTx} className="space-y-3 max-h-[80vh] overflow-y-auto pr-0.5">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <TomanInput
-                  label="مبلغ (تومان)"
+                  label="مبلغ کل پرداختی یا اصل تعهد (تومان)"
                   required
                   value={editFinAmount}
                   onChange={setEditFinAmount}
@@ -5600,21 +6115,27 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                    نوع پرداخت / تراکنش
+                    نوع پرداخت / سرفصل تعهد مالی
                   </label>
                   <select
                     value={editFinType}
-                    onChange={(e) => setEditFinType(e.target.value as FinancialTxType)}
+                    onChange={(e) => {
+                      const nextType = e.target.value as FinancialTxType;
+                      setEditFinType(nextType);
+                      if (nextType === 'SALARY' || nextType === 'PETTY_CASH') {
+                        setEditFinSettlementMode('LUMP_SUM');
+                      }
+                    }}
                     className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white"
                   >
-                    <option value="SALARY">حقوق</option>
-                    <option value="ADVANCE">مساعده</option>
-                    <option value="ON_ACCOUNT">علی‌الحساب</option>
+                    <option value="SALARY">تسویه حقوق و مزایای دوره‌ای</option>
+                    <option value="ADVANCE">مساعده تعهدی پرسنل</option>
+                    <option value="ON_ACCOUNT">پرداخت علی‌الحساب</option>
                     <option value="OTHER">
-                      هزینه متفرقه انجام‌شده برای پرسنل (اسنپ، تهیه وسیله و...)
+                      واگذاری ملزومات / پرداخت خارج از حکم حقوق (تعهد مالی پرسنل)
                     </option>
                     <option value="PETTY_CASH">
-                      هزینه متفرقه / تنخواه کارگاهی (بستانکاری پرسنل)
+                      خرید کارگاهی / هزینه تنخواه (بستانکاری پرسنل)
                     </option>
                   </select>
                 </div>
@@ -5622,7 +6143,7 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <ShamsiDatePicker
-                  label="تاریخ"
+                  label="تاریخ ثبت"
                   value={editFinShamsiDate}
                   onChange={setEditFinShamsiDate}
                   todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
@@ -5637,16 +6158,86 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     onChange={(e) => setEditFinStatus(e.target.value as FinancialStatus)}
                     className="w-full min-h-[44px] rounded-xl border border-slate-200 px-3 text-xs bg-white"
                   >
-                    <option value="APPROVED">تأییدشده (پرداخت قطعی)</option>
+                    <option value="APPROVED">تأییدشده (قطعی)</option>
                     <option value="PENDING">در انتظار تأیید</option>
                     <option value="REJECTED">ردشده</option>
                   </select>
                 </div>
               </div>
 
+              {(editFinType === 'OTHER' ||
+                editFinType === 'ADVANCE' ||
+                editFinType === 'ON_ACCOUNT') && (
+                <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-3 space-y-2.5">
+                  <div className="text-xs font-extrabold text-[#0B192C]">
+                    سیاست تسویه و نحوه استهلاک تعهد در صورتحساب پرسنل
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <label
+                      className={`rounded-xl border p-2.5 cursor-pointer text-xs ${
+                        editFinSettlementMode === 'LUMP_SUM'
+                          ? 'bg-[#0B192C] text-white border-[#0B192C]'
+                          : 'bg-white text-[#0B192C] border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 font-bold">
+                        <input
+                          type="radio"
+                          name="editSettlementMode"
+                          checked={editFinSettlementMode === 'LUMP_SUM'}
+                          onChange={() => setEditFinSettlementMode('LUMP_SUM')}
+                          className="accent-[#C5A059]"
+                        />
+                        <span>تسویه و کسر یکجا در دوره جاری</span>
+                      </div>
+                    </label>
+                    <label
+                      className={`rounded-xl border p-2.5 cursor-pointer text-xs ${
+                        editFinSettlementMode === 'INSTALLMENT'
+                          ? 'bg-[#0B192C] text-white border-[#0B192C]'
+                          : 'bg-white text-[#0B192C] border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 font-bold">
+                        <input
+                          type="radio"
+                          name="editSettlementMode"
+                          checked={editFinSettlementMode === 'INSTALLMENT'}
+                          onChange={() => {
+                            setEditFinSettlementMode('INSTALLMENT');
+                            if (!editFinInstallmentStartDate) {
+                              setEditFinInstallmentStartDate(editFinShamsiDate);
+                            }
+                          }}
+                          className="accent-[#C5A059]"
+                        />
+                        <span>استهلاک تدریجی و کسر خودکار ماهانه</span>
+                      </div>
+                    </label>
+                  </div>
+
+                  {editFinSettlementMode === 'INSTALLMENT' && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                      <TomanInput
+                        label="مبلغ کسر خودکار در هر دوره ماهانه (تومان)"
+                        value={editFinMonthlyDeduction}
+                        onChange={setEditFinMonthlyDeduction}
+                        required
+                      />
+                      <ShamsiDatePicker
+                        label="تاریخ شروع اولین دوره استهلاک"
+                        value={editFinInstallmentStartDate || editFinShamsiDate}
+                        onChange={setEditFinInstallmentStartDate}
+                        todayShamsi={dashboard?.serverTime.shamsiDate || initialShamsiDate}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  شرح پرداخت یا هزینه
+                  شرح پرداخت یا موضوع تعهد مالی
                 </label>
                 <input
                   type="text"
@@ -5773,6 +6364,12 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 <X className="w-4 h-4" />
               </button>
             </div>
+
+            {lateModalError && (
+              <div className="rounded-xl bg-red-50 border border-red-200 p-2.5 text-xs font-bold text-red-800">
+                {lateModalError}
+              </div>
+            )}
 
             <div className="rounded-xl bg-orange-50 border border-orange-200 p-3 text-xs space-y-1">
               <div className="flex flex-wrap items-center justify-between gap-2">

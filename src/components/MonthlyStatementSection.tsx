@@ -393,9 +393,25 @@ export function MonthlyStatementSection({
             </div>
             {activeStatement.otherPaidForWorkerToman > 0 && (
               <div className="flex items-center justify-between text-slate-600">
-                <span>سایر هزینه‌های انجام‌شده برای پرسنل:</span>
+                <span>تسهیلات و تعهدات غیرحقوق پرسنل (کسر از حساب):</span>
                 <strong className="text-[#0B192C]">
                   {formatToman(activeStatement.otherPaidForWorkerToman)}
+                </strong>
+              </div>
+            )}
+            {(activeStatement.installmentDeductionThisPeriodToman || 0) > 0 && (
+              <div className="flex items-center justify-between text-indigo-900 bg-indigo-50/80 px-2 py-1 rounded-lg border border-indigo-200 mt-1">
+                <span>سهم استهلاک اقساط تعهدات در این دوره:</span>
+                <strong className="font-extrabold">
+                  {formatToman(activeStatement.installmentDeductionThisPeriodToman || 0)}
+                </strong>
+              </div>
+            )}
+            {(activeStatement.remainingDeferredDebtAfterPeriodToman || 0) > 0 && (
+              <div className="flex items-center justify-between text-slate-600 pt-1 border-t border-dashed border-slate-200">
+                <span>مانده مستهلک‌نشده انتقالی به دوره‌های آتی:</span>
+                <strong className="text-amber-800">
+                  {formatToman(activeStatement.remainingDeferredDebtAfterPeriodToman || 0)}
                 </strong>
               </div>
             )}

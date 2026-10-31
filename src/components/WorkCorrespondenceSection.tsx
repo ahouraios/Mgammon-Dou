@@ -483,6 +483,28 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
     return toPersianDigits(`${pad2(mins)}:${pad2(secs)}`);
   };
 
+  const handleDeleteMessageMedia = async (
+    sourceType: 'CORRESPONDENCE_AUDIO' | 'CORRESPONDENCE_ATTACHMENT',
+    recordId: number,
+    fileUrl: string
+  ) => {
+    try {
+      const res = await apiRequest<{ ok: boolean; message: string }>('/api/media/cleanup', {
+        method: 'POST',
+        body: JSON.stringify({
+          items: [{ source_type: sourceType, record_id: recordId, file_url: fileUrl }],
+        }),
+      });
+      setFeedback({
+        type: 'success',
+        text: res.message || 'فایل پیوست از حافظه هاست حذف شد و فضای سرور آزاد گردید.',
+      });
+      await loadCorrespondences();
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    }
+  };
+
   return (
     <div className="space-y-4">
       {feedback && (
@@ -649,7 +671,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
                   )}
 
                   {msg.audio_url && (
-                    <div className="pt-1 flex items-center gap-2">
+                    <div className="pt-1 flex flex-wrap items-center gap-2">
                       <audio
                         src={msg.audio_url}
                         controls
@@ -661,6 +683,18 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
                           {formatSec(msg.audio_duration_seconds)}
                         </span>
                       )}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteMessageMedia('CORRESPONDENCE_AUDIO', msg.id, msg.audio_url!);
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[10.5px] font-bold cursor-pointer"
+                        title="حذف فایل صوتی جهت آزادسازی فضای هاست"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>حذف صوت</span>
+                      </button>
                     </div>
                   )}
 
@@ -715,6 +749,22 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
                                   <Download className="w-3 h-3" />
                                   <span>دانلود</span>
                                 </a>
+                                <span className="text-slate-300">·</span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleDeleteMessageMedia(
+                                      'CORRESPONDENCE_ATTACHMENT',
+                                      msg.id,
+                                      att.file_url
+                                    )
+                                  }
+                                  className="text-[10px] font-bold text-rose-600 hover:text-rose-800 flex items-center gap-0.5 cursor-pointer"
+                                  title="حذف فایل پیوست جهت آزادسازی فضای هاست"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  <span>حذف فایل</span>
+                                </button>
                               </div>
                             </div>
                           </div>
@@ -1268,7 +1318,7 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
 
                   {/* پخش‌کننده پیام صوتی در صورت وجود */}
                   {msg.audio_url && (
-                    <div className="pt-1 flex items-center gap-2">
+                    <div className="pt-1 flex flex-wrap items-center gap-2">
                       <audio
                         src={msg.audio_url}
                         controls
@@ -1280,6 +1330,18 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
                           {formatSec(msg.audio_duration_seconds)}
                         </span>
                       )}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteMessageMedia('CORRESPONDENCE_AUDIO', msg.id, msg.audio_url!);
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[10.5px] font-bold cursor-pointer"
+                        title="حذف فایل صوتی جهت آزادسازی فضای هاست"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>حذف صوت</span>
+                      </button>
                     </div>
                   )}
 
@@ -1335,6 +1397,22 @@ export const WorkCorrespondenceSection: React.FC<WorkCorrespondenceSectionProps>
                                   <Download className="w-3 h-3" />
                                   <span>دانلود</span>
                                 </a>
+                                <span className="text-slate-300">·</span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleDeleteMessageMedia(
+                                      'CORRESPONDENCE_ATTACHMENT',
+                                      msg.id,
+                                      att.file_url
+                                    )
+                                  }
+                                  className="text-[10px] font-bold text-rose-600 hover:text-rose-800 flex items-center gap-0.5 cursor-pointer"
+                                  title="حذف فایل پیوست جهت آزادسازی فضای هاست"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  <span>حذف فایل</span>
+                                </button>
                               </div>
                             </div>
                           </div>

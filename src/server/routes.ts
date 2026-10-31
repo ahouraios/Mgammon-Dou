@@ -53,11 +53,16 @@ import {
   LeaveQuotaSummary,
   LeaveRequestItem,
   LeaveType,
+  MediaSourceType,
+  MediaStorageItem,
+  MediaStorageSummary,
   OvertimeCalcMode,
+  SettlementMode,
   SystemSettings,
   UserRole,
   WorkCorrespondence,
   WorkTaskItem,
+  FlexibleClockEntryMode,
 } from '../shared/types';
 import {
   formatDurationPersian,
@@ -74,6 +79,7 @@ import {
   toPersianDigits,
 } from '../shared/jalali';
 import {
+  calculateCumulativeFinancialSummaryAsOf,
   calculateDailyAttendance,
   calculateLateAndAbsenceRates,
   calculateSalaryAndOvertimeRates,
@@ -300,6 +306,63 @@ function saveBase64MediaFile(
   };
 }
 
+function getBaseMediaDirPath(): string {
+  return process.env.PRIVATE_MEDIA_DIR
+    ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
+    : path.resolve(process.cwd(), '.data/private_media');
+}
+
+function resolveMediaDiskPath(fileUrl: unknown): string | null {
+  if (typeof fileUrl !== 'string') return null;
+  const trimmed = fileUrl.trim();
+  if (!trimmed.startsWith('/assets/media/')) return null;
+  const relPart = trimmed.slice('/assets/media/'.length);
+  const parts = relPart.split('/').filter(Boolean);
+  if (parts.length !== 2) return null;
+  const [subFolder, fileName] = parts;
+  const allowedFolders = ['avatars', 'attachments', 'excel', 'audio', 'receipts', 'reports'];
+  if (!allowedFolders.includes(subFolder)) return null;
+  const safeFileName = path.basename(fileName);
+  if (!safeFileName || safeFileName !== fileName || safeFileName.includes('..')) return null;
+
+  const baseDir = getBaseMediaDirPath();
+  const fullPath = path.resolve(baseDir, subFolder, safeFileName);
+  if (!fullPath.startsWith(baseDir + path.sep)) return null;
+  return fullPath;
+}
+
+function getMediaFileInfoOnDisk(fileUrl: unknown): { exists: boolean; sizeBytes: number; mtimeIso: string | null } {
+  const fullPath = resolveMediaDiskPath(fileUrl);
+  if (!fullPath) return { exists: false, sizeBytes: 0, mtimeIso: null };
+  try {
+    if (!fs.existsSync(fullPath)) return { exists: false, sizeBytes: 0, mtimeIso: null };
+    const stat = fs.statSync(fullPath);
+    if (!stat.isFile()) return { exists: false, sizeBytes: 0, mtimeIso: null };
+    return {
+      exists: true,
+      sizeBytes: stat.size,
+      mtimeIso: stat.mtime.toISOString(),
+    };
+  } catch {
+    return { exists: false, sizeBytes: 0, mtimeIso: null };
+  }
+}
+
+function unlinkMediaUrlFromDisk(fileUrl: unknown): number {
+  const fullPath = resolveMediaDiskPath(fileUrl);
+  if (!fullPath) return 0;
+  try {
+    if (!fs.existsSync(fullPath)) return 0;
+    const stat = fs.statSync(fullPath);
+    if (!stat.isFile()) return 0;
+    const size = stat.size;
+    fs.unlinkSync(fullPath);
+    return size;
+  } catch {
+    return 0;
+  }
+}
+
 function extractSqlDateString(val: unknown, fallbackShamsi?: unknown): string {
   if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val.trim())) {
     return val.trim().slice(0, 10);
@@ -350,6 +413,23 @@ function mapRowToAttendanceLog(row: mysql.RowDataPacket): AttendanceLog {
 
 function mapRowToFinancialTx(row: mysql.RowDataPacket): FinancialTransaction {
   const txDate = extractSqlDateString(row.tx_date, row.shamsi_date);
+  const rawSettlement = String(row.settlement_mode || 'LUMP_SUM').trim();
+  const settlementMode: SettlementMode =
+    rawSettlement === 'INSTALLMENT' ? 'INSTALLMENT' : 'LUMP_SUM';
+  const monthlyDeductionToman =
+    row.monthly_deduction_toman !== null &&
+    row.monthly_deduction_toman !== undefined &&
+    Number(row.monthly_deduction_toman) > 0
+      ? Number(row.monthly_deduction_toman)
+      : null;
+  const installmentCount =
+    row.installment_count !== null &&
+    row.installment_count !== undefined &&
+    Number(row.installment_count) > 0
+      ? Number(row.installment_count)
+      : monthlyDeductionToman && monthlyDeductionToman > 0
+        ? Math.max(1, Math.ceil(Number(row.amount_toman) / monthlyDeductionToman))
+        : null;
   return {
     id: Number(row.id),
     user_id: Number(row.user_id),
@@ -368,6 +448,12 @@ function mapRowToFinancialTx(row: mysql.RowDataPacket): FinancialTransaction {
     reviewed_by_user_id: row.reviewed_by_user_id ? Number(row.reviewed_by_user_id) : null,
     reviewed_at: row.reviewed_at ? new Date(row.reviewed_at).toISOString() : null,
     manager_note: row.manager_note ? String(row.manager_note) : null,
+    settlement_mode: settlementMode,
+    monthly_deduction_toman: monthlyDeductionToman,
+    installment_count: installmentCount,
+    installment_start_shamsi: row.installment_start_shamsi
+      ? String(row.installment_start_shamsi)
+      : null,
     idempotency_key: row.idempotency_key ? String(row.idempotency_key) : null,
     created_at: row.created_at ? new Date(row.created_at).toISOString() : '',
   };
@@ -414,7 +500,8 @@ function inferHistoricalCheckInOut(
   otMins: number,
   note?: string | null,
   explicitIn?: string,
-  explicitOut?: string
+  explicitOut?: string,
+  dayName?: string
 ): { firstIn: string; lastOut: string } {
   if (explicitIn && explicitOut) {
     return { firstIn: explicitIn, lastOut: explicitOut };
@@ -423,15 +510,21 @@ function inferHistoricalCheckInOut(
   if (noteStr.includes('۰۸:۰۰') && noteStr.includes('۱۴:۳۰')) {
     return { firstIn: '08:00', lastOut: '14:30' };
   }
+  const isThursday = dayName === 'پنجشنبه';
+  const expectedShiftMins = isThursday ? 420 : 480;
+  const shiftEndHour = isThursday ? 14 : 15;
+
   const startMinutes =
-    netMins > 0 && netMins <= 480 ? 7 * 60 + (480 - netMins) : 7 * 60;
+    netMins > 0 && netMins <= expectedShiftMins
+      ? 7 * 60 + (expectedShiftMins - netMins)
+      : 7 * 60;
   const inH = Math.floor(startMinutes / 60);
   const inM = startMinutes % 60;
   const firstIn =
     explicitIn ||
     `${String(inH).padStart(2, '0')}:${String(inM).padStart(2, '0')}`;
 
-  const endMinutes = 15 * 60 + Math.max(0, otMins);
+  const endMinutes = shiftEndHour * 60 + Math.max(0, otMins);
   const outH = Math.floor(endMinutes / 60);
   const outM = endMinutes % 60;
   const lastOut =
@@ -464,14 +557,43 @@ function mergeApprovedHistoricalIntoDailySummaries(
 
         const workDate = shamsiToGregorian(normShamsi);
         const dayName = getShamsiDayOfWeekName(normShamsi);
+        const isThursday = dayName === 'پنجشنبه';
+        const expectedShiftMins = isThursday ? 420 : 480;
         const isMission = Boolean(row.note && row.note.includes('مأموریت'));
         const { firstIn, lastOut } = inferHistoricalCheckInOut(
           row.net_work_minutes,
           row.overtime_minutes,
           row.note,
           row.check_in,
-          row.check_out
+          row.check_out,
+          dayName
         );
+
+        const rawLateMins =
+          dayName === 'جمعه'
+            ? 0
+            : row.check_in
+              ? Math.max(0, parseTimeToMinutes(row.check_in) - 7 * 60)
+              : row.net_work_minutes > 0 && row.net_work_minutes < expectedShiftMins
+                ? expectedShiftMins - row.net_work_minutes
+                : 0;
+
+        const savedLateStatus: LateArrivalDisposition =
+          row.late_status && row.late_status !== 'NONE'
+            ? row.late_status
+            : rawLateMins > 0
+              ? 'PENDING'
+              : 'NONE';
+
+        const effectiveIsLate =
+          rawLateMins > 0 &&
+          savedLateStatus !== 'EXCUSED' &&
+          savedLateStatus !== 'DEDUCT_LEAVE';
+
+        const effectiveLateMins =
+          savedLateStatus === 'EXCUSED' || savedLateStatus === 'DEDUCT_LEAVE'
+            ? 0
+            : rawLateMins;
 
         byShamsi.set(normShamsi, {
           work_date: workDate,
@@ -483,17 +605,24 @@ function mergeApprovedHistoricalIntoDailySummaries(
           first_in_time: firstIn,
           last_out_time: lastOut,
           is_incomplete: false,
-          is_late: row.net_work_minutes > 0 && row.net_work_minutes < 480 && dayName !== 'جمعه',
-          late_minutes:
-            row.net_work_minutes > 0 && row.net_work_minutes < 480 && dayName !== 'جمعه'
-              ? 480 - row.net_work_minutes
-              : 0,
+          is_late: effectiveIsLate,
+          raw_late_minutes: rawLateMins,
+          late_minutes: effectiveLateMins,
+          late_status: savedLateStatus,
+          manager_late_note: row.manager_late_note || null,
+          custom_deduction_toman: row.custom_deduction_toman ?? null,
+          late_deduction_toman: row.late_deduction_toman ?? 0,
           gross_presence_minutes: row.net_work_minutes + row.overtime_minutes,
           mission_minutes: isMission ? 60 : 0,
           break_deducted_minutes: 0,
-          net_work_minutes: row.net_work_minutes,
+          net_work_minutes:
+            savedLateStatus === 'ABSENCE'
+              ? 0
+              : savedLateStatus === 'EXCUSED' && row.net_work_minutes < expectedShiftMins
+                ? expectedShiftMins + row.overtime_minutes
+                : row.net_work_minutes,
           provisional_work_minutes: row.net_work_minutes,
-          overtime_minutes: row.overtime_minutes,
+          overtime_minutes: savedLateStatus === 'ABSENCE' ? 0 : row.overtime_minutes,
           status_label: row.note || row.title || 'ثبت‌شده در سوابق کارکرد',
         });
       }
@@ -508,7 +637,10 @@ function mergeApprovedHistoricalIntoDailySummaries(
       const { firstIn, lastOut } = inferHistoricalCheckInOut(
         rec.net_work_minutes,
         rec.overtime_minutes,
-        rec.note
+        rec.note,
+        undefined,
+        undefined,
+        dayName
       );
       byShamsi.set(normShamsi, {
         work_date: workDate,
@@ -522,6 +654,7 @@ function mergeApprovedHistoricalIntoDailySummaries(
         is_incomplete: false,
         is_late: false,
         late_minutes: 0,
+        late_status: 'NONE',
         gross_presence_minutes: rec.net_work_minutes + rec.overtime_minutes,
         mission_minutes: 0,
         break_deducted_minutes: 0,
@@ -1743,19 +1876,24 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       ? activeMonthlyCycles.size * Math.round(Number(settings.base_salary_toman))
       : hourlyEarnedRegularWorkToman;
 
-    const [finTotals] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN amount_toman ELSE 0 END), 0) AS approved_total,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type != 'PETTY_CASH' THEN amount_toman ELSE 0 END), 0) AS approved_received_salary_advance,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type = 'PETTY_CASH' THEN amount_toman ELSE 0 END), 0) AS approved_petty_cash
-       FROM financial_transactions
-       WHERE user_id = ?`,
+    const [finAllRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT f.*, u.role AS creator_role, u.full_name AS creator_name
+       FROM financial_transactions f
+       LEFT JOIN users u ON u.id = f.created_by_user_id
+       WHERE f.user_id = ?`,
       [workerInfo.id]
     );
+    const allWorkerTxs = finAllRows.map(mapRowToFinancialTx);
+    const finCumulative = calculateCumulativeFinancialSummaryAsOf({
+      transactions: allWorkerTxs,
+      currentShamsiDate: nowInfo.shamsiDate,
+      collabStartShamsi: settings.collaboration_start_shamsi || '1405/06/15',
+      anchorDay: 15,
+    });
 
-    const approvedTotalToman = Number(finTotals[0]?.approved_total || 0);
-    const approvedReceivedToman = Number(finTotals[0]?.approved_received_salary_advance || 0);
-    const approvedPettyCashToman = Number(finTotals[0]?.approved_petty_cash || 0);
+    const approvedTotalToman = finCumulative.approvedTotalGrossToman;
+    const approvedReceivedToman = finCumulative.approvedMaturedReceivedToman;
+    const approvedPettyCashToman = finCumulative.approvedPettyCashToman;
     const netSalaryPlusOvertimeToman = Math.max(
       0,
       earnedRegularWorkToman + earnedOvertimeToman - totalLateAndAbsenceDeductionToman
@@ -2009,6 +2147,490 @@ apiRouter.post(
           message: 'این درخواست تردد قبلاً ثبت شده است.',
         });
         return;
+      }
+      handleServerError(res, err);
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+
+// ============================================================================
+// ۳-الف. ثبت بازنگری ساعت شروع یا پایان کار در هر ساعت از شبانه‌روز (بدون الزام به تکمیل هم‌زمان خروج)
+// ============================================================================
+apiRouter.post(
+  '/attendance/flexible-clock',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    const pool = getPool();
+    let conn: mysql.PoolConnection | null = null;
+    try {
+      const workerInfo = await getWorkerInfo(pool);
+      const workerId = workerInfo.id;
+      const actorId = req.user!.id;
+      const actorRole = req.user!.role;
+
+      const currentSettings = await getSystemSettingsFromDb();
+      const nowInfo = getNowInTimezone(currentSettings.timezone);
+
+      const rawShamsiDate = req.body?.shamsi_date
+        ? toEnglishDigits(String(req.body.shamsi_date)).trim()
+        : nowInfo.shamsiDate;
+
+      if (!isValidShamsiDate(rawShamsiDate)) {
+        res.status(400).json({
+          ok: false,
+          message: 'فرمت تاریخ شمسی معتبر نیست (مثال: ۱۴۰۵/۰۸/۱۰).',
+        });
+        return;
+      }
+
+      const shamsiDate = normalizeShamsiDate(rawShamsiDate);
+      const workDate = shamsiToGregorian(shamsiDate);
+      const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
+
+      const rawEntryMode = String(req.body?.entry_mode || 'START_ONLY').trim().toUpperCase();
+      const entryMode: FlexibleClockEntryMode =
+        rawEntryMode === 'END_ONLY' || rawEntryMode === 'FULL_SHIFT'
+          ? (rawEntryMode as FlexibleClockEntryMode)
+          : 'START_ONLY';
+
+      const shiftCategory: 'WORK' | 'MISSION' =
+        String(req.body?.shift_category || 'WORK').toUpperCase() === 'MISSION'
+          ? 'MISSION'
+          : 'WORK';
+
+      const checkInRaw = toEnglishDigits(String(req.body?.check_in_time || '')).trim();
+      const checkOutRaw = toEnglishDigits(String(req.body?.check_out_time || '')).trim();
+      const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
+      const lateReason = req.body?.late_reason
+        ? String(req.body.late_reason).trim().slice(0, 500)
+        : null;
+
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM users WHERE id = ? FOR UPDATE`,
+        [workerId]
+      );
+
+      const [existingRows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT * FROM attendance_logs
+         WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+         ORDER BY recorded_time ASC, id ASC
+         FOR UPDATE`,
+        [workerId, workDate]
+      );
+      const existingLogs = existingRows.map(mapRowToAttendanceLog);
+
+      if (entryMode === 'START_ONLY') {
+        if (!isValidTimeHHMMOrHHMMSS(checkInRaw, true)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: 'لطفاً ساعت آغاز به کار (ورود) را با فرمت معتبر (مثلاً 07:30) وارد نمایید.',
+          });
+          return;
+        }
+        const checkInTime = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
+        const startEventType: AttendanceEventType =
+          shiftCategory === 'MISSION' ? 'MISSION_START' : 'WORK_START';
+
+        const simulatedLogs = [
+          ...existingLogs.map((l) => ({
+            event_type: l.event_type,
+            recorded_time: l.recorded_time,
+          })),
+          { event_type: startEventType, recorded_time: checkInTime },
+        ];
+
+        const seqCheck = validateFullDayLogSequence(simulatedLogs);
+        if (!seqCheck.valid) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message:
+              seqCheck.error ||
+              'در این تاریخ یک نوبت کاری باز وجود دارد یا ترتیب زمانی تردد هم‌پوشانی دارد.',
+          });
+          return;
+        }
+
+        const isFirstWorkStart =
+          startEventType === 'WORK_START' &&
+          !existingLogs.some((l) => l.event_type === 'WORK_START');
+        const isThursday = getDayOfWeekFromGregorian(workDate) === 5;
+        const isHoliday =
+          getDayOfWeekFromGregorian(workDate) === 6 ||
+          effectiveSettings.official_holidays.includes(shamsiDate);
+        const isWorkingDay =
+          !isHoliday &&
+          effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+
+        const shiftStartMin = parseTimeToMinutes(
+          isThursday
+            ? effectiveSettings.thursday_shift_start_time ||
+                effectiveSettings.shift_start_time ||
+                '07:00'
+            : effectiveSettings.shift_start_time || '07:00'
+        );
+        const recordedMin = parseTimeToMinutes(checkInTime);
+        const isLateArrival =
+          isFirstWorkStart &&
+          isWorkingDay &&
+          recordedMin > shiftStartMin + effectiveSettings.grace_period_minutes;
+        const lateStatus = isLateArrival ? 'PENDING' : 'NONE';
+
+        const recordedAt = `${workDate} ${checkInTime}`;
+        const modReason =
+          actorRole === 'manager'
+            ? 'ثبت ساعت آغاز شیفت توسط مدیریت (نوبت کاری فعال در جریان)'
+            : 'ثبت بازنگری ساعت آغاز به کار توسط پرسنل (شیفت فعال در جریان)';
+
+        const [ins] = await conn.execute<mysql.ResultSetHeader>(
+          `INSERT INTO attendance_logs
+            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, late_reason, late_status, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+          [
+            workerId,
+            workDate,
+            shamsiDate,
+            startEventType,
+            recordedAt,
+            checkInTime,
+            note,
+            isLateArrival ? lateReason || note : null,
+            lateStatus,
+            actorId,
+            modReason,
+          ]
+        );
+
+        await recordAuditLog({
+          actorUserId: actorId,
+          actionType: 'FLEXIBLE_CLOCK_START_ONLY',
+          targetEntity: 'attendance_logs',
+          targetId: ins.insertId,
+          afterState: {
+            shamsi_date: shamsiDate,
+            event_type: startEventType,
+            check_in_time: checkInTime,
+            late_status: lateStatus,
+          },
+          reason: modReason,
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
+
+        await conn.commit();
+
+        const [todayRows] = await pool.execute<mysql.RowDataPacket[]>(
+          `SELECT * FROM attendance_logs
+           WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+           ORDER BY recorded_time ASC, id ASC`,
+          [workerId, nowInfo.workDate]
+        );
+        const todayLogs = todayRows.map(mapRowToAttendanceLog);
+        const liveState = evaluateWorkerLiveState(todayLogs, currentSettings);
+        liveState.worker_profile = {
+          full_name: workerInfo.full_name,
+          avatar_url: workerInfo.avatar_url,
+          collaboration_start_shamsi:
+            currentSettings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi,
+          phone_number: currentSettings.worker_phone_number || workerInfo.phone_number,
+        };
+        await attachForgottenCheckoutWarning(pool, workerId, liveState, currentSettings, nowInfo);
+
+        res.status(201).json({
+          ok: true,
+          logId: ins.insertId,
+          liveState,
+          message:
+            shamsiDate === nowInfo.shamsiDate
+              ? `ساعت آغاز به کار (${checkInTime.slice(0, 5)}) برای امروز ثبت شد و وضعیت حضور شما در داشبورد به «در حال انجام کار» تغییر یافت. در زمان اتمام کار می‌توانید دکمه «پایان کار» را بزنید یا ساعت خروج را ثبت نمایید.`
+              : `ساعت آغاز به کار (${checkInTime.slice(0, 5)}) در تاریخ ${shamsiDate} ثبت گردید. هر زمان ساعت خاتمه کار مشخص شد می‌توانید آن را تکمیل نمایید.`,
+        });
+        return;
+      }
+
+      if (entryMode === 'END_ONLY') {
+        if (!isValidTimeHHMMOrHHMMSS(checkOutRaw, true)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: 'لطفاً ساعت خاتمه کار (خروج) را با فرمت معتبر (مثلاً 17:30) وارد نمایید.',
+          });
+          return;
+        }
+        const checkOutTime = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
+
+        if (existingLogs.length === 0) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message:
+              'در این تاریخ هنوز ساعت آغاز به کار (ورود) ثبت نشده است؛ ابتدا ساعت ورود را ثبت کنید یا از حالت «ثبت کامل ورود و خروج» استفاده نمایید.',
+          });
+          return;
+        }
+
+        const lastLog = existingLogs[existingLogs.length - 1];
+        const endEventType: AttendanceEventType =
+          lastLog.event_type === 'MISSION_START' ? 'MISSION_END' : 'WORK_END';
+
+        const simulatedLogs = [
+          ...existingLogs.map((l) => ({
+            event_type: l.event_type,
+            recorded_time: l.recorded_time,
+          })),
+          { event_type: endEventType, recorded_time: checkOutTime },
+        ];
+
+        const seqCheck = validateFullDayLogSequence(simulatedLogs);
+        if (!seqCheck.valid) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message:
+              seqCheck.error ||
+              'ساعت خاتمه کار باید پس از آخرین ساعت شروع ثبت‌شده در این روز باشد.',
+          });
+          return;
+        }
+
+        const recordedAt = `${workDate} ${checkOutTime}`;
+        const modReason =
+          actorRole === 'manager'
+            ? 'ثبت ساعت خاتمه شیفت باز توسط مدیریت'
+            : 'ثبت تکمیلی ساعت خاتمه کار (خروج) توسط پرسنل';
+
+        const [ins] = await conn.execute<mysql.ResultSetHeader>(
+          `INSERT INTO attendance_logs
+            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+          [
+            workerId,
+            workDate,
+            shamsiDate,
+            endEventType,
+            recordedAt,
+            checkOutTime,
+            note,
+            actorId,
+            modReason,
+          ]
+        );
+
+        await recordAuditLog({
+          actorUserId: actorId,
+          actionType: 'FLEXIBLE_CLOCK_END_ONLY',
+          targetEntity: 'attendance_logs',
+          targetId: ins.insertId,
+          afterState: {
+            shamsi_date: shamsiDate,
+            event_type: endEventType,
+            check_out_time: checkOutTime,
+          },
+          reason: modReason,
+          ipAddress: req.ip || null,
+          connection: conn,
+        });
+
+        await conn.commit();
+
+        const [todayRows] = await pool.execute<mysql.RowDataPacket[]>(
+          `SELECT * FROM attendance_logs
+           WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+           ORDER BY recorded_time ASC, id ASC`,
+          [workerId, nowInfo.workDate]
+        );
+        const todayLogs = todayRows.map(mapRowToAttendanceLog);
+        const liveState = evaluateWorkerLiveState(todayLogs, currentSettings);
+        liveState.worker_profile = {
+          full_name: workerInfo.full_name,
+          avatar_url: workerInfo.avatar_url,
+          collaboration_start_shamsi:
+            currentSettings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi,
+          phone_number: currentSettings.worker_phone_number || workerInfo.phone_number,
+        };
+        await attachForgottenCheckoutWarning(pool, workerId, liveState, currentSettings, nowInfo);
+
+        res.status(201).json({
+          ok: true,
+          logId: ins.insertId,
+          liveState,
+          message: `ساعت خاتمه کار (${checkOutTime.slice(0, 5)}) با موفقیت ثبت و نوبت کاری تاریخ ${shamsiDate} تکمیل گردید.`,
+        });
+        return;
+      }
+
+      // FULL_SHIFT mode
+      if (
+        !isValidTimeHHMMOrHHMMSS(checkInRaw, true) ||
+        !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)
+      ) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: 'فرمت ساعت آغاز و خاتمه کار باید معتبر و بین 00:00 تا 23:59 باشد.',
+        });
+        return;
+      }
+
+      const checkInTime = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
+      const checkOutTime = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
+
+      if (parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: 'ساعت خاتمه کار (خروج) باید پس از ساعت آغاز به کار (ورود) باشد.',
+        });
+        return;
+      }
+
+      const startEventType: AttendanceEventType =
+        shiftCategory === 'MISSION' ? 'MISSION_START' : 'WORK_START';
+      const endEventType: AttendanceEventType =
+        shiftCategory === 'MISSION' ? 'MISSION_END' : 'WORK_END';
+
+      const simulatedLogs = [
+        ...existingLogs.map((l) => ({
+          event_type: l.event_type,
+          recorded_time: l.recorded_time,
+        })),
+        { event_type: startEventType, recorded_time: checkInTime },
+        { event_type: endEventType, recorded_time: checkOutTime },
+      ];
+
+      const seqCheck = validateFullDayLogSequence(simulatedLogs);
+      if (!seqCheck.valid) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: seqCheck.error || 'تداخل زمانی با ترددهای ثبت‌شده در این روز وجود دارد.',
+        });
+        return;
+      }
+
+      const isFirstWorkStart =
+        startEventType === 'WORK_START' &&
+        !existingLogs.some((l) => l.event_type === 'WORK_START');
+      const isThursday = getDayOfWeekFromGregorian(workDate) === 5;
+      const isHoliday =
+        getDayOfWeekFromGregorian(workDate) === 6 ||
+        effectiveSettings.official_holidays.includes(shamsiDate);
+      const isWorkingDay =
+        !isHoliday &&
+        effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+
+      const shiftStartMin = parseTimeToMinutes(
+        isThursday
+          ? effectiveSettings.thursday_shift_start_time ||
+              effectiveSettings.shift_start_time ||
+              '07:00'
+          : effectiveSettings.shift_start_time || '07:00'
+      );
+      const recordedMin = parseTimeToMinutes(checkInTime);
+      const isLateArrival =
+        isFirstWorkStart &&
+        isWorkingDay &&
+        recordedMin > shiftStartMin + effectiveSettings.grace_period_minutes;
+      const lateStatus = isLateArrival ? 'PENDING' : 'NONE';
+
+      const recordedAtIn = `${workDate} ${checkInTime}`;
+      const recordedAtOut = `${workDate} ${checkOutTime}`;
+      const modReason =
+        actorRole === 'manager'
+          ? 'ثبت نوبت کاری کامل توسط مدیریت'
+          : 'ثبت بازنگری نوبت کاری کامل (ورود و خروج) توسط پرسنل';
+
+      const [insIn] = await conn.execute<mysql.ResultSetHeader>(
+        `INSERT INTO attendance_logs
+          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, late_reason, late_status, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+        [
+          workerId,
+          workDate,
+          shamsiDate,
+          startEventType,
+          recordedAtIn,
+          checkInTime,
+          note,
+          isLateArrival ? lateReason || note : null,
+          lateStatus,
+          actorId,
+          modReason,
+        ]
+      );
+
+      const [insOut] = await conn.execute<mysql.ResultSetHeader>(
+        `INSERT INTO attendance_logs
+          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+        [
+          workerId,
+          workDate,
+          shamsiDate,
+          endEventType,
+          recordedAtOut,
+          checkOutTime,
+          note,
+          actorId,
+          modReason,
+        ]
+      );
+
+      await recordAuditLog({
+        actorUserId: actorId,
+        actionType: 'FLEXIBLE_CLOCK_FULL_SHIFT',
+        targetEntity: 'attendance_logs',
+        targetId: insIn.insertId,
+        afterState: {
+          shamsi_date: shamsiDate,
+          check_in_time: checkInTime,
+          check_out_time: checkOutTime,
+          check_in_log_id: insIn.insertId,
+          check_out_log_id: insOut.insertId,
+        },
+        reason: modReason,
+        ipAddress: req.ip || null,
+        connection: conn,
+      });
+
+      await conn.commit();
+
+      const [todayRows] = await pool.execute<mysql.RowDataPacket[]>(
+        `SELECT * FROM attendance_logs
+         WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+         ORDER BY recorded_time ASC, id ASC`,
+        [workerId, nowInfo.workDate]
+      );
+      const todayLogs = todayRows.map(mapRowToAttendanceLog);
+      const liveState = evaluateWorkerLiveState(todayLogs, currentSettings);
+      liveState.worker_profile = {
+        full_name: workerInfo.full_name,
+        avatar_url: workerInfo.avatar_url,
+        collaboration_start_shamsi:
+          currentSettings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi,
+        phone_number: currentSettings.worker_phone_number || workerInfo.phone_number,
+      };
+      await attachForgottenCheckoutWarning(pool, workerId, liveState, currentSettings, nowInfo);
+
+      res.status(201).json({
+        ok: true,
+        logId: insIn.insertId,
+        liveState,
+        message: `نوبت کاری تاریخ ${shamsiDate} (ورود ${checkInTime.slice(0, 5)} تا خروج ${checkOutTime.slice(0, 5)}) با موفقیت ثبت گردید.`,
+      });
+    } catch (err) {
+      if (conn) {
+        try {
+          await conn.rollback();
+        } catch {
+          // ignore
+        }
       }
       handleServerError(res, err);
     } finally {
@@ -3051,22 +3673,34 @@ apiRouter.post(
         const checkOutRaw = toEnglishDigits(String(req.body?.check_out_time || '')).trim();
         const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
 
-        if (
-          !isValidTimeHHMMOrHHMMSS(checkInRaw, true) ||
-          !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)
-        ) {
+        if (!isValidTimeHHMMOrHHMMSS(checkInRaw, true)) {
           await conn.rollback();
           res.status(400).json({
             ok: false,
-            message: 'فرمت ساعت ورود و خروج باید معتبر و بین 00:00 تا 23:59 باشد.',
+            message: 'فرمت ساعت آغاز به کار (ورود) باید معتبر و بین 00:00 تا 23:59 باشد.',
           });
           return;
         }
 
         const checkInTime = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
-        const checkOutTime = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
+        const hasCheckOut = checkOutRaw.length > 0;
 
-        if (parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
+        if (hasCheckOut && !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: 'فرمت ساعت خاتمه کار (خروج) باید معتبر و بین 00:00 تا 23:59 باشد.',
+          });
+          return;
+        }
+
+        const checkOutTime = hasCheckOut
+          ? checkOutRaw.length === 5
+            ? `${checkOutRaw}:00`
+            : checkOutRaw
+          : null;
+
+        if (checkOutTime && parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
           await conn.rollback();
           res.status(400).json({
             ok: false,
@@ -3086,7 +3720,9 @@ apiRouter.post(
             recorded_time: String(r.recorded_time),
           })),
           { event_type: 'WORK_START' as AttendanceEventType, recorded_time: checkInTime },
-          { event_type: 'WORK_END' as AttendanceEventType, recorded_time: checkOutTime },
+          ...(checkOutTime
+            ? [{ event_type: 'WORK_END' as AttendanceEventType, recorded_time: checkOutTime }]
+            : []),
         ];
 
         const seqCheck = validateFullDayLogSequence(simulatedLogs);
@@ -3100,7 +3736,6 @@ apiRouter.post(
         }
 
         const recordedAtIn = `${workDate} ${checkInTime}`;
-        const recordedAtOut = `${workDate} ${checkOutTime}`;
 
         const [insIn] = await conn.execute<mysql.ResultSetHeader>(
           `INSERT INTO attendance_logs
@@ -3109,12 +3744,17 @@ apiRouter.post(
           [workerId, workDate, shamsiDate, recordedAtIn, checkInTime, note, managerId, reason]
         );
 
-        const [insOut] = await conn.execute<mysql.ResultSetHeader>(
-          `INSERT INTO attendance_logs
-            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
-           VALUES (?, ?, ?, 'WORK_END', ?, ?, ?, 1, ?, ?, 0)`,
-          [workerId, workDate, shamsiDate, recordedAtOut, checkOutTime, note, managerId, reason]
-        );
+        let checkOutLogId: number | null = null;
+        if (checkOutTime) {
+          const recordedAtOut = `${workDate} ${checkOutTime}`;
+          const [insOut] = await conn.execute<mysql.ResultSetHeader>(
+            `INSERT INTO attendance_logs
+              (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+             VALUES (?, ?, ?, 'WORK_END', ?, ?, ?, 1, ?, ?, 0)`,
+            [workerId, workDate, shamsiDate, recordedAtOut, checkOutTime, note, managerId, reason]
+          );
+          checkOutLogId = insOut.insertId;
+        }
 
         await recordAuditLog({
           actorUserId: managerId,
@@ -3127,7 +3767,7 @@ apiRouter.post(
             check_in_time: checkInTime,
             check_out_time: checkOutTime,
             check_in_log_id: insIn.insertId,
-            check_out_log_id: insOut.insertId,
+            check_out_log_id: checkOutLogId,
           },
           reason,
           ipAddress: req.ip || null,
@@ -3137,7 +3777,9 @@ apiRouter.post(
         await conn.commit();
         res.status(201).json({
           ok: true,
-          message: 'نوبت کاری (ساعت ورود و خروج) با موفقیت در کارکرد پرسنل ثبت گردید.',
+          message: checkOutTime
+            ? 'نوبت کاری (ساعت ورود و خروج) با موفقیت در کارکرد پرسنل ثبت گردید.'
+            : 'ساعت آغاز به کار (ورود) با موفقیت ثبت شد و نوبت کاری در وضعیت «در جریان» فعال گردید.',
         });
         return;
       }
@@ -3372,7 +4014,9 @@ apiRouter.post(
     let conn: mysql.PoolConnection | null = null;
     try {
       const logId = req.body?.log_id ? Number(req.body.log_id) : 0;
-      const shamsiRaw = req.body?.shamsi_date ? String(req.body.shamsi_date).trim() : '';
+      const shamsiRaw = req.body?.shamsi_date
+        ? toEnglishDigits(String(req.body.shamsi_date)).trim()
+        : '';
       const decision = String(req.body?.decision || '').trim() as LateArrivalDisposition;
       const managerNote = req.body?.manager_note
         ? String(req.body.manager_note).trim().slice(0, 500)
@@ -3418,7 +4062,8 @@ apiRouter.post(
         if (rows.length > 0) {
           targetRow = rows[0];
         }
-      } else if (shamsiRaw && isValidShamsiDate(shamsiRaw)) {
+      }
+      if (!targetRow && shamsiRaw && isValidShamsiDate(shamsiRaw)) {
         const normShamsi = normalizeShamsiDate(shamsiRaw);
         const [rows] = await conn.execute<mysql.RowDataPacket[]>(
           `SELECT * FROM attendance_logs
@@ -3429,6 +4074,85 @@ apiRouter.post(
         );
         if (rows.length > 0) {
           targetRow = rows[0];
+        } else {
+          // اگر این تاریخ از سوابق قبلی یا فایل اکسل بارگذاری شده باشد و هنوز در attendance_logs ردیف نداشته باشد،
+          // رکورد ورود و خروج معادل آن را در attendance_logs ایجاد می‌کنیم تا تصمیم مدیریت به صورت قطعی ذخیره و اعمال شود.
+          const [histRows] = await conn.execute<mysql.RowDataPacket[]>(
+            `SELECT * FROM historical_work_records WHERE user_id = ? AND status = 'APPROVED' FOR UPDATE`,
+            [workerId]
+          );
+          let matchedHistRow: HistoricalWorkRowItem | null = null;
+          for (const hr of histRows) {
+            const mapped = mapRowToHistoricalWork(hr);
+            if (mapped.parsed_rows && mapped.parsed_rows.length > 0) {
+              const found = mapped.parsed_rows.find(
+                (r) =>
+                  r.shamsi_date &&
+                  isValidShamsiDate(r.shamsi_date) &&
+                  normalizeShamsiDate(r.shamsi_date) === normShamsi
+              );
+              if (found) {
+                matchedHistRow = found;
+                break;
+              }
+            }
+          }
+
+          const workDate = shamsiToGregorian(normShamsi);
+          const dayName = getShamsiDayOfWeekName(normShamsi);
+          const { firstIn, lastOut } = matchedHistRow
+            ? inferHistoricalCheckInOut(
+                matchedHistRow.net_work_minutes,
+                matchedHistRow.overtime_minutes,
+                matchedHistRow.note,
+                matchedHistRow.check_in,
+                matchedHistRow.check_out,
+                dayName
+              )
+            : { firstIn: '07:05', lastOut: dayName === 'پنجشنبه' ? '14:00' : '15:00' };
+
+          const startHHMMSS = firstIn.length === 5 ? `${firstIn}:00` : firstIn;
+          const endHHMMSS = lastOut.length === 5 ? `${lastOut}:00` : lastOut;
+
+          const [insStart] = await conn.execute<mysql.ResultSetHeader>(
+            `INSERT INTO attendance_logs
+              (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted, late_status, manager_late_note, custom_deduction_toman, late_reviewed_by_user_id, late_reviewed_at, is_late_seen_by_worker)
+             VALUES (?, ?, ?, 'WORK_START', NOW(), ?, ?, 1, ?, 'تعیین تکلیف تأخیر توسط مدیریت', 0, ?, ?, ?, ?, NOW(), 0)`,
+            [
+              workerId,
+              workDate,
+              normShamsi,
+              startHHMMSS,
+              matchedHistRow?.note || null,
+              req.user!.id,
+              decision,
+              managerNote,
+              decision === 'CUSTOM' ? customDeductionToman : null,
+              req.user!.id,
+            ]
+          );
+
+          await conn.execute(
+            `INSERT INTO attendance_logs
+              (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+             VALUES (?, ?, ?, 'WORK_END', NOW(), ?, ?, 1, ?, 'تعیین تکلیف تأخیر توسط مدیریت', 0)`,
+            [
+              workerId,
+              workDate,
+              normShamsi,
+              endHHMMSS,
+              matchedHistRow?.note || null,
+              req.user!.id,
+            ]
+          );
+
+          const [createdRows] = await conn.execute<mysql.RowDataPacket[]>(
+            `SELECT * FROM attendance_logs WHERE id = ? LIMIT 1`,
+            [insStart.insertId]
+          );
+          if (createdRows.length > 0) {
+            targetRow = createdRows[0];
+          }
         }
       }
 
@@ -3442,7 +4166,8 @@ apiRouter.post(
       }
 
       const targetLog = mapRowToAttendanceLog(targetRow);
-      const effectiveSettings = await getSystemSettingsFromDb(targetLog.shamsi_date);
+      const normTargetShamsi = normalizeShamsiDate(targetLog.shamsi_date);
+      const effectiveSettings = await getSystemSettingsFromDb(normTargetShamsi);
       const dayOfWeek = getDayOfWeekFromGregorian(targetLog.work_date);
       const { shiftStartHHMM, shiftStartMin } = getDayShiftSchedule(dayOfWeek, effectiveSettings);
       const firstInMin = parseTimeToMinutes(targetLog.recorded_time);
@@ -3456,15 +4181,57 @@ apiRouter.post(
              late_reviewed_by_user_id = ?,
              late_reviewed_at = NOW(),
              is_late_seen_by_worker = 0
-         WHERE id = ?`,
+         WHERE user_id = ? AND shamsi_date = ? AND is_deleted = 0 AND event_type = 'WORK_START'`,
         [
           decision,
           managerNote,
           decision === 'CUSTOM' ? customDeductionToman : null,
           req.user!.id,
-          targetLog.id,
+          workerId,
+          normTargetShamsi,
         ]
       );
+
+      // همگام‌سازی وضعیت تعیین تکلیف تأخیر در parsed_rows_json سوابق اکسل / تاریخی (در صورت وجود)
+      const [histUpdateRows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id, parsed_rows_json FROM historical_work_records WHERE user_id = ? AND parsed_rows_json IS NOT NULL FOR UPDATE`,
+        [workerId]
+      );
+      for (const hr of histUpdateRows) {
+        try {
+          const parsed: HistoricalWorkRowItem[] =
+            typeof hr.parsed_rows_json === 'string'
+              ? JSON.parse(hr.parsed_rows_json)
+              : hr.parsed_rows_json;
+          if (Array.isArray(parsed)) {
+            let changed = false;
+            const updatedRows = parsed.map((r) => {
+              if (
+                r.shamsi_date &&
+                isValidShamsiDate(r.shamsi_date) &&
+                normalizeShamsiDate(r.shamsi_date) === normTargetShamsi
+              ) {
+                changed = true;
+                return {
+                  ...r,
+                  late_status: decision,
+                  manager_late_note: managerNote,
+                  custom_deduction_toman: decision === 'CUSTOM' ? customDeductionToman : null,
+                };
+              }
+              return r;
+            });
+            if (changed) {
+              await conn.execute(
+                `UPDATE historical_work_records SET parsed_rows_json = ? WHERE id = ?`,
+                [JSON.stringify(updatedRows), hr.id]
+              );
+            }
+          }
+        } catch {
+          // ignore JSON parse errors
+        }
+      }
 
       // اگر تصمیم مدیر «کسر از مرخصی» (DEDUCT_LEAVE) باشد، یک مرخصی ساعتی تأییدشده معادل مدت تأخیر ثبت می‌شود
       const leaveIdempotencyKey = `late_leave_log_${targetLog.id}`;
@@ -4206,10 +4973,51 @@ apiRouter.post(
         ? String(req.body.manager_note).trim().slice(0, 500)
         : 'ثبت مستقیم توسط مدیریت';
 
+      const rawSettlementMode = String(req.body?.settlement_mode || 'LUMP_SUM').trim();
+      const settlementMode: SettlementMode =
+        txType !== 'PETTY_CASH' && rawSettlementMode === 'INSTALLMENT'
+          ? 'INSTALLMENT'
+          : 'LUMP_SUM';
+      const rawMonthlyDeduction = toEnglishDigits(
+        String(req.body?.monthly_deduction_toman || '')
+      )
+        .replace(/,/g, '')
+        .trim();
+      const parsedMonthlyDeduction = Number(rawMonthlyDeduction);
+      const monthlyDeductionToman =
+        settlementMode === 'INSTALLMENT' &&
+        Number.isFinite(parsedMonthlyDeduction) &&
+        parsedMonthlyDeduction > 0
+          ? Math.min(amountToman, Math.round(parsedMonthlyDeduction))
+          : null;
+
+      if (settlementMode === 'INSTALLMENT' && (!monthlyDeductionToman || monthlyDeductionToman <= 0)) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: 'برای اعمال استهلاک تدریجی ماهانه، تعیین مبلغ کسر خودکار در هر دوره ماهانه الزامی است.',
+        });
+        return;
+      }
+
+      const installmentCount =
+        settlementMode === 'INSTALLMENT' && monthlyDeductionToman
+          ? Math.max(1, Math.ceil(amountToman / monthlyDeductionToman))
+          : null;
+      const rawInstStart = req.body?.installment_start_shamsi
+        ? toEnglishDigits(String(req.body.installment_start_shamsi)).trim()
+        : '';
+      const installmentStartShamsi =
+        settlementMode === 'INSTALLMENT'
+          ? rawInstStart && isValidShamsiDate(rawInstStart)
+            ? normalizeShamsiDate(rawInstStart)
+            : shamsiDate
+          : null;
+
       const [result] = await conn.execute<mysql.ResultSetHeader>(
         `INSERT INTO financial_transactions
-          (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, receipt_file_url, receipt_file_name, status, is_seen_by_manager, reviewed_by_user_id, reviewed_at, manager_note, idempotency_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', 1, ?, NOW(), ?, ?)`,
+          (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, receipt_file_url, receipt_file_name, status, is_seen_by_manager, reviewed_by_user_id, reviewed_at, manager_note, settlement_mode, monthly_deduction_toman, installment_count, installment_start_shamsi, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', 1, ?, NOW(), ?, ?, ?, ?, ?, ?)`,
         [
           workerId,
           managerId,
@@ -4222,6 +5030,10 @@ apiRouter.post(
           savedReceiptUrl ? receiptFileName : null,
           managerId,
           managerNoteInput || 'ثبت مستقیم توسط مدیریت',
+          settlementMode,
+          monthlyDeductionToman,
+          installmentCount,
+          installmentStartShamsi,
           idempotencyKey,
         ]
       );
@@ -4235,6 +5047,9 @@ apiRouter.post(
           amount_toman: amountToman,
           tx_type: txType,
           shamsi_date: shamsiDate,
+          settlement_mode: settlementMode,
+          monthly_deduction_toman: monthlyDeductionToman,
+          installment_count: installmentCount,
           status: 'APPROVED',
         },
         ipAddress: req.ip || null,
@@ -4250,7 +5065,14 @@ apiRouter.post(
       res.status(201).json({
         ok: true,
         transactionId: result.insertId,
-        message: 'پرداخت / سابقه مالی با موفقیت ثبت و به مجموع پرداخت‌های قطعی اضافه شد.',
+        message:
+          settlementMode === 'INSTALLMENT' && monthlyDeductionToman
+            ? `تعهد مالی پرسنل با برنامه استهلاک خودکار ماهانه (${toPersianDigits(
+                monthlyDeductionToman.toLocaleString('en-US')
+              )} تومان در هر دوره، طی ${toPersianDigits(
+                installmentCount || 1
+              )} دوره ماهانه) ثبت شد.`
+            : 'پرداخت / سابقه مالی با موفقیت ثبت و به مجموع پرداخت‌های قطعی اضافه شد.',
       });
     } catch (err) {
       if (conn) {
@@ -4457,6 +5279,47 @@ apiRouter.put(
 
       const nextManagerNote = isManager ? managerNote : existing.manager_note;
 
+      let nextSettlementMode: SettlementMode = existing.settlement_mode || 'LUMP_SUM';
+      let nextMonthlyDeduction: number | null = existing.monthly_deduction_toman ?? null;
+      let nextInstallmentCount: number | null = existing.installment_count ?? null;
+      let nextInstallmentStart: string | null = existing.installment_start_shamsi ?? null;
+
+      if (isManager && req.body?.settlement_mode !== undefined) {
+        const rawMode = String(req.body.settlement_mode || 'LUMP_SUM').trim();
+        nextSettlementMode =
+          txType !== 'PETTY_CASH' && rawMode === 'INSTALLMENT' ? 'INSTALLMENT' : 'LUMP_SUM';
+        if (nextSettlementMode === 'INSTALLMENT') {
+          const rawM = toEnglishDigits(String(req.body?.monthly_deduction_toman || ''))
+            .replace(/,/g, '')
+            .trim();
+          const parsedM = Number(rawM);
+          if (!Number.isFinite(parsedM) || parsedM <= 0) {
+            await conn.rollback();
+            res.status(400).json({
+              ok: false,
+              message: 'لطفاً مبلغ کسر خودکار در هر دوره ماهانه را به صورت عدد صحیح مثبت وارد کنید.',
+            });
+            return;
+          }
+          nextMonthlyDeduction = Math.min(amountToman, Math.round(parsedM));
+          nextInstallmentCount = Math.max(1, Math.ceil(amountToman / nextMonthlyDeduction));
+          const rawStart = req.body?.installment_start_shamsi
+            ? toEnglishDigits(String(req.body.installment_start_shamsi)).trim()
+            : '';
+          nextInstallmentStart =
+            rawStart && isValidShamsiDate(rawStart)
+              ? normalizeShamsiDate(rawStart)
+              : shamsiDate;
+        } else {
+          nextMonthlyDeduction = null;
+          nextInstallmentCount = null;
+          nextInstallmentStart = null;
+        }
+      } else if (nextSettlementMode === 'INSTALLMENT' && nextMonthlyDeduction) {
+        nextMonthlyDeduction = Math.min(amountToman, nextMonthlyDeduction);
+        nextInstallmentCount = Math.max(1, Math.ceil(amountToman / nextMonthlyDeduction));
+      }
+
       await conn.execute(
         `UPDATE financial_transactions
          SET amount_toman = ?,
@@ -4466,6 +5329,10 @@ apiRouter.put(
              description = ?,
              manager_note = ?,
              status = ?,
+             settlement_mode = ?,
+             monthly_deduction_toman = ?,
+             installment_count = ?,
+             installment_start_shamsi = ?,
              reviewed_by_user_id = CASE WHEN ? = 1 THEN ? ELSE reviewed_by_user_id END,
              reviewed_at = CASE WHEN ? = 1 THEN NOW() ELSE reviewed_at END
          WHERE id = ?`,
@@ -4477,6 +5344,10 @@ apiRouter.put(
           description,
           nextManagerNote,
           nextStatus,
+          nextSettlementMode,
+          nextMonthlyDeduction,
+          nextInstallmentCount,
+          nextInstallmentStart,
           isManager ? 1 : 0,
           req.user!.id,
           isManager ? 1 : 0,
@@ -4493,12 +5364,16 @@ apiRouter.put(
           amount_toman: existing.amount_toman,
           tx_type: existing.tx_type,
           shamsi_date: existing.shamsi_date,
+          settlement_mode: existing.settlement_mode,
+          monthly_deduction_toman: existing.monthly_deduction_toman,
           status: existing.status,
         },
         afterState: {
           amount_toman: amountToman,
           tx_type: txType,
           shamsi_date: shamsiDate,
+          settlement_mode: nextSettlementMode,
+          monthly_deduction_toman: nextMonthlyDeduction,
           status: nextStatus,
         },
         ipAddress: req.ip || null,
@@ -5009,15 +5884,28 @@ apiRouter.get(
 
             const rowNetMins = Number(row.net_work_minutes || 0);
             const rowOtMins = Number(row.overtime_minutes || 0);
-            if (rowNetMins > 0 || rowOtMins > 0) {
+            if (rowNetMins > 0 || rowOtMins > 0 || row.late_status === 'ABSENCE') {
               activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
             }
-            totalRecordedWorkDays += 1;
+            if (row.late_status !== 'ABSENCE') {
+              totalRecordedWorkDays += 1;
+            }
             totalConfirmedNetWorkMinutes += rowNetMins;
             totalConfirmedOvertimeMinutes += rowOtMins;
 
             const effSet = await getSystemSettingsFromDb(normShamsi);
             const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+            const deductionRatesRow = calculateLateAndAbsenceRates(effSet);
+            if (row.late_deduction_toman && row.late_deduction_toman > 0) {
+              totalLateDeductionTomanAccum += Math.round(row.late_deduction_toman);
+            } else if (row.late_status === 'ABSENCE') {
+              totalLateDeductionTomanAccum += deductionRatesRow.effectiveDailyAbsenceRateToman;
+            } else if (row.late_status === 'CUSTOM') {
+              totalLateDeductionTomanAccum +=
+                row.custom_deduction_toman && row.custom_deduction_toman > 0
+                  ? Math.round(row.custom_deduction_toman)
+                  : 0;
+            }
             hourlyEarnedRegularWorkToman += Math.round(
               (rowNetMins / 60) * rowCalc.effectiveHourlyRateToman
             );
@@ -5106,6 +5994,18 @@ apiRouter.get(
         dailySummaries,
         historicalRecords
       );
+
+      pendingLateReviews.length = 0;
+      reviewedLateSummaries.length = 0;
+      for (const summary of mergedDailySummaries) {
+        if ((summary.raw_late_minutes || 0) > 0 || (summary.late_status && summary.late_status !== 'NONE')) {
+          if (!summary.late_status || summary.late_status === 'PENDING') {
+            pendingLateReviews.push(summary);
+          } else if (reviewedLateSummaries.length < 30) {
+            reviewedLateSummaries.push(summary);
+          }
+        }
+      }
 
       const confirmedChronological = [...mergedDailySummaries]
         .filter((d) => d.logs.length > 0 || d.net_work_minutes > 0 || d.overtime_minutes > 0)
@@ -6128,3 +7028,530 @@ apiRouter.get(
     }
   }
 );
+
+// ============================================================================
+// ۱۰. مدیریت فضای ذخیره‌سازی هاست و پاکسازی فایل‌های صوتی، تصاویر و پیوست‌ها (مشترک مدیر و پرسنل)
+// ============================================================================
+apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const pool = getPool();
+    const items: MediaStorageItem[] = [];
+    const referencedUrls = new Set<string>();
+
+    // ۱. پیام‌ها و مکاتبات (فایل‌های صوتی و پیوست‌ها)
+    const [corrRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
+       FROM work_correspondences c
+       LEFT JOIN users u ON u.id = c.sender_user_id
+       ORDER BY c.id DESC`
+    );
+
+    for (const r of corrRows) {
+      const recordId = Number(r.id);
+      const senderLabel = r.sender_name || (r.sender_role === 'manager' ? 'مدیریت' : 'پرسنل');
+      const shamsiDate = String(r.shamsi_date || '');
+      const recordedTime = String(r.recorded_time || '').slice(0, 5);
+      const createdAt = r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString();
+      const msgPreview = String(r.message_text || '').trim().slice(0, 60) || 'پیام کاری';
+
+      if (r.audio_url) {
+        const audioUrl = String(r.audio_url).trim();
+        referencedUrls.add(audioUrl);
+        const info = getMediaFileInfoOnDisk(audioUrl);
+        items.push({
+          id: `CORR_AUDIO_${recordId}`,
+          source_type: 'CORRESPONDENCE_AUDIO',
+          category: 'AUDIO',
+          record_id: recordId,
+          file_url: audioUrl,
+          file_name: path.basename(audioUrl),
+          size_bytes: info.sizeBytes,
+          shamsi_date: shamsiDate,
+          recorded_time: recordedTime,
+          title_or_context: `فایل صوتی پیام: ${msgPreview}`,
+          sender_or_creator: senderLabel,
+          exists_on_disk: info.exists,
+          created_at: createdAt,
+        });
+      }
+
+      if (r.attachments_json) {
+        let parsedAtts: CorrespondenceAttachment[] = [];
+        try {
+          parsedAtts =
+            typeof r.attachments_json === 'string'
+              ? JSON.parse(r.attachments_json)
+              : r.attachments_json;
+        } catch {
+          parsedAtts = [];
+        }
+        if (Array.isArray(parsedAtts)) {
+          parsedAtts.forEach((att, idx) => {
+            if (!att || !att.file_url) return;
+            const fileUrl = String(att.file_url).trim();
+            referencedUrls.add(fileUrl);
+            const info = getMediaFileInfoOnDisk(fileUrl);
+            const ext = path.extname(fileUrl).toLowerCase();
+            const isImg = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+            const isAud = ['.webm', '.ogg', '.mp3', '.m4a', '.wav'].includes(ext);
+            items.push({
+              id: `CORR_ATT_${recordId}_${idx}`,
+              source_type: 'CORRESPONDENCE_ATTACHMENT',
+              category: isAud ? 'AUDIO' : isImg ? 'IMAGE' : 'DOCUMENT',
+              record_id: recordId,
+              file_url: fileUrl,
+              file_name: att.file_name || path.basename(fileUrl),
+              size_bytes: info.exists ? info.sizeBytes : Number(att.file_size || 0),
+              shamsi_date: shamsiDate,
+              recorded_time: recordedTime,
+              title_or_context: `پیوست مکاتبه: ${att.file_name || msgPreview}`,
+              sender_or_creator: senderLabel,
+              exists_on_disk: info.exists,
+              created_at: createdAt,
+            });
+          });
+        }
+      }
+    }
+
+    // ۲. تصاویر گزارش کارهای روزانه
+    const [repRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT id, shamsi_date, recorded_time, activity_description, report_image_url, created_at
+       FROM daily_work_reports
+       WHERE report_image_url IS NOT NULL AND report_image_url != ''
+       ORDER BY id DESC`
+    );
+    for (const r of repRows) {
+      const recordId = Number(r.id);
+      const fileUrl = String(r.report_image_url).trim();
+      referencedUrls.add(fileUrl);
+      const info = getMediaFileInfoOnDisk(fileUrl);
+      items.push({
+        id: `REP_PHOTO_${recordId}`,
+        source_type: 'REPORT_PHOTO',
+        category: 'IMAGE',
+        record_id: recordId,
+        file_url: fileUrl,
+        file_name: path.basename(fileUrl),
+        size_bytes: info.sizeBytes,
+        shamsi_date: String(r.shamsi_date || ''),
+        recorded_time: String(r.recorded_time || '').slice(0, 5),
+        title_or_context: `تصویر گزارش کار: ${String(r.activity_description || '').slice(0, 60)}`,
+        sender_or_creator: 'پرسنل',
+        exists_on_disk: info.exists,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
+      });
+    }
+
+    // ۳. تصاویر رسید و فاکتور تراکنش‌های مالی
+    const [finRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT f.id, f.shamsi_date, f.recorded_time, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
+       FROM financial_transactions f
+       LEFT JOIN users u ON u.id = f.created_by_user_id
+       WHERE f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
+       ORDER BY f.id DESC`
+    );
+    for (const r of finRows) {
+      const recordId = Number(r.id);
+      const fileUrl = String(r.receipt_file_url).trim();
+      referencedUrls.add(fileUrl);
+      const info = getMediaFileInfoOnDisk(fileUrl);
+      const ext = path.extname(fileUrl).toLowerCase();
+      items.push({
+        id: `FIN_RECEIPT_${recordId}`,
+        source_type: 'FINANCE_RECEIPT',
+        category: ext === '.pdf' ? 'DOCUMENT' : 'IMAGE',
+        record_id: recordId,
+        file_url: fileUrl,
+        file_name: r.receipt_file_name ? String(r.receipt_file_name) : path.basename(fileUrl),
+        size_bytes: info.sizeBytes,
+        shamsi_date: String(r.shamsi_date || ''),
+        recorded_time: String(r.recorded_time || '').slice(0, 5),
+        title_or_context: `پیوست سند مالی: ${String(r.description || 'رسید تراکنش مالی').slice(0, 60)}`,
+        sender_or_creator: r.creator_name ? String(r.creator_name) : 'ثبت مالی',
+        exists_on_disk: info.exists,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
+      });
+    }
+
+    // ۴. فایل‌های اکسل سوابق کاری گذشته
+    const [histRows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT id, shamsi_date, title, excel_file_url, excel_file_name, created_at
+       FROM historical_work_records
+       WHERE excel_file_url IS NOT NULL AND excel_file_url != ''
+       ORDER BY id DESC`
+    );
+    for (const r of histRows) {
+      const recordId = Number(r.id);
+      const fileUrl = String(r.excel_file_url).trim();
+      referencedUrls.add(fileUrl);
+      const info = getMediaFileInfoOnDisk(fileUrl);
+      items.push({
+        id: `HIST_EXCEL_${recordId}`,
+        source_type: 'HISTORICAL_EXCEL',
+        category: 'DOCUMENT',
+        record_id: recordId,
+        file_url: fileUrl,
+        file_name: r.excel_file_name ? String(r.excel_file_name) : path.basename(fileUrl),
+        size_bytes: info.sizeBytes,
+        shamsi_date: String(r.shamsi_date || ''),
+        title_or_context: `فایل اکسل سوابق: ${String(r.title || '').slice(0, 60)}`,
+        sender_or_creator: 'آرشیو کارکرد',
+        exists_on_disk: info.exists,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
+      });
+    }
+
+    // ۵. بررسی فایل‌های بدون مرجع (Orphan) روی دیسک در پوشه‌های audio, attachments, reports, receipts, excel
+    const baseDir = getBaseMediaDirPath();
+    const scanFolders: Array<{ folder: string; cat: 'AUDIO' | 'IMAGE' | 'DOCUMENT' }> = [
+      { folder: 'audio', cat: 'AUDIO' },
+      { folder: 'reports', cat: 'IMAGE' },
+      { folder: 'receipts', cat: 'IMAGE' },
+      { folder: 'attachments', cat: 'DOCUMENT' },
+      { folder: 'excel', cat: 'DOCUMENT' },
+    ];
+
+    for (const { folder, cat } of scanFolders) {
+      const dirPath = path.join(baseDir, folder);
+      if (!fs.existsSync(dirPath)) continue;
+      let fileNames: string[] = [];
+      try {
+        fileNames = fs.readdirSync(dirPath);
+      } catch {
+        fileNames = [];
+      }
+      for (const fName of fileNames) {
+        const publicUrl = `/assets/media/${folder}/${fName}`;
+        if (referencedUrls.has(publicUrl)) continue;
+        const info = getMediaFileInfoOnDisk(publicUrl);
+        if (!info.exists) continue;
+        const mtimeIso = info.mtimeIso || new Date().toISOString();
+        const shamsiDate = gregorianToShamsi(mtimeIso.slice(0, 10));
+        items.push({
+          id: `ORPHAN_${folder}_${fName}`,
+          source_type: 'ORPHAN_FILE',
+          category: cat,
+          record_id: null,
+          file_url: publicUrl,
+          file_name: fName,
+          size_bytes: info.sizeBytes,
+          shamsi_date: shamsiDate,
+          title_or_context: `فایل ذخیره‌شده روی هاست (${folder})`,
+          sender_or_creator: 'سیستم',
+          exists_on_disk: true,
+          created_at: mtimeIso,
+        });
+      }
+    }
+
+    let totalSizeBytes = 0;
+    let audioCount = 0;
+    let audioBytes = 0;
+    let imageCount = 0;
+    let imageBytes = 0;
+    let docCount = 0;
+    let docBytes = 0;
+
+    for (const item of items) {
+      totalSizeBytes += item.size_bytes;
+      if (item.category === 'AUDIO') {
+        audioCount += 1;
+        audioBytes += item.size_bytes;
+      } else if (item.category === 'IMAGE') {
+        imageCount += 1;
+        imageBytes += item.size_bytes;
+      } else {
+        docCount += 1;
+        docBytes += item.size_bytes;
+      }
+    }
+
+    const summary: MediaStorageSummary = {
+      total_files_count: items.length,
+      total_size_bytes: totalSizeBytes,
+      audio_files_count: audioCount,
+      audio_size_bytes: audioBytes,
+      image_files_count: imageCount,
+      image_size_bytes: imageBytes,
+      document_files_count: docCount,
+      document_size_bytes: docBytes,
+      items,
+    };
+
+    res.json({ ok: true, storage: summary });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const pool = getPool();
+  let conn: mysql.PoolConnection | null = null;
+  try {
+    const actorId = req.user!.id;
+    const actorRole = req.user!.role;
+
+    const rawItems: Array<{
+      source_type: MediaSourceType;
+      record_id: number | null;
+      file_url: string;
+    }> = Array.isArray(req.body?.items) ? req.body.items : [];
+
+    const olderThanDays =
+      req.body?.older_than_days !== undefined && req.body?.older_than_days !== null
+        ? Number(req.body.older_than_days)
+        : null;
+    const targetCategory = req.body?.category ? String(req.body.category).toUpperCase() : 'ALL';
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const targets: Array<{
+      source_type: MediaSourceType;
+      record_id: number | null;
+      file_url: string;
+    }> = [...rawItems];
+
+    // در صورتی که پاکسازی گروهی بر اساس قدمت زمانی یا دسته‌بندی درخواست شده باشد:
+    if (targets.length === 0 && olderThanDays !== null && !Number.isNaN(olderThanDays) && olderThanDays >= 0) {
+      const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+
+      const [corrRows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences FOR UPDATE`
+      );
+      for (const r of corrRows) {
+        const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+        if (createdMs > cutoffMs) continue;
+        const recId = Number(r.id);
+        if (r.audio_url && (targetCategory === 'ALL' || targetCategory === 'AUDIO')) {
+          targets.push({
+            source_type: 'CORRESPONDENCE_AUDIO',
+            record_id: recId,
+            file_url: String(r.audio_url).trim(),
+          });
+        }
+        if (r.attachments_json) {
+          let parsedAtts: CorrespondenceAttachment[] = [];
+          try {
+            parsedAtts =
+              typeof r.attachments_json === 'string'
+                ? JSON.parse(r.attachments_json)
+                : r.attachments_json;
+          } catch {
+            parsedAtts = [];
+          }
+          if (Array.isArray(parsedAtts)) {
+            for (const att of parsedAtts) {
+              if (!att?.file_url) continue;
+              const ext = path.extname(att.file_url).toLowerCase();
+              const isImg = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+              const isAud = ['.webm', '.ogg', '.mp3', '.m4a', '.wav'].includes(ext);
+              const cat = isAud ? 'AUDIO' : isImg ? 'IMAGE' : 'DOCUMENT';
+              if (targetCategory === 'ALL' || targetCategory === cat) {
+                targets.push({
+                  source_type: 'CORRESPONDENCE_ATTACHMENT',
+                  record_id: recId,
+                  file_url: String(att.file_url).trim(),
+                });
+              }
+            }
+          }
+        }
+      }
+
+      if (targetCategory === 'ALL' || targetCategory === 'IMAGE') {
+        const [repRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, report_image_url, created_at FROM daily_work_reports WHERE report_image_url IS NOT NULL AND report_image_url != '' FOR UPDATE`
+        );
+        for (const r of repRows) {
+          const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+          if (createdMs > cutoffMs) continue;
+          targets.push({
+            source_type: 'REPORT_PHOTO',
+            record_id: Number(r.id),
+            file_url: String(r.report_image_url).trim(),
+          });
+        }
+      }
+
+      if (targetCategory === 'ALL' || targetCategory === 'IMAGE' || targetCategory === 'DOCUMENT') {
+        const [finRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`
+        );
+        for (const r of finRows) {
+          const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+          if (createdMs > cutoffMs) continue;
+          targets.push({
+            source_type: 'FINANCE_RECEIPT',
+            record_id: Number(r.id),
+            file_url: String(r.receipt_file_url).trim(),
+          });
+        }
+      }
+
+      if (targetCategory === 'ALL' || targetCategory === 'DOCUMENT') {
+        const [histRows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`
+        );
+        for (const r of histRows) {
+          const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+          if (createdMs > cutoffMs) continue;
+          targets.push({
+            source_type: 'HISTORICAL_EXCEL',
+            record_id: Number(r.id),
+            file_url: String(r.excel_file_url).trim(),
+          });
+        }
+      }
+    }
+
+    if (targets.length === 0) {
+      await conn.rollback();
+      res.status(200).json({
+        ok: true,
+        deletedCount: 0,
+        freedBytes: 0,
+        message: 'فایلی مطابق با شرایط انتخابی جهت پاکسازی یافت نشد.',
+      });
+      return;
+    }
+
+    let deletedCount = 0;
+    let freedBytes = 0;
+
+    for (const target of targets) {
+      const sourceType = String(target.source_type || '').toUpperCase() as MediaSourceType;
+      const recordId = target.record_id ? Number(target.record_id) : null;
+      const fileUrl = String(target.file_url || '').trim();
+
+      if (!fileUrl) continue;
+
+      if (sourceType === 'CORRESPONDENCE_AUDIO' && recordId) {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, message_text, audio_url FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          const currentMsg = String(rows[0].message_text || '').trim();
+          const updatedMsg =
+            !currentMsg || currentMsg === 'پیام صوتی جدید'
+              ? 'پیام صوتی (فایل صوتی جهت آزادسازی فضای هاست حذف شد)'
+              : currentMsg;
+          await conn.execute(
+            `UPDATE work_correspondences SET audio_url = NULL, audio_duration_seconds = NULL, message_text = ? WHERE id = ?`,
+            [updatedMsg, recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].audio_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === 'CORRESPONDENCE_ATTACHMENT' && recordId) {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, message_text, attachments_json FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          let parsedAtts: CorrespondenceAttachment[] = [];
+          try {
+            parsedAtts =
+              typeof rows[0].attachments_json === 'string'
+                ? JSON.parse(rows[0].attachments_json)
+                : rows[0].attachments_json || [];
+          } catch {
+            parsedAtts = [];
+          }
+          const remaining = Array.isArray(parsedAtts)
+            ? parsedAtts.filter((a) => String(a?.file_url || '').trim() !== fileUrl)
+            : [];
+          const currentMsg = String(rows[0].message_text || '').trim();
+          const updatedMsg =
+            !currentMsg || currentMsg === 'فایل پیوست جدید'
+              ? 'پیوست مکاتبه (فایل پیوست جهت آزادسازی فضای هاست حذف شد)'
+              : currentMsg;
+          await conn.execute(
+            `UPDATE work_correspondences SET attachments_json = ?, message_text = ? WHERE id = ?`,
+            [remaining.length > 0 ? JSON.stringify(remaining) : null, updatedMsg, recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === 'REPORT_PHOTO' && recordId) {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, report_image_url FROM daily_work_reports WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          await conn.execute(
+            `UPDATE daily_work_reports SET report_image_url = NULL WHERE id = ?`,
+            [recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].report_image_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === 'FINANCE_RECEIPT' && recordId) {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, receipt_file_url FROM financial_transactions WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          await conn.execute(
+            `UPDATE financial_transactions SET receipt_file_url = NULL, receipt_file_name = NULL WHERE id = ?`,
+            [recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].receipt_file_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === 'HISTORICAL_EXCEL' && recordId) {
+        const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT id, excel_file_url FROM historical_work_records WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          await conn.execute(
+            `UPDATE historical_work_records SET excel_file_url = NULL, excel_file_name = NULL WHERE id = ?`,
+            [recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].excel_file_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === 'ORPHAN_FILE') {
+        freedBytes += unlinkMediaUrlFromDisk(fileUrl);
+        deletedCount += 1;
+      }
+    }
+
+    await recordAuditLog({
+      actorUserId: actorId,
+      actionType: 'MEDIA_STORAGE_CLEANUP',
+      targetEntity: 'private_media',
+      afterState: {
+        actor_role: actorRole,
+        deleted_count: deletedCount,
+        freed_bytes: freedBytes,
+      },
+      reason: 'پاکسازی فایل‌های چندرسانه‌ای و آزادسازی فضای ذخیره‌سازی هاست',
+      ipAddress: req.ip || null,
+      connection: conn,
+    });
+
+    await conn.commit();
+
+    res.json({
+      ok: true,
+      deletedCount,
+      freedBytes,
+      message: `${deletedCount} فایل چندرسانه‌ای با موفقیت از حافظه هاست حذف و فضای ذخیره‌سازی آزادسازی گردید (اطلاعات متنی و مالی کاملاً محفوظ ماند).`,
+    });
+  } catch (err) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch {
+        // ignore
+      }
+    }
+    handleServerError(res, err);
+  } finally {
+    if (conn) conn.release();
+  }
+});

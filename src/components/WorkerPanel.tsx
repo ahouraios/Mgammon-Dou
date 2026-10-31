@@ -6,9 +6,11 @@ import {
   FinancialStatus,
   FinancialTransaction,
   FinancialTxType,
+  FlexibleClockEntryMode,
   HistoricalWorkRecord,
   LeaveRequestItem,
   LeaveType,
+  MediaSourceType,
   SystemSettings,
   UserProfile,
   WorkerLiveState,
@@ -76,8 +78,10 @@ import {
   Edit3,
   Trash2,
   CheckSquare,
+  HardDrive,
 } from 'lucide-react';
 import { SHAMSI_MONTH_NAMES } from '../shared/jalali';
+import { MediaStorageCleanupPanel } from './MediaStorageCleanupPanel';
 
 interface WorkerPanelProps {
   user: UserProfile;
@@ -339,12 +343,20 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const isFirstPollDoneRef = useRef(false);
   const [externalLeaveRequestType, setExternalLeaveRequestType] = useState<LeaveType | null>(null);
 
+  // ثبت بازنگری ساعت آغاز یا خاتمه شیفت امروز در هر ساعت از شبانه‌روز (بدون الزام به تکمیل هم‌زمان ساعت پایان)
+  const [showTodayFlexibleForm, setShowTodayFlexibleForm] = useState(false);
+  const [todayFlexMode, setTodayFlexMode] = useState<FlexibleClockEntryMode>('START_ONLY');
+  const [todayFlexCheckIn, setTodayFlexCheckIn] = useState('07:00');
+  const [todayFlexCheckOut, setTodayFlexCheckOut] = useState('17:00');
+  const [todayFlexNote, setTodayFlexNote] = useState('');
+
   // ثبت سابقه کارکرد و اضافه‌کاری قبلی توسط پرسنل (با ورود ساعت ورود و خروج و محاسبه خودکار)
   const [showPastWorkForm, setShowPastWorkForm] = useState(true);
   const [pastWorkDate, setPastWorkDate] = useState(initialShamsiDate);
   const [pastEntryType, setPastEntryType] = useState<
     'WORK' | 'MISSION' | 'DAILY_LEAVE' | 'HOURLY_LEAVE'
   >('WORK');
+  const [pastWorkEntryMode, setPastWorkEntryMode] = useState<FlexibleClockEntryMode>('FULL_SHIFT');
   const [pastCheckIn, setPastCheckIn] = useState('07:00');
   const [pastCheckOut, setPastCheckOut] = useState('15:00');
   const [pastLeaveStartTime, setPastLeaveStartTime] = useState('10:00');
@@ -395,9 +407,9 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const [previewFile, setPreviewFile] = useState<PreviewFileItem | null>(null);
   const [cameraTarget, setCameraTarget] = useState<'report' | 'receipt' | null>(null);
 
-  // تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، اطلاعات قرارداد، و راهنما و اعلان‌ها)
+  // تنظیمات پرسنل (حساب کاربری، ارسال اکسل سوابق، اطلاعات قرارداد، مدیریت فضای هاست، و راهنما و اعلان‌ها)
   const [workerSettingsSubTab, setWorkerSettingsSubTab] = useState<
-    'profile' | 'excel_history' | 'contract' | 'guide'
+    'profile' | 'excel_history' | 'contract' | 'storage_cleanup' | 'guide'
   >('profile');
 
   const loadAllWorkerData = useCallback(async () => {
@@ -747,6 +759,64 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     }, 60);
   };
 
+  const handleTodayFlexibleClockSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setActionLoading(true);
+    setFeedback(null);
+    try {
+      const res = await apiRequest<{
+        ok: boolean;
+        message: string;
+        liveState: WorkerLiveState;
+      }>('/api/attendance/flexible-clock', {
+        method: 'POST',
+        body: JSON.stringify({
+          shamsi_date: serverShamsiDate,
+          entry_mode: todayFlexMode,
+          shift_category: 'WORK',
+          check_in_time: todayFlexCheckIn,
+          check_out_time: todayFlexMode === 'START_ONLY' ? '' : todayFlexCheckOut,
+          note: todayFlexNote.trim() || clockNote.trim() || null,
+          late_reason: todayFlexNote.trim() || clockNote.trim() || null,
+        }),
+      });
+      if (res.liveState) {
+        setLiveState(res.liveState);
+      }
+      setTodayFlexNote('');
+      setShowTodayFlexibleForm(false);
+      setFeedback({ type: 'success', text: res.message });
+      await loadAllWorkerData();
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleWorkerDeleteMediaItem = async (
+    sourceType: MediaSourceType,
+    recordId: number,
+    fileUrl: string
+  ) => {
+    setActionLoading(true);
+    setFeedback(null);
+    try {
+      const res = await apiRequest<{ ok: boolean; message: string }>('/api/media/cleanup', {
+        method: 'POST',
+        body: JSON.stringify({
+          items: [{ source_type: sourceType, record_id: recordId, file_url: fileUrl }],
+        }),
+      });
+      setFeedback({ type: 'success', text: res.message });
+      await loadAllWorkerData();
+    } catch (err) {
+      setFeedback({ type: 'error', text: (err as Error).message });
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
   const handlePastWorkSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setActionLoading(true);
@@ -763,6 +833,38 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             reason: pastWorkNote.trim() || pastWorkTitle.trim() || 'ثبت مرخصی روزهای قبل',
           }),
         });
+        setFeedback({ type: 'success', text: res.message });
+        setPastWorkTitle('');
+        setPastWorkNote('');
+        await loadAllWorkerData();
+        return;
+      }
+
+      // در صورتی که حالت ثبت «صرفاً ساعت آغاز به کار (شیفت در جریان)» یا «ثبت تکمیلی ساعت خاتمه کار» باشد، یا تاریخ امروز انتخاب شده باشد:
+      if (
+        pastWorkEntryMode === 'START_ONLY' ||
+        pastWorkEntryMode === 'END_ONLY' ||
+        pastWorkDate === serverShamsiDate
+      ) {
+        const res = await apiRequest<{
+          ok: boolean;
+          message: string;
+          liveState?: WorkerLiveState;
+        }>('/api/attendance/flexible-clock', {
+          method: 'POST',
+          body: JSON.stringify({
+            shamsi_date: pastWorkDate,
+            entry_mode: pastWorkEntryMode,
+            shift_category: pastEntryType === 'MISSION' ? 'MISSION' : 'WORK',
+            check_in_time: pastCheckIn,
+            check_out_time: pastWorkEntryMode === 'START_ONLY' ? '' : pastCheckOut,
+            note: pastWorkNote.trim() || pastWorkTitle.trim() || null,
+            late_reason: pastWorkNote.trim() || pastWorkTitle.trim() || null,
+          }),
+        });
+        if (res.liveState) {
+          setLiveState(res.liveState);
+        }
         setFeedback({ type: 'success', text: res.message });
         setPastWorkTitle('');
         setPastWorkNote('');
@@ -1405,6 +1507,149 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                       </button>
                     </div>
 
+                    {/* بخش ویژه: ثبت بازنگری ساعت آغاز یا خاتمه شیفت امروز در هر ساعت از شبانه‌روز (بدون الزام به تکمیل هم‌زمان ساعت پایان) */}
+                    <div className="pt-2 border-t border-slate-100">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!showTodayFlexibleForm) {
+                            const hasActiveStart =
+                              allowedEvents.includes('WORK_END') &&
+                              !allowedEvents.includes('WORK_START');
+                            setTodayFlexMode(hasActiveStart ? 'END_ONLY' : 'START_ONLY');
+                          }
+                          setShowTodayFlexibleForm((prev) => !prev);
+                        }}
+                        className="w-full min-h-[38px] rounded-xl bg-gradient-to-r from-[#FCF9F2] via-amber-50/70 to-[#FCF9F2] hover:bg-amber-100/60 border border-[#C5A059] px-3 py-2 flex items-center justify-between gap-2 text-right transition cursor-pointer"
+                      >
+                        <div className="flex items-center gap-2">
+                          <Clock className="w-4 h-4 text-[#9A7428] shrink-0" />
+                          <div>
+                            <div className="text-[11px] font-extrabold text-[#0B192C]">
+                              ثبت بازنگری ساعت آغاز یا خاتمه شیفت امروز (با انتخاب ساعت دلخواه)
+                            </div>
+                            <div className="text-[9.5px] text-slate-600">
+                              در صورت عدم ثبت به‌موقع ورود صبح، ساعت شروع را اکنون ثبت و شیفت را فعال نمایید (بدون الزام به درج هم‌زمان ساعت پایان)
+                            </div>
+                          </div>
+                        </div>
+                        {showTodayFlexibleForm ? (
+                          <ChevronUp className="w-4 h-4 text-[#9A7428] shrink-0" />
+                        ) : (
+                          <ChevronDown className="w-4 h-4 text-[#9A7428] shrink-0" />
+                        )}
+                      </button>
+
+                      {showTodayFlexibleForm && (
+                        <form
+                          onSubmit={handleTodayFlexibleClockSubmit}
+                          className="mt-2 rounded-2xl bg-[#FCF9F2] border border-[#C5A059] p-3.5 space-y-3"
+                        >
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                            {[
+                              {
+                                id: 'START_ONLY' as FlexibleClockEntryMode,
+                                title: 'ثبت صرفاً ساعت آغاز شیفت (فعال‌سازی حضور در جریان)',
+                              },
+                              {
+                                id: 'END_ONLY' as FlexibleClockEntryMode,
+                                title: 'ثبت تکمیلی ساعت خاتمه کار (بستن شیفت فعال)',
+                              },
+                              {
+                                id: 'FULL_SHIFT' as FlexibleClockEntryMode,
+                                title: 'ثبت یکپارچه ساعت آغاز و خاتمه نوبت کاری',
+                              },
+                            ].map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => setTodayFlexMode(m.id)}
+                                className={`min-h-[36px] rounded-xl border px-2.5 py-1.5 text-[10.5px] font-bold transition cursor-pointer ${
+                                  todayFlexMode === m.id
+                                    ? 'bg-[#0B192C] text-[#C5A059] border-[#C5A059] shadow-2xs'
+                                    : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                                }`}
+                              >
+                                {m.title}
+                              </button>
+                            ))}
+                          </div>
+
+                          <div className="rounded-xl bg-white/90 border border-[#C5A059]/45 px-3 py-2 text-[10.5px] text-slate-700 leading-5">
+                            {todayFlexMode === 'START_ONLY' && (
+                              <span>
+                                <strong>نحوه عملکرد:</strong> با ثبت ساعت آغاز شیفت برای امروز (بدون نیاز به وارد کردن ساعت پایان)، نوبت کاری شما در داشبورد <strong>«فعال و در جریان»</strong> می‌شود و پس از اتمام کار می‌توانید دکمه <strong>«پایان کار»</strong> داشبورد را بزنید یا ساعت خروج را دستی ثبت نمایید.
+                              </span>
+                            )}
+                            {todayFlexMode === 'END_ONLY' && (
+                              <span>
+                                <strong>نحوه عملکرد:</strong> ساعت خاتمه کار برای نوبت کاری فعال امروز ثبت شده و شیفت کاری بسته و محاسبه می‌گردد.
+                              </span>
+                            )}
+                            {todayFlexMode === 'FULL_SHIFT' && (
+                              <span>
+                                <strong>نحوه عملکرد:</strong> ساعت آغاز و خاتمه نوبت کاری امروز به‌طور کامل در کارکرد روزانه ثبت می‌گردد.
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-start">
+                            {(todayFlexMode === 'START_ONLY' || todayFlexMode === 'FULL_SHIFT') && (
+                              <TimePickerInput
+                                label="ساعت آغاز به کار (ورود)"
+                                value={todayFlexCheckIn}
+                                onChange={setTodayFlexCheckIn}
+                              />
+                            )}
+
+                            {(todayFlexMode === 'END_ONLY' || todayFlexMode === 'FULL_SHIFT') && (
+                              <TimePickerInput
+                                label="ساعت خاتمه کار (خروج)"
+                                value={todayFlexCheckOut}
+                                onChange={setTodayFlexCheckOut}
+                              />
+                            )}
+
+                            <div className={todayFlexMode === 'FULL_SHIFT' ? '' : 'sm:col-span-2'}>
+                              <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                                توضیحات تردد یا علت تأخیر (اختیاری)
+                              </label>
+                              <input
+                                type="text"
+                                value={todayFlexNote}
+                                onChange={(e) => setTodayFlexNote(e.target.value)}
+                                placeholder="توضیح تکمیلی..."
+                                className="w-full min-h-[40px] rounded-xl border border-slate-200 bg-white px-3 text-xs"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setShowTodayFlexibleForm(false)}
+                              className="min-h-[36px] px-3.5 rounded-xl bg-white border border-slate-200 text-slate-600 text-[11px] font-bold cursor-pointer"
+                            >
+                              بستن
+                            </button>
+                            <button
+                              type="submit"
+                              disabled={actionLoading}
+                              className="min-h-[36px] px-4 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-[11px] font-bold cursor-pointer"
+                            >
+                              {actionLoading
+                                ? 'در حال ثبت...'
+                                : todayFlexMode === 'START_ONLY'
+                                  ? 'ثبت ساعت آغاز و فعال‌سازی شیفت در جریان'
+                                  : todayFlexMode === 'END_ONLY'
+                                    ? 'ثبت ساعت خاتمه و بستن شیفت کاری'
+                                    : 'ثبت کامل نوبت کاری امروز'}
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                    </div>
+
                     {/* خلاصه تردد امروز */}
                     {liveState?.today_summary && (
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1.5 border-t border-slate-100">
@@ -1760,9 +2005,46 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                       })}
                     </div>
 
+                    {(pastEntryType === 'WORK' || pastEntryType === 'MISSION') && (
+                      <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/60 p-2.5 space-y-2">
+                        <div className="text-[11px] font-bold text-[#0B192C]">
+                          شیوه ثبت تردد (امکان ثبت ساعت آغاز به کار بدون الزام به تکمیل هم‌زمان ساعت پایان):
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                          {[
+                            {
+                              id: 'FULL_SHIFT' as FlexibleClockEntryMode,
+                              label: 'ثبت کامل نوبت کاری (ورود و خروج)',
+                            },
+                            {
+                              id: 'START_ONLY' as FlexibleClockEntryMode,
+                              label: 'ثبت صرفاً ساعت آغاز شیفت (فعال و در جریان)',
+                            },
+                            {
+                              id: 'END_ONLY' as FlexibleClockEntryMode,
+                              label: 'ثبت تکمیلی ساعت خاتمه کار (بستن شیفت باز)',
+                            },
+                          ].map((modeItem) => (
+                            <button
+                              key={modeItem.id}
+                              type="button"
+                              onClick={() => setPastWorkEntryMode(modeItem.id)}
+                              className={`min-h-[34px] rounded-lg border px-2 py-1 text-[10.5px] font-bold transition cursor-pointer ${
+                                pastWorkEntryMode === modeItem.id
+                                  ? 'bg-[#0B192C] text-[#C5A059] border-[#C5A059]'
+                                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                              }`}
+                            >
+                              {modeItem.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-start">
                       <ShamsiDatePicker
-                        label="تاریخ روز مورد نظر"
+                        label="تاریخ روز مورد نظر (امروز یا روزهای قبل)"
                         value={pastWorkDate}
                         onChange={setPastWorkDate}
                         todayShamsi={serverShamsiDate}
@@ -1770,16 +2052,35 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
 
                       {pastEntryType === 'WORK' || pastEntryType === 'MISSION' ? (
                         <>
-                          <TimePickerInput
-                            label={pastEntryType === 'MISSION' ? 'ساعت شروع مأموریت' : 'ساعت ورود'}
-                            value={pastCheckIn}
-                            onChange={setPastCheckIn}
-                          />
-                          <TimePickerInput
-                            label={pastEntryType === 'MISSION' ? 'ساعت پایان مأموریت' : 'ساعت خروج'}
-                            value={pastCheckOut}
-                            onChange={setPastCheckOut}
-                          />
+                          {(pastWorkEntryMode === 'FULL_SHIFT' ||
+                            pastWorkEntryMode === 'START_ONLY') && (
+                            <TimePickerInput
+                              label={
+                                pastEntryType === 'MISSION'
+                                  ? 'ساعت شروع مأموریت'
+                                  : 'ساعت آغاز به کار (ورود)'
+                              }
+                              value={pastCheckIn}
+                              onChange={setPastCheckIn}
+                            />
+                          )}
+                          {(pastWorkEntryMode === 'FULL_SHIFT' ||
+                            pastWorkEntryMode === 'END_ONLY') && (
+                            <TimePickerInput
+                              label={
+                                pastEntryType === 'MISSION'
+                                  ? 'ساعت پایان مأموریت'
+                                  : 'ساعت خاتمه کار (خروج)'
+                              }
+                              value={pastCheckOut}
+                              onChange={setPastCheckOut}
+                            />
+                          )}
+                          {pastWorkEntryMode === 'START_ONLY' && (
+                            <div className="rounded-xl bg-emerald-50/80 border border-emerald-200 p-2.5 text-[10.5px] text-emerald-950 leading-5">
+                              نوبت کاری با ساعت ورود انتخابی <strong>فعال</strong> می‌شود و نیازی به درج هم‌زمان ساعت پایان نیست. پایان کار را می‌توانید بعداً از داشبورد یا به‌صورت دستی ثبت کنید.
+                            </div>
+                          )}
                         </>
                       ) : pastEntryType === 'HOURLY_LEAVE' ? (
                         <>
@@ -2132,7 +2433,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                               {rep.activity_description}
                             </p>
                             {rep.photo_url && (
-                              <div className="pt-1">
+                              <div className="pt-1 flex flex-wrap items-center gap-2">
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -2151,6 +2452,18 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                                   />
                                   <Eye className="w-3.5 h-3.5 text-[#9A7428]" />
                                   <span>مشاهده تصویر کار انجام‌شده</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={actionLoading}
+                                  onClick={() =>
+                                    handleWorkerDeleteMediaItem('REPORT_PHOTO', rep.id, rep.photo_url!)
+                                  }
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[10.5px] font-bold cursor-pointer"
+                                  title="حذف تصویر جهت آزادسازی فضای هاست (متن گزارش حفظ می‌شود)"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                  <span>حذف تصویر پیوست</span>
                                 </button>
                               </div>
                             )}
@@ -2553,8 +2866,21 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                             </div>
                           </div>
                           <p className="text-[11px] text-slate-700">{tx.description}</p>
+                          {tx.settlement_mode === 'INSTALLMENT' &&
+                            tx.monthly_deduction_toman &&
+                            tx.monthly_deduction_toman > 0 && (
+                              <div className="rounded-lg bg-indigo-50/90 border border-indigo-200 px-2.5 py-1.5 text-[10.5px] font-bold text-indigo-950 tabular-nums">
+                                سیاست تسویه: استهلاک تدریجی و کسر خودکار ماهانه — سهم هر دوره:{' '}
+                                {formatToman(tx.monthly_deduction_toman)} (طی{' '}
+                                {toPersianDigits(
+                                  tx.installment_count ||
+                                    Math.ceil(tx.amount_toman / tx.monthly_deduction_toman)
+                                )}{' '}
+                                دوره ماهانه)
+                              </div>
+                            )}
                           {tx.receipt_file_url && (
-                            <div className="pt-0.5">
+                            <div className="pt-0.5 flex flex-wrap items-center gap-2">
                               <button
                                 type="button"
                                 onClick={() =>
@@ -2567,6 +2893,22 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                               >
                                 <Eye className="w-3 h-3 text-[#9A7428]" />
                                 <span>پیش‌نمایش فاکتور / رسید</span>
+                              </button>
+                              <button
+                                type="button"
+                                disabled={actionLoading}
+                                onClick={() =>
+                                  handleWorkerDeleteMediaItem(
+                                    'FINANCE_RECEIPT',
+                                    tx.id,
+                                    tx.receipt_file_url!
+                                  )
+                                }
+                                className="inline-flex items-center gap-1 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 px-2 py-1 text-[10.5px] font-bold text-rose-700 cursor-pointer"
+                                title="حذف فایل رسید جهت آزادسازی فضای هاست (مبلغ و شرح مالی حفظ می‌شود)"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>حذف فایل رسید</span>
                               </button>
                             </div>
                           )}
@@ -2601,7 +2943,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
           {activeTab === 'settings' && (
             <div className="space-y-3.5">
               {/* کارت‌های کوچک و رنگی در بخش تنظیمات پرسنل */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                 {[
                   {
                     id: 'profile' as const,
@@ -2614,6 +2956,12 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                     title: 'کارکرد روزهای قبل',
                     subtitle: 'ثبت با ورود/خروج و اکسل',
                     icon: FileSpreadsheet,
+                  },
+                  {
+                    id: 'storage_cleanup' as const,
+                    title: 'فضای هاست و فایل‌ها',
+                    subtitle: 'پاکسازی صوت و تصاویر',
+                    icon: HardDrive,
                   },
                   {
                     id: 'contract' as const,
@@ -2655,6 +3003,11 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                   );
                 })}
               </div>
+
+              {/* زیرتب مدیریت فضای ذخیره‌سازی هاست و پاکسازی فایل‌های چندرسانه‌ای */}
+              {workerSettingsSubTab === 'storage_cleanup' && (
+                <MediaStorageCleanupPanel role="worker" onDataChanged={loadAllWorkerData} />
+              )}
 
               {/* زیرتب ۱: تصویر پروفایل، تغییر رمز عبور و ورود سریع */}
               {workerSettingsSubTab === 'profile' && (
