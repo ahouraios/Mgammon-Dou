@@ -80,7 +80,10 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
   isOvertimeActive,
 }) => {
   const { isNotificationActive } = useNotificationStatus();
-  const effectiveBannerUrl = bannerBgUrl || '/assets/media/banner-bg.svg';
+  const effectiveBannerUrl =
+    !bannerBgUrl || bannerBgUrl === '/assets/media/banner-bg.svg'
+      ? '/assets/media/banner-bg.webp'
+      : bannerBgUrl;
   const defaultAvatar =
     role === 'manager' ? '/assets/media/manager-avatar.svg' : '/assets/media/worker-avatar.svg';
 
@@ -94,7 +97,14 @@ export const HeroBanner: React.FC<HeroBannerProps> = ({
         alt="Mgammon"
         referrerPolicy="no-referrer"
         onError={(e) => {
-          (e.currentTarget as HTMLImageElement).src = '/assets/media/banner-bg.svg';
+          const img = e.currentTarget as HTMLImageElement;
+          if (!img.dataset.triedUploads) {
+            img.dataset.triedUploads = '1';
+            img.src = '/uploads/banner-bg.webp';
+          } else if (!img.dataset.triedRoot) {
+            img.dataset.triedRoot = '1';
+            img.src = '/banner-bg.webp';
+          }
         }}
         className="absolute inset-0 w-full h-full object-cover opacity-45"
       />

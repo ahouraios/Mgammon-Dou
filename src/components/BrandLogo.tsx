@@ -80,10 +80,21 @@ export const BrandLogo: React.FC<BrandLogoProps> = ({ size = 'md', badgeCount })
         </div>
       ) : (
         <img
-          src="/uploads/logo.png"
+          src="/uploads/logo.webp"
           alt="Mgammon"
           referrerPolicy="no-referrer"
-          onError={() => setImgError(true)}
+          onError={(e) => {
+            const img = e.currentTarget as HTMLImageElement;
+            if (!img.dataset.triedMedia) {
+              img.dataset.triedMedia = '1';
+              img.src = '/assets/media/logo.webp';
+            } else if (!img.dataset.triedRoot) {
+              img.dataset.triedRoot = '1';
+              img.src = '/logo.webp';
+            } else {
+              setImgError(true);
+            }
+          }}
           className={`${dimensions} rounded-2xl object-contain bg-[#0B192C] border border-[#C5A059]/60 p-1 shadow-sm shrink-0`}
         />
       )}

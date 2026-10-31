@@ -30,7 +30,7 @@ export default function App() {
   const [initializing, setInitializing] = useState(true);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [serverShamsiDate, setServerShamsiDate] = useState('1405/07/30');
-  const [bannerBgUrl, setBannerBgUrl] = useState<string | null>('/assets/media/banner-bg.svg');
+  const [bannerBgUrl, setBannerBgUrl] = useState<string | null>('/assets/media/banner-bg.webp');
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // فرم ورود
@@ -281,35 +281,23 @@ export default function App() {
           <div className="max-w-md mx-auto px-4 py-8">
             <div className="rounded-3xl bg-white border border-[#C5A059]/60 p-5 sm:p-7 space-y-5 shadow-sm">
               {/* بنر بالای کارت ورود */}
-              <div className="relative overflow-hidden rounded-2xl bg-[#0B192C] border border-[#C5A059]/60 p-5 text-center text-white">
+              <div className="overflow-hidden rounded-2xl bg-[#0B192C] border border-[#C5A059]/60">
                 <img
-                  src={bannerBgUrl || '/assets/media/banner-bg.svg'}
-                  alt="Mgammon Banner"
+                  src="/assets/media/start_baner.webp"
+                  alt="Mgammon"
                   referrerPolicy="no-referrer"
                   onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).src = '/assets/media/banner-bg.svg';
+                    const img = e.currentTarget as HTMLImageElement;
+                    if (!img.dataset.triedUploads) {
+                      img.dataset.triedUploads = '1';
+                      img.src = '/uploads/start_baner.webp';
+                    } else if (!img.dataset.triedRoot) {
+                      img.dataset.triedRoot = '1';
+                      img.src = '/start_baner.webp';
+                    }
                   }}
-                  className="absolute inset-0 w-full h-full object-cover opacity-50"
+                  className="w-full h-auto object-cover block"
                 />
-                <div className="relative z-10 flex flex-col items-center space-y-2">
-                  <BrandLogo size="lg" />
-                  <h1 className="text-xl font-extrabold tracking-tight text-white">
-                    Mgammon
-                  </h1>
-                  <p className="text-xs text-[#C5A059] font-medium">
-                    سامانه مدیریت کارکرد و حقوق پرسنل
-                  </p>
-                  <div className="w-16 h-px bg-[#C5A059]/60 my-1" />
-                  <div className="text-[11px] text-slate-300 flex items-center gap-2">
-                    <span>
-                      مدیریت: <strong>مجید نورایی</strong>
-                    </span>
-                    <span className="text-[#C5A059]">·</span>
-                    <span>
-                      پرسنل: <strong>امید میثمی</strong>
-                    </span>
-                  </div>
-                </div>
               </div>
 
               {loginError && (
@@ -434,47 +422,6 @@ export default function App() {
                   {loginLoading ? 'در حال ورود...' : 'ورود به سامانه'}
                 </button>
               </form>
-
-              {/* انتخاب سریع نام کاربری */}
-              <div className="pt-3.5 border-t border-slate-100 space-y-2">
-                <div className="text-[11px] font-medium text-slate-500 text-center">
-                  انتخاب سریع نام کاربری:
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUsername('manager');
-                      try {
-                        if (rememberMe) {
-                          localStorage.setItem(REMEMBERED_USERNAME_KEY, 'manager');
-                        }
-                      } catch {
-                        // ignore
-                      }
-                    }}
-                    className="min-h-[40px] px-2.5 py-1.5 rounded-xl border border-[#C5A059]/50 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] bg-white transition-colors cursor-pointer"
-                  >
-                    مدیریت: مجید نورایی
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setUsername('worker');
-                      try {
-                        if (rememberMe) {
-                          localStorage.setItem(REMEMBERED_USERNAME_KEY, 'worker');
-                        }
-                      } catch {
-                        // ignore
-                      }
-                    }}
-                    className="min-h-[40px] px-2.5 py-1.5 rounded-xl border border-[#C5A059]/50 hover:border-[#C5A059] text-[11px] font-semibold text-[#0B192C] bg-white transition-colors cursor-pointer"
-                  >
-                    پرسنل: امید میثمی
-                  </button>
-                </div>
-              </div>
             </div>
 
             <ForgotPasswordModal

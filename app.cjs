@@ -1068,7 +1068,7 @@ async function initializeDatabase() {
             rules_confirmed_by_manager,
             effective_from_shamsi,
             banner_bg_url
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'PERCENTAGE', 140.00, NULL, '1405/06/15', 2.5, 0, ?, '/assets/media/banner-bg.svg')`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'PERCENTAGE', 140.00, NULL, '1405/06/15', 2.5, 0, ?, '/assets/media/banner-bg.webp')`,
           [
             "07:00",
             "15:00",
@@ -1195,7 +1195,7 @@ function mapRowToSystemSettings(row) {
     worker_phone_number: String(row.worker_phone_number || ""),
     rules_confirmed_by_manager: Boolean(row.rules_confirmed_by_manager),
     effective_from_shamsi: String(row.effective_from_shamsi || "1405/06/15"),
-    banner_bg_url: row.banner_bg_url ? String(row.banner_bg_url) : "/assets/media/banner-bg.svg",
+    banner_bg_url: row.banner_bg_url && String(row.banner_bg_url) !== "/assets/media/banner-bg.svg" ? String(row.banner_bg_url) : "/assets/media/banner-bg.webp",
     updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : void 0
   };
 }
@@ -3213,7 +3213,7 @@ apiRouter.get("/health", async (_req, res) => {
       ok: true,
       dbConnected: true,
       serverTime: nowInfo,
-      bannerBgUrl: settings.banner_bg_url || "/assets/media/banner-bg.svg"
+      bannerBgUrl: settings.banner_bg_url || "/assets/media/banner-bg.webp"
     });
   } catch {
     const nowInfo = getNowInTimezone("Asia/Tehran");
@@ -3221,7 +3221,7 @@ apiRouter.get("/health", async (_req, res) => {
       ok: true,
       dbConnected: true,
       serverTime: nowInfo,
-      bannerBgUrl: "/assets/media/banner-bg.svg"
+      bannerBgUrl: "/assets/media/banner-bg.webp"
     });
   }
 });

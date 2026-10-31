@@ -664,7 +664,7 @@ apiRouter.get('/health', async (_req, res) => {
       ok: true,
       dbConnected: true,
       serverTime: nowInfo,
-      bannerBgUrl: settings.banner_bg_url || '/assets/media/banner-bg.svg',
+      bannerBgUrl: settings.banner_bg_url || '/assets/media/banner-bg.webp',
     });
   } catch {
     const nowInfo = getNowInTimezone('Asia/Tehran');
@@ -672,7 +672,7 @@ apiRouter.get('/health', async (_req, res) => {
       ok: true,
       dbConnected: true,
       serverTime: nowInfo,
-      bannerBgUrl: '/assets/media/banner-bg.svg',
+      bannerBgUrl: '/assets/media/banner-bg.webp',
     });
   }
 });
