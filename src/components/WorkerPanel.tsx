@@ -79,9 +79,11 @@ import {
   Trash2,
   CheckSquare,
   HardDrive,
+  AlarmClock,
 } from 'lucide-react';
 import { SHAMSI_MONTH_NAMES } from '../shared/jalali';
 import { MediaStorageCleanupPanel } from './MediaStorageCleanupPanel';
+import { RemindersSection } from './RemindersSection';
 
 interface WorkerPanelProps {
   user: UserProfile;
@@ -371,7 +373,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
     'today_clock' | 'calendar_history' | 'past_work' | 'leaves'
   >('today_clock');
   const [workerReportsCard, setWorkerReportsCard] = useState<
-    'new_report' | 'pending_tasks' | 'archive'
+    'new_report' | 'pending_tasks' | 'archive' | 'reminders'
   >('new_report');
   const [workerFinanceCard, setWorkerFinanceCard] = useState<
     'statement' | 'new_expense' | 'history'
@@ -2193,10 +2195,10 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
             </div>
           )}
 
-          {/* ================= تب ۲: برنامه‌های کاری و گزارش کار روزانه با کارت‌های کوچک و رنگی ================= */}
+          {/* ================= تب ۲: برنامه‌های کاری، گزارش کار روزانه و یادآوری‌ها با کارت‌های کوچک و رنگی ================= */}
           {activeTab === 'reports' && (
             <div className="space-y-3.5">
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 {[
                   {
                     id: 'new_report' as const,
@@ -2224,6 +2226,15 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                     activeBg: 'bg-gradient-to-br from-blue-600 to-indigo-700 text-white border-blue-600 shadow-sm',
                     idleBg: 'bg-blue-50/90 hover:bg-blue-100/80 text-blue-950 border-blue-200',
                     iconClass: 'bg-blue-600/15 text-blue-700',
+                  },
+                  {
+                    id: 'reminders' as const,
+                    title: 'یادآوری زمان‌بندی‌شده',
+                    subtitle: 'تعیین تاریخ، ساعت و تکرار',
+                    icon: AlarmClock,
+                    activeBg: 'bg-gradient-to-br from-amber-600 to-yellow-600 text-white border-amber-600 shadow-sm',
+                    idleBg: 'bg-amber-50/90 hover:bg-amber-100/80 text-amber-950 border-amber-200',
+                    iconClass: 'bg-amber-600/15 text-amber-800',
                   },
                 ].map((card) => {
                   const Icon = card.icon;
@@ -2267,6 +2278,10 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                   );
                 })}
               </div>
+
+              {workerReportsCard === 'reminders' && (
+                <RemindersSection role="worker" currentShamsiDate={serverShamsiDate} />
+              )}
 
               {workerReportsCard === 'pending_tasks' && (
                 <DailyTasksChecklist

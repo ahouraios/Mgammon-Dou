@@ -314,3 +314,32 @@ CREATE TABLE IF NOT EXISTS `audit_logs` (
   KEY `idx_audit_entity` (`target_entity`, `target_id`),
   CONSTRAINT `fk_audit_actor` FOREIGN KEY (`actor_user_id`) REFERENCES `users` (`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ۱۳. جدول یادآوری‌های شخصی و کاری زمان‌بندی‌شده (با الگوی تکرار و تعداد دفعات قابل تنظیم)
+CREATE TABLE IF NOT EXISTS `user_reminders` (
+  `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `user_id` INT UNSIGNED NOT NULL,
+  `created_by_user_id` INT UNSIGNED NOT NULL,
+  `target_scope` ENUM('SELF', 'WORKER', 'BOTH') NOT NULL DEFAULT 'SELF',
+  `title` VARCHAR(255) NOT NULL,
+  `message_text` TEXT NOT NULL,
+  `shamsi_date` VARCHAR(10) NOT NULL,
+  `reminder_time` VARCHAR(5) NOT NULL DEFAULT '09:00',
+  `repeat_type` ENUM('ONCE', 'SAME_DAY_INTERVAL', 'DAILY', 'EVERY_N_DAYS', 'WEEKLY', 'MONTHLY') NOT NULL DEFAULT 'ONCE',
+  `repeat_count` INT UNSIGNED NOT NULL DEFAULT 1,
+  `repeat_interval_minutes` INT UNSIGNED NOT NULL DEFAULT 15,
+  `triggered_count` INT UNSIGNED NOT NULL DEFAULT 0,
+  `next_trigger_shamsi` VARCHAR(10) NOT NULL,
+  `next_trigger_time` VARCHAR(5) NOT NULL DEFAULT '09:00',
+  `last_triggered_at` DATETIME NULL DEFAULT NULL,
+  `is_completed` TINYINT(1) NOT NULL DEFAULT 0,
+  `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_reminders_user_active` (`user_id`, `is_active`, `is_completed`),
+  KEY `idx_reminders_next_trigger` (`next_trigger_shamsi`, `next_trigger_time`),
+  CONSTRAINT `fk_reminders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_reminders_creator` FOREIGN KEY (`created_by_user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+

@@ -12,13 +12,18 @@ import {
   ShieldAlert,
   Eye,
   EyeOff,
+  Lock,
 } from 'lucide-react';
 import { UserProfile } from '../shared/types';
 import { apiRequest, withAuthTokenUrl } from '../services/api';
 import {
+  AppLockConfig,
   disableDeviceBiometric,
+  getAppLockConfig,
   getStoredBiometricInfo,
   registerDeviceBiometric,
+  saveAppLockConfig,
+  triggerImmediateAppLock,
 } from '../services/biometric';
 import { CameraCaptureModal } from './CameraCaptureModal';
 
@@ -78,6 +83,21 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
     type: 'success' | 'error';
     text: string;
   } | null>(null);
+
+  const [lockConfig, setLockConfig] = useState<AppLockConfig>(() => getAppLockConfig());
+  const [showLockPin, setShowLockPin] = useState(false);
+  const [lockFeedback, setLockFeedback] = useState<string | null>(null);
+
+  const handleSaveLockConfig = (e: React.FormEvent) => {
+    e.preventDefault();
+    const saved = saveAppLockConfig(lockConfig);
+    setLockConfig(saved);
+    setLockFeedback(
+      saved.enabled
+        ? `تنظیمات قفل خودکار ذخیره شد (قفل شدن پس از ${saved.timeoutMinutes} دقیقه عدم استفاده).`
+        : 'قفل خودکار برنامه غیرفعال شد.'
+    );
+  };
 
   const defaultAvatar =
     user.role === 'manager'
@@ -631,6 +651,124 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
           </div>
         </div>
 
+        {/* کارت تنظیمات قفل خودکار صفحه (با اثر انگشت / تشخیص چهره / رمز) */}
+        <form
+          onSubmit={handleSaveLockConfig}
+          className="rounded-2xl bg-white border border-[#C5A059]/60 p-5 space-y-3.5"
+        >
+          <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-3">
+            <div className="flex items-center gap-2">
+              <Lock className="w-4 h-4 text-[#9A7428]" />
+              <h4 className="text-sm font-bold text-[#0B192C]">
+                قفل خودکار برنامه (اثر انگشت / چهره / رمز)
+              </h4>
+            </div>
+            <button
+              type="button"
+              onClick={triggerImmediateAppLock}
+              className="min-h-[32px] px-3 rounded-xl bg-[#FCF9F2] hover:bg-[#C5A059]/20 text-[#0B192C] border border-[#C5A059] text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+            >
+              <Lock className="w-3 h-3 text-[#9A7428]" />
+              <span>قفل فوری همین حالا</span>
+            </button>
+          </div>
+
+          <p className="text-xs text-slate-600 leading-relaxed">
+            در صورت عدم استفاده از برنامه پس از زمان تعیین‌شده، صفحه به‌صورت خودکار قفل می‌شود و با{' '}
+            <strong className="text-[#0B192C]">اثر انگشت، تشخیص چهره یا رمز</strong> بازگشایی می‌گردد.
+          </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                وضعیت قفل خودکار و زمان عدم فعالیت
+              </label>
+              <select
+                value={lockConfig.enabled ? String(lockConfig.timeoutMinutes) : 'OFF'}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === 'OFF') {
+                    const updated = saveAppLockConfig({ ...lockConfig, enabled: false });
+                    setLockConfig(updated);
+                  } else {
+                    const updated = saveAppLockConfig({
+                      ...lockConfig,
+                      enabled: true,
+                      timeoutMinutes: Number(val) || 5,
+                    });
+                    setLockConfig(updated);
+                  }
+                }}
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 px-3 text-xs font-bold text-[#0B192C] bg-white focus:outline-none focus:border-[#0B192C]"
+              >
+                <option value="1">فعال — قفل پس از ۱ دقیقه عدم استفاده</option>
+                <option value="3">فعال — قفل پس از ۳ دقیقه عدم استفاده</option>
+                <option value="5">فعال — قفل پس از ۵ دقیقه عدم استفاده</option>
+                <option value="10">فعال — قفل پس از ۱۰ دقیقه عدم استفاده</option>
+                <option value="15">فعال — قفل پس از ۱۵ دقیقه عدم استفاده</option>
+                <option value="30">فعال — قفل پس از ۳۰ دقیقه عدم استفاده</option>
+                <option value="OFF">غیرفعال (عدم قفل خودکار)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                رمز دلخواه بازگشایی سریع قفل (اختیاری)
+              </label>
+              <div className="relative">
+                <input
+                  type={showLockPin ? 'text' : 'password'}
+                  dir="ltr"
+                  value={lockConfig.customPin}
+                  onChange={(e) =>
+                    setLockConfig((prev) => ({ ...prev, customPin: e.target.value }))
+                  }
+                  placeholder="مثلاً رمز ۴ رقمی (یا خالی = رمز حساب)"
+                  className="w-full min-h-[42px] rounded-xl border border-slate-200 pl-9 pr-3 text-xs text-right focus:outline-none focus:border-[#0B192C]"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowLockPin((p) => !p)}
+                  className="absolute inset-y-0 left-0 flex items-center px-2.5 text-slate-400 hover:text-[#0B192C] cursor-pointer"
+                >
+                  {showLockPin ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={lockConfig.lockOnBackground}
+                onChange={(e) => {
+                  const updated = saveAppLockConfig({
+                    ...lockConfig,
+                    lockOnBackground: e.target.checked,
+                  });
+                  setLockConfig(updated);
+                }}
+                className="w-4 h-4 rounded border-slate-300 accent-[#0B192C] cursor-pointer"
+              />
+              <span>قفل شدن خودکار هنگام بسته شدن موقت صفحه در گوشی</span>
+            </label>
+
+            <button
+              type="submit"
+              className="min-h-[38px] px-4 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059] text-xs font-bold cursor-pointer"
+            >
+              ذخیره تنظیمات قفل
+            </button>
+          </div>
+
+          {lockFeedback && (
+            <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-2.5 text-xs font-medium text-emerald-900">
+              {lockFeedback}
+            </div>
+          )}
+        </form>
+
         {user.role === 'manager' && (
           <div className="rounded-2xl bg-white border border-slate-200 p-5 space-y-3">
             <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
@@ -692,6 +830,14 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
               >
                 <DatabaseBackup className="w-4 h-4 text-[#9A7428]" />
                 <span>فایل پشتیبان کامل</span>
+              </a>
+              <a
+                href={withAuthTokenUrl('/api/manager/deploy-package')}
+                download="mgammon-duo-cpanel-deploy.zip"
+                className="min-h-[42px] px-3.5 rounded-xl border border-[#C5A059] bg-white text-[#0B192C] text-xs font-bold flex items-center gap-1.5 hover:bg-[#FCF9F2]"
+              >
+                <Download className="w-4 h-4 text-[#9A7428]" />
+                <span>دانلود پکیج آماده نصب cPanel (ZIP)</span>
               </a>
             </div>
           </div>

@@ -344,3 +344,115 @@ export function numberToPersianTomanWords(input: string | number): string {
 
   return `${groups.join(' و ')} تومان`;
 }
+
+/**
+ * افزودن تعداد مشخصی روز به یک تاریخ شمسی YYYY/MM/DD
+ */
+export function addDaysToShamsi(shamsiDateStr: string, daysToAdd: number): string {
+  const gregStr = shamsiToGregorian(shamsiDateStr);
+  const [gy, gm, gd] = gregStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(gy, gm - 1, gd + Math.round(daysToAdd), 12, 0, 0));
+  const nextGreg = `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+  return gregorianToShamsi(nextGreg);
+}
+
+/**
+ * افزودن تعداد مشخصی ماه شمسی به یک تاریخ شمسی YYYY/MM/DD (با رعایت طول ماه مقصد)
+ */
+export function addMonthsToShamsi(shamsiDateStr: string, monthsToAdd: number): string {
+  const clean = normalizeShamsiDate(shamsiDateStr);
+  const [jy, jm, jd] = clean.split('/').map(Number);
+  const totalMonths = (jy * 12 + (jm - 1)) + Math.round(monthsToAdd);
+  const nextJy = Math.floor(totalMonths / 12);
+  const nextJm = (totalMonths % 12) + 1;
+  const maxDays = jalaali.jalaaliMonthLength(nextJy, nextJm);
+  const nextJd = Math.min(jd, maxDays);
+  return `${nextJy}/${pad2(nextJm)}/${pad2(nextJd)}`;
+}
+
+/**
+ * محاسبه زمان سررسید بعدی یک یادآوری بر اساس الگوی تکرار و تعداد دفعات انجام‌شده
+ */
+export function computeNextReminderOccurrence(params: {
+  currentTriggerShamsi: string;
+  currentTriggerTime: string;
+  baseReminderTime: string;
+  repeatType: 'ONCE' | 'SAME_DAY_INTERVAL' | 'DAILY' | 'EVERY_N_DAYS' | 'WEEKLY' | 'MONTHLY';
+  repeatCount: number;
+  repeatIntervalMinutes: number;
+  newTriggeredCount: number;
+}): {
+  isCompleted: boolean;
+  nextTriggerShamsi: string;
+  nextTriggerTime: string;
+} {
+  const safeRepeatCount = Math.max(1, Math.round(params.repeatCount || 1));
+  if (params.repeatType === 'ONCE' || params.newTriggeredCount >= safeRepeatCount) {
+    return {
+      isCompleted: true,
+      nextTriggerShamsi: params.currentTriggerShamsi,
+      nextTriggerTime: params.currentTriggerTime,
+    };
+  }
+
+  if (params.repeatType === 'SAME_DAY_INTERVAL') {
+    const intervalMins = Math.max(1, Math.round(params.repeatIntervalMinutes || 15));
+    const currentMins = parseTimeToMinutes(params.currentTriggerTime);
+    const nextTotalMins = currentMins + intervalMins;
+    const daysOverflow = Math.floor(nextTotalMins / 1440);
+    const wrappedMins = ((nextTotalMins % 1440) + 1440) % 1440;
+    const nextHH = pad2(Math.floor(wrappedMins / 60));
+    const nextMM = pad2(wrappedMins % 60);
+    const nextDate =
+      daysOverflow > 0
+        ? addDaysToShamsi(params.currentTriggerShamsi, daysOverflow)
+        : params.currentTriggerShamsi;
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: nextDate,
+      nextTriggerTime: `${nextHH}:${nextMM}`,
+    };
+  }
+
+  const baseHHMM = params.baseReminderTime.slice(0, 5);
+
+  if (params.repeatType === 'DAILY') {
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addDaysToShamsi(params.currentTriggerShamsi, 1),
+      nextTriggerTime: baseHHMM,
+    };
+  }
+
+  if (params.repeatType === 'EVERY_N_DAYS') {
+    const daysStep = Math.max(1, Math.round(params.repeatIntervalMinutes || 2));
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addDaysToShamsi(params.currentTriggerShamsi, daysStep),
+      nextTriggerTime: baseHHMM,
+    };
+  }
+
+  if (params.repeatType === 'WEEKLY') {
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addDaysToShamsi(params.currentTriggerShamsi, 7),
+      nextTriggerTime: baseHHMM,
+    };
+  }
+
+  if (params.repeatType === 'MONTHLY') {
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addMonthsToShamsi(params.currentTriggerShamsi, 1),
+      nextTriggerTime: baseHHMM,
+    };
+  }
+
+  return {
+    isCompleted: true,
+    nextTriggerShamsi: params.currentTriggerShamsi,
+    nextTriggerTime: params.currentTriggerTime,
+  };
+}
+

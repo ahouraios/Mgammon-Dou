@@ -375,3 +375,36 @@ export interface MediaStorageSummary {
 }
 
 export type FlexibleClockEntryMode = 'START_ONLY' | 'END_ONLY' | 'FULL_SHIFT';
+
+export type ReminderRepeatType =
+  | 'ONCE'
+  | 'SAME_DAY_INTERVAL'
+  | 'DAILY'
+  | 'EVERY_N_DAYS'
+  | 'WEEKLY'
+  | 'MONTHLY';
+
+export type ReminderTargetScope = 'SELF' | 'WORKER' | 'BOTH';
+
+export interface UserReminderItem {
+  id: number;
+  user_id: number;
+  created_by_user_id: number;
+  creator_role?: UserRole;
+  target_scope: ReminderTargetScope;
+  title: string;
+  message_text: string;
+  shamsi_date: string; // YYYY/MM/DD
+  reminder_time: string; // HH:MM
+  repeat_type: ReminderRepeatType;
+  repeat_count: number; // تعداد کل دفعات تکرار
+  repeat_interval_minutes: number; // فاصله دقیقه در تکرار همان روز یا فاصله روز در EVERY_N_DAYS
+  triggered_count: number; // تعداد دفعاتی که تاکنون یادآوری شده است
+  next_trigger_shamsi: string; // YYYY/MM/DD
+  next_trigger_time: string; // HH:MM
+  last_triggered_at: string | null;
+  is_completed: boolean;
+  is_active: boolean;
+  created_at: string;
+}
+

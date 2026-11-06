@@ -80,8 +80,10 @@ import {
   ChevronUp,
   HelpCircle,
   HardDrive,
+  AlarmClock,
 } from 'lucide-react';
 import { MediaStorageCleanupPanel } from './MediaStorageCleanupPanel';
+import { RemindersSection } from './RemindersSection';
 
 type ManagerTab =
   | 'dashboard'
@@ -102,7 +104,7 @@ type ManagerDashCard =
   | 'chart';
 
 type ManagerAttCard = 'calendar' | 'daily_table' | 'leaves' | 'manual_excel';
-type ManagerRepCard = 'daily_reports' | 'tasks_checklist';
+type ManagerRepCard = 'daily_reports' | 'tasks_checklist' | 'reminders';
 type ManagerFinCard = 'transactions' | 'add_payment' | 'monthly_statement';
 
 const DEFAULT_MANAGER_SETTINGS: SystemSettings = {
@@ -4205,11 +4207,11 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             </div>
           )}
 
-          {/* ================= تب ۳: برنامه‌های کاری و گزارش‌های روزانه ================= */}
+          {/* ================= تب ۳: برنامه‌های کاری، گزارش‌های روزانه و یادآوری‌ها ================= */}
           {activeTab === 'reports' && (
             <div className="space-y-4">
               {/* کارت‌های انتخاب بخش در تب گزارش‌ها */}
-              <div className="grid grid-cols-2 gap-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                 <button
                   type="button"
                   onClick={() => setActiveRepCard('daily_reports')}
@@ -4261,11 +4263,44 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                     </div>
                   </div>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveRepCard('reminders')}
+                  className={`rounded-2xl p-3 text-right border transition-all cursor-pointer flex flex-col justify-between min-h-[74px] ${
+                    activeRepCard === 'reminders'
+                      ? 'bg-gradient-to-br from-[#0B192C] to-[#1b3556] text-[#C5A059] border-[#C5A059] shadow-md'
+                      : 'bg-gradient-to-br from-[#FCF9F2] via-white to-amber-50/70 text-[#0B192C] border-[#C5A059]/60 hover:border-[#C5A059]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <AlarmClock className="w-4 h-4 shrink-0" />
+                    <span className="text-[10px] font-bold">یادآوری هوشمند</span>
+                  </div>
+                  <div className="mt-1.5">
+                    <div className="text-xs font-extrabold">یادآوری‌های زمان‌بندی‌شده</div>
+                    <div
+                      className={`text-[10px] truncate ${
+                        activeRepCard === 'reminders' ? 'text-amber-100' : 'text-slate-500'
+                      }`}
+                    >
+                      تعیین روز، ساعت، متن دلخواه و الگوی تکرار
+                    </div>
+                  </div>
+                </button>
               </div>
 
               {/* ۱. برنامه‌های کاری محول‌شده از طرف مدیر به پرسنل */}
               {activeRepCard === 'tasks_checklist' && (
                 <DailyTasksChecklist
+                  role="manager"
+                  currentShamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
+                />
+              )}
+
+              {/* ۱-ب. بخش یادآوری‌های هوشمند و زمان‌بندی‌شده */}
+              {activeRepCard === 'reminders' && (
+                <RemindersSection
                   role="manager"
                   currentShamsiDate={effectiveDashboard.serverTime.shamsiDate || initialShamsiDate}
                 />

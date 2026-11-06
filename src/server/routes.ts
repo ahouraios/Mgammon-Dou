@@ -57,14 +57,18 @@ import {
   MediaStorageItem,
   MediaStorageSummary,
   OvertimeCalcMode,
+  ReminderRepeatType,
+  ReminderTargetScope,
   SettlementMode,
   SystemSettings,
+  UserReminderItem,
   UserRole,
   WorkCorrespondence,
   WorkTaskItem,
   FlexibleClockEntryMode,
 } from '../shared/types';
 import {
+  computeNextReminderOccurrence,
   formatDurationPersian,
   getDayOfWeekFromGregorian,
   getNowInTimezone,
@@ -73,6 +77,7 @@ import {
   isValidShamsiDate,
   isValidTimeHHMMOrHHMMSS,
   normalizeShamsiDate,
+  pad2,
   parseTimeToMinutes,
   shamsiToGregorian,
   toEnglishDigits,
@@ -1108,6 +1113,48 @@ apiRouter.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Re
       serverTime: nowInfo,
       settings: sanitizeSettingsForRole(settings, req.user!.role),
     });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+/**
+ * بررسی رمز عبور حساب کاربری جهت بازگشایی قفل خودکار صفحه (بدون خروج از نشست)
+ */
+apiRouter.post('/auth/verify-unlock', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const password = String(req.body?.password || '');
+    if (!password) {
+      res.status(400).json({ ok: false, message: 'لطفاً رمز را وارد نمایید.' });
+      return;
+    }
+
+    const pool = getPool();
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT password_hash FROM users WHERE id = ? AND is_active = 1 LIMIT 1',
+      [req.user!.id]
+    );
+
+    if (rows.length === 0) {
+      res.status(401).json({ ok: false, message: 'حساب کاربری معتبر نیست.' });
+      return;
+    }
+
+    const hash = String(rows[0].password_hash);
+    let match = await bcrypt.compare(password, hash);
+    if (!match) {
+      const normalized = toEnglishDigits(password).trim();
+      if (normalized !== password) {
+        match = await bcrypt.compare(normalized, hash);
+      }
+    }
+
+    if (!match) {
+      res.status(401).json({ ok: false, message: 'رمز واردشده صحیح نیست.' });
+      return;
+    }
+
+    res.json({ ok: true, unlocked: true });
   } catch (err) {
     handleServerError(res, err);
   }
@@ -4637,6 +4684,446 @@ apiRouter.delete('/tasks/:id', requireAuth, requireRole('manager'), async (req: 
   }
 });
 
+// ============================================================================
+// ۵-ب. یادآوری‌های شخصی و کاری زمان‌بندی‌شده (با الگوی تکرار و تعداد دفعات دلخواه)
+// ============================================================================
+const ALLOWED_REMINDER_REPEAT_TYPES: Set<ReminderRepeatType> = new Set([
+  'ONCE',
+  'SAME_DAY_INTERVAL',
+  'DAILY',
+  'EVERY_N_DAYS',
+  'WEEKLY',
+  'MONTHLY',
+]);
+
+function mapRowToUserReminder(row: mysql.RowDataPacket): UserReminderItem {
+  return {
+    id: Number(row.id),
+    user_id: Number(row.user_id),
+    created_by_user_id: Number(row.created_by_user_id),
+    creator_role: row.creator_role === 'manager' ? 'manager' : 'worker',
+    target_scope:
+      row.target_scope === 'WORKER' || row.target_scope === 'BOTH' ? row.target_scope : 'SELF',
+    title: String(row.title || ''),
+    message_text: String(row.message_text || ''),
+    shamsi_date: String(row.shamsi_date || ''),
+    reminder_time: String(row.reminder_time || '09:00').slice(0, 5),
+    repeat_type: ALLOWED_REMINDER_REPEAT_TYPES.has(row.repeat_type) ? row.repeat_type : 'ONCE',
+    repeat_count: Math.max(1, Number(row.repeat_count || 1)),
+    repeat_interval_minutes: Math.max(1, Number(row.repeat_interval_minutes || 15)),
+    triggered_count: Math.max(0, Number(row.triggered_count || 0)),
+    next_trigger_shamsi: String(row.next_trigger_shamsi || row.shamsi_date || ''),
+    next_trigger_time: String(row.next_trigger_time || row.reminder_time || '09:00').slice(0, 5),
+    last_triggered_at: row.last_triggered_at ? new Date(row.last_triggered_at).toISOString() : null,
+    is_completed: Boolean(row.is_completed),
+    is_active: Boolean(row.is_active),
+    created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+  };
+}
+
+apiRouter.get('/reminders', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const pool = getPool();
+    const settings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(settings.timezone);
+
+    let sql = `
+      SELECT r.*, u.role AS creator_role
+      FROM user_reminders r
+      LEFT JOIN users u ON u.id = r.created_by_user_id
+    `;
+    const params: (number | string)[] = [];
+
+    if (req.user!.role === 'manager') {
+      sql += ' WHERE r.user_id = ? OR r.created_by_user_id = ?';
+      params.push(req.user!.id, req.user!.id);
+    } else {
+      sql += " WHERE r.user_id = ? OR r.target_scope IN ('WORKER', 'BOTH')";
+      params.push(req.user!.id);
+    }
+
+    sql += ' ORDER BY r.is_completed ASC, r.next_trigger_shamsi ASC, r.next_trigger_time ASC, r.id DESC LIMIT 200';
+
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(sql, params);
+    res.json({
+      ok: true,
+      serverTime: {
+        shamsiDate: nowInfo.shamsiDate,
+        timeHHMM: nowInfo.timeHHMM,
+      },
+      reminders: rows.map(mapRowToUserReminder),
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+apiRouter.post('/reminders', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const rawTitle = String(req.body?.title || '').trim();
+    const rawMessage = String(req.body?.message_text || '').trim();
+    const messageText = rawMessage || rawTitle;
+    const title = rawTitle || messageText.slice(0, 80);
+
+    if (!messageText) {
+      res.status(400).json({ ok: false, message: 'متن یادآوری الزامی است.' });
+      return;
+    }
+
+    const settings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(settings.timezone);
+
+    const rawShamsi = String(req.body?.shamsi_date || '').trim();
+    const shamsiDate =
+      rawShamsi && isValidShamsiDate(rawShamsi) ? normalizeShamsiDate(rawShamsi) : nowInfo.shamsiDate;
+
+    const rawTime = toEnglishDigits(String(req.body?.reminder_time || '')).trim().slice(0, 5);
+    const reminderTime = isValidTimeHHMMOrHHMMSS(rawTime, false) ? rawTime : nowInfo.timeHHMM;
+
+    const rawRepeatType = String(req.body?.repeat_type || 'ONCE').trim() as ReminderRepeatType;
+    const repeatType: ReminderRepeatType = ALLOWED_REMINDER_REPEAT_TYPES.has(rawRepeatType)
+      ? rawRepeatType
+      : 'ONCE';
+
+    const repeatCount =
+      repeatType === 'ONCE'
+        ? 1
+        : Math.min(365, Math.max(1, Math.round(Number(req.body?.repeat_count) || 2)));
+
+    const repeatIntervalMinutes = Math.min(
+      1440,
+      Math.max(1, Math.round(Number(req.body?.repeat_interval_minutes) || 15))
+    );
+
+    const rawScope = String(req.body?.target_scope || 'SELF').trim() as ReminderTargetScope;
+    const targetScope: ReminderTargetScope =
+      req.user!.role === 'manager' && (rawScope === 'WORKER' || rawScope === 'BOTH')
+        ? rawScope
+        : 'SELF';
+
+    const pool = getPool();
+    let targetUserId = req.user!.id;
+    if (req.user!.role === 'manager' && targetScope === 'WORKER') {
+      const workerInfo = await getWorkerInfo(pool);
+      targetUserId = workerInfo.id;
+    }
+
+    const [ins] = await pool.execute<mysql.ResultSetHeader>(
+      `INSERT INTO user_reminders (
+        user_id,
+        created_by_user_id,
+        target_scope,
+        title,
+        message_text,
+        shamsi_date,
+        reminder_time,
+        repeat_type,
+        repeat_count,
+        repeat_interval_minutes,
+        triggered_count,
+        next_trigger_shamsi,
+        next_trigger_time,
+        is_completed,
+        is_active
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 1)`,
+      [
+        targetUserId,
+        req.user!.id,
+        targetScope,
+        title.slice(0, 250),
+        messageText.slice(0, 2000),
+        shamsiDate,
+        reminderTime,
+        repeatType,
+        repeatCount,
+        repeatIntervalMinutes,
+        shamsiDate,
+        reminderTime,
+      ]
+    );
+
+    res.status(201).json({
+      ok: true,
+      id: ins.insertId,
+      message: 'یادآوری جدید با موفقیت زمان‌بندی و ثبت شد.',
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+apiRouter.put('/reminders/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const reminderId = Number(req.params.id);
+    if (!reminderId) {
+      res.status(400).json({ ok: false, message: 'شناسه یادآوری معتبر نیست.' });
+      return;
+    }
+
+    const pool = getPool();
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT * FROM user_reminders WHERE id = ? LIMIT 1',
+      [reminderId]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ ok: false, message: 'یادآوری مورد نظر یافت نشد.' });
+      return;
+    }
+
+    const existing = rows[0];
+    if (
+      req.user!.role !== 'manager' &&
+      Number(existing.user_id) !== req.user!.id &&
+      Number(existing.created_by_user_id) !== req.user!.id
+    ) {
+      res.status(403).json({ ok: false, message: 'مجوز ویرایش این یادآوری را ندارید.' });
+      return;
+    }
+
+    const rawTitle = String(req.body?.title ?? existing.title ?? '').trim();
+    const rawMessage = String(req.body?.message_text ?? existing.message_text ?? '').trim();
+    const messageText = rawMessage || rawTitle;
+    const title = rawTitle || messageText.slice(0, 80);
+
+    if (!messageText) {
+      res.status(400).json({ ok: false, message: 'متن یادآوری الزامی است.' });
+      return;
+    }
+
+    const rawShamsi = String(req.body?.shamsi_date || existing.shamsi_date).trim();
+    const shamsiDate = isValidShamsiDate(rawShamsi)
+      ? normalizeShamsiDate(rawShamsi)
+      : String(existing.shamsi_date);
+
+    const rawTime = toEnglishDigits(String(req.body?.reminder_time || existing.reminder_time))
+      .trim()
+      .slice(0, 5);
+    const reminderTime = isValidTimeHHMMOrHHMMSS(rawTime, false)
+      ? rawTime
+      : String(existing.reminder_time).slice(0, 5);
+
+    const rawRepeatType = String(
+      req.body?.repeat_type || existing.repeat_type
+    ).trim() as ReminderRepeatType;
+    const repeatType: ReminderRepeatType = ALLOWED_REMINDER_REPEAT_TYPES.has(rawRepeatType)
+      ? rawRepeatType
+      : 'ONCE';
+
+    const repeatCount =
+      repeatType === 'ONCE'
+        ? 1
+        : Math.min(365, Math.max(1, Math.round(Number(req.body?.repeat_count) || 2)));
+
+    const repeatIntervalMinutes = Math.min(
+      1440,
+      Math.max(1, Math.round(Number(req.body?.repeat_interval_minutes) || 15))
+    );
+
+    const rawScope = String(
+      req.body?.target_scope || existing.target_scope
+    ).trim() as ReminderTargetScope;
+    const targetScope: ReminderTargetScope =
+      req.user!.role === 'manager' && (rawScope === 'WORKER' || rawScope === 'BOTH')
+        ? rawScope
+        : 'SELF';
+
+    await pool.execute(
+      `UPDATE user_reminders
+       SET target_scope = ?,
+           title = ?,
+           message_text = ?,
+           shamsi_date = ?,
+           reminder_time = ?,
+           repeat_type = ?,
+           repeat_count = ?,
+           repeat_interval_minutes = ?,
+           triggered_count = 0,
+           next_trigger_shamsi = ?,
+           next_trigger_time = ?,
+           is_completed = 0,
+           is_active = 1
+       WHERE id = ?`,
+      [
+        targetScope,
+        title.slice(0, 250),
+        messageText.slice(0, 2000),
+        shamsiDate,
+        reminderTime,
+        repeatType,
+        repeatCount,
+        repeatIntervalMinutes,
+        shamsiDate,
+        reminderTime,
+        reminderId,
+      ]
+    );
+
+    res.json({
+      ok: true,
+      message: 'یادآوری با موفقیت بروزرسانی و فعال شد.',
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+
+apiRouter.post(
+  '/reminders/:id/acknowledge',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const reminderId = Number(req.params.id);
+      if (!reminderId) {
+        res.status(400).json({ ok: false, message: 'شناسه یادآوری معتبر نیست.' });
+        return;
+      }
+
+      const action = String(req.body?.action || 'ACKNOWLEDGE').trim();
+      const pool = getPool();
+      const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+        'SELECT * FROM user_reminders WHERE id = ? LIMIT 1',
+        [reminderId]
+      );
+      if (rows.length === 0) {
+        res.status(404).json({ ok: false, message: 'یادآوری یافت نشد.' });
+        return;
+      }
+
+      const row = rows[0];
+      const reminder = mapRowToUserReminder(row);
+
+      if (action === 'SNOOZE_10M') {
+        const settings = await getSystemSettingsFromDb();
+        const nowInfo = getNowInTimezone(settings.timezone);
+        const nowMins = parseTimeToMinutes(nowInfo.timeHHMM);
+        const snoozedTotal = nowMins + 10;
+        const wrappedMins = snoozedTotal % 1440;
+        const nextTime = `${pad2(Math.floor(wrappedMins / 60))}:${pad2(wrappedMins % 60)}`;
+        await pool.execute(
+          `UPDATE user_reminders
+           SET next_trigger_shamsi = ?, next_trigger_time = ?, is_completed = 0, is_active = 1
+           WHERE id = ?`,
+          [nowInfo.shamsiDate, nextTime, reminderId]
+        );
+        res.json({
+          ok: true,
+          message: 'یادآوری برای ۱۰ دقیقه دیگر تنظیم شد.',
+        });
+        return;
+      }
+
+      if (action === 'COMPLETE_ALL') {
+        await pool.execute(
+          `UPDATE user_reminders
+           SET is_completed = 1, triggered_count = repeat_count, last_triggered_at = NOW()
+           WHERE id = ?`,
+          [reminderId]
+        );
+        res.json({
+          ok: true,
+          message: 'یادآوری به عنوان انجام‌شده در آرشیو ثبت گردید.',
+        });
+        return;
+      }
+
+      if (action === 'REACTIVATE') {
+        const settings = await getSystemSettingsFromDb();
+        const nowInfo = getNowInTimezone(settings.timezone);
+        const nextDate =
+          reminder.shamsi_date >= nowInfo.shamsiDate ? reminder.shamsi_date : nowInfo.shamsiDate;
+        await pool.execute(
+          `UPDATE user_reminders
+           SET triggered_count = 0,
+               next_trigger_shamsi = ?,
+               next_trigger_time = ?,
+               is_completed = 0,
+               is_active = 1
+           WHERE id = ?`,
+          [nextDate, reminder.reminder_time, reminderId]
+        );
+        res.json({
+          ok: true,
+          message: 'یادآوری مجدداً فعال شد.',
+        });
+        return;
+      }
+
+      // ACKNOWLEDGE (ثبت نوبت فعلی و محاسبه نوبت بعدی بر اساس الگوی تکرار)
+      const newTriggeredCount = reminder.triggered_count + 1;
+      const nextSchedule = computeNextReminderOccurrence({
+        currentTriggerShamsi: reminder.next_trigger_shamsi,
+        currentTriggerTime: reminder.next_trigger_time,
+        baseReminderTime: reminder.reminder_time,
+        repeatType: reminder.repeat_type,
+        repeatCount: reminder.repeat_count,
+        repeatIntervalMinutes: reminder.repeat_interval_minutes,
+        newTriggeredCount,
+      });
+
+      await pool.execute(
+        `UPDATE user_reminders
+         SET triggered_count = ?,
+             next_trigger_shamsi = ?,
+             next_trigger_time = ?,
+             is_completed = ?,
+             last_triggered_at = NOW()
+         WHERE id = ?`,
+        [
+          newTriggeredCount,
+          nextSchedule.nextTriggerShamsi,
+          nextSchedule.nextTriggerTime,
+          nextSchedule.isCompleted ? 1 : 0,
+          reminderId,
+        ]
+      );
+
+      res.json({
+        ok: true,
+        isCompleted: nextSchedule.isCompleted,
+        nextTriggerShamsi: nextSchedule.nextTriggerShamsi,
+        nextTriggerTime: nextSchedule.nextTriggerTime,
+        triggeredCount: newTriggeredCount,
+        message: nextSchedule.isCompleted
+          ? 'تمام نوبت‌های این یادآوری به پایان رسید و در آرشیو ثبت شد.'
+          : `نوبت ${toPersianDigits(newTriggeredCount)} ثبت شد؛ یادآوری بعدی در ${toPersianDigits(nextSchedule.nextTriggerShamsi)} ساعت ${toPersianDigits(nextSchedule.nextTriggerTime)} انجام می‌شود.`,
+      });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
+apiRouter.delete(
+  '/reminders/:id',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const reminderId = Number(req.params.id);
+      const pool = getPool();
+      const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+        'SELECT * FROM user_reminders WHERE id = ? LIMIT 1',
+        [reminderId]
+      );
+      if (rows.length === 0) {
+        res.status(404).json({ ok: false, message: 'یادآوری یافت نشد.' });
+        return;
+      }
+      if (
+        req.user!.role !== 'manager' &&
+        Number(rows[0].user_id) !== req.user!.id &&
+        Number(rows[0].created_by_user_id) !== req.user!.id
+      ) {
+        res.status(403).json({ ok: false, message: 'مجوز حذف این یادآوری را ندارید.' });
+        return;
+      }
+      await pool.execute('DELETE FROM user_reminders WHERE id = ?', [reminderId]);
+      res.json({ ok: true, message: 'یادآوری حذف شد.' });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
 /**
  * ثبت رؤیت گزارش‌ها یا درخواست‌ها توسط مدیر
  */
@@ -6515,6 +7002,7 @@ apiRouter.get(
       const [reports] = await pool.execute('SELECT * FROM daily_work_reports');
       const [tasks] = await pool.execute('SELECT * FROM work_tasks');
       const [correspondences] = await pool.execute('SELECT * FROM work_correspondences');
+      const [reminders] = await pool.execute('SELECT * FROM user_reminders');
 
       const backupPayload = {
         exported_at: new Date().toISOString(),
@@ -6527,11 +7015,38 @@ apiRouter.get(
         reports,
         tasks,
         correspondences,
+        reminders,
       };
 
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="mgammon-backup.json"');
       res.send(JSON.stringify(backupPayload, null, 2));
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+
+apiRouter.get(
+  '/manager/deploy-package',
+  requireAuth,
+  requireRole('manager'),
+  (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const zipPath = path.resolve(process.cwd(), 'mgammon-duo-cpanel-deploy.zip');
+      if (!fs.existsSync(zipPath)) {
+        res.status(404).json({
+          ok: false,
+          message: 'فایل بسته نصبی cPanel یافت نشد.',
+        });
+        return;
+      }
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="mgammon-duo-cpanel-deploy.zip"'
+      );
+      res.sendFile(zipPath);
     } catch (err) {
       handleServerError(res, err);
     }

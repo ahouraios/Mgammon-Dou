@@ -324,6 +324,15 @@ async function checkDatabaseConnection() {
     };
   }
   if (!isDatabaseInitialized()) {
+    await waitForPendingDatabaseInit();
+  }
+  if (!isDatabaseInitialized() && process.env.VITEST !== "true") {
+    try {
+      await initializeDatabase();
+    } catch {
+    }
+  }
+  if (!isDatabaseInitialized()) {
     return {
       connected: false,
       initialized: false,
@@ -824,6 +833,58 @@ var SCHEMA_MIGRATIONS = [
         "sms_on_task_and_message",
         "TINYINT(1) NOT NULL DEFAULT 0"
       );
+      await ensureColumnExists(
+        p,
+        "financial_transactions",
+        "settlement_mode",
+        "ENUM('LUMP_SUM', 'INSTALLMENT') NOT NULL DEFAULT 'LUMP_SUM'"
+      );
+      await ensureColumnExists(
+        p,
+        "financial_transactions",
+        "monthly_deduction_toman",
+        "DECIMAL(15, 0) NULL DEFAULT NULL"
+      );
+      await ensureColumnExists(
+        p,
+        "financial_transactions",
+        "installment_count",
+        "INT UNSIGNED NULL DEFAULT NULL"
+      );
+      await ensureColumnExists(
+        p,
+        "financial_transactions",
+        "installment_start_shamsi",
+        "VARCHAR(10) NULL DEFAULT NULL"
+      );
+      await p.query(`
+        CREATE TABLE IF NOT EXISTS \`user_reminders\` (
+          \`id\` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+          \`user_id\` INT UNSIGNED NOT NULL,
+          \`created_by_user_id\` INT UNSIGNED NOT NULL,
+          \`target_scope\` ENUM('SELF', 'WORKER', 'BOTH') NOT NULL DEFAULT 'SELF',
+          \`title\` VARCHAR(255) NOT NULL,
+          \`message_text\` TEXT NOT NULL,
+          \`shamsi_date\` VARCHAR(10) NOT NULL,
+          \`reminder_time\` VARCHAR(5) NOT NULL DEFAULT '09:00',
+          \`repeat_type\` ENUM('ONCE', 'SAME_DAY_INTERVAL', 'DAILY', 'EVERY_N_DAYS', 'WEEKLY', 'MONTHLY') NOT NULL DEFAULT 'ONCE',
+          \`repeat_count\` INT UNSIGNED NOT NULL DEFAULT 1,
+          \`repeat_interval_minutes\` INT UNSIGNED NOT NULL DEFAULT 15,
+          \`triggered_count\` INT UNSIGNED NOT NULL DEFAULT 0,
+          \`next_trigger_shamsi\` VARCHAR(10) NOT NULL,
+          \`next_trigger_time\` VARCHAR(5) NOT NULL DEFAULT '09:00',
+          \`last_triggered_at\` DATETIME NULL DEFAULT NULL,
+          \`is_completed\` TINYINT(1) NOT NULL DEFAULT 0,
+          \`is_active\` TINYINT(1) NOT NULL DEFAULT 1,
+          \`created_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          \`updated_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (\`id\`),
+          KEY \`idx_reminders_user_active\` (\`user_id\`, \`is_active\`, \`is_completed\`),
+          KEY \`idx_reminders_next_trigger\` (\`next_trigger_shamsi\`, \`next_trigger_time\`),
+          CONSTRAINT \`fk_reminders_user\` FOREIGN KEY (\`user_id\`) REFERENCES \`users\` (\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_reminders_creator\` FOREIGN KEY (\`created_by_user_id\`) REFERENCES \`users\` (\`id\`) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
     }
   }
 ];
@@ -2036,6 +2097,83 @@ function formatMinutesToDurationPersian(totalMinutes) {
   return `${toPersianDigits(hours)} \u0633\u0627\u0639\u062A \u0648 ${toPersianDigits(mins)} \u062F\u0642\u06CC\u0642\u0647`;
 }
 var formatDurationPersian = formatMinutesToDurationPersian;
+function addDaysToShamsi(shamsiDateStr, daysToAdd) {
+  const gregStr = shamsiToGregorian(shamsiDateStr);
+  const [gy, gm, gd] = gregStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(gy, gm - 1, gd + Math.round(daysToAdd), 12, 0, 0));
+  const nextGreg = `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+  return gregorianToShamsi(nextGreg);
+}
+function addMonthsToShamsi(shamsiDateStr, monthsToAdd) {
+  const clean = normalizeShamsiDate(shamsiDateStr);
+  const [jy, jm, jd] = clean.split("/").map(Number);
+  const totalMonths = jy * 12 + (jm - 1) + Math.round(monthsToAdd);
+  const nextJy = Math.floor(totalMonths / 12);
+  const nextJm = totalMonths % 12 + 1;
+  const maxDays = jalaali.jalaaliMonthLength(nextJy, nextJm);
+  const nextJd = Math.min(jd, maxDays);
+  return `${nextJy}/${pad2(nextJm)}/${pad2(nextJd)}`;
+}
+function computeNextReminderOccurrence(params) {
+  const safeRepeatCount = Math.max(1, Math.round(params.repeatCount || 1));
+  if (params.repeatType === "ONCE" || params.newTriggeredCount >= safeRepeatCount) {
+    return {
+      isCompleted: true,
+      nextTriggerShamsi: params.currentTriggerShamsi,
+      nextTriggerTime: params.currentTriggerTime
+    };
+  }
+  if (params.repeatType === "SAME_DAY_INTERVAL") {
+    const intervalMins = Math.max(1, Math.round(params.repeatIntervalMinutes || 15));
+    const currentMins = parseTimeToMinutes(params.currentTriggerTime);
+    const nextTotalMins = currentMins + intervalMins;
+    const daysOverflow = Math.floor(nextTotalMins / 1440);
+    const wrappedMins = (nextTotalMins % 1440 + 1440) % 1440;
+    const nextHH = pad2(Math.floor(wrappedMins / 60));
+    const nextMM = pad2(wrappedMins % 60);
+    const nextDate = daysOverflow > 0 ? addDaysToShamsi(params.currentTriggerShamsi, daysOverflow) : params.currentTriggerShamsi;
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: nextDate,
+      nextTriggerTime: `${nextHH}:${nextMM}`
+    };
+  }
+  const baseHHMM = params.baseReminderTime.slice(0, 5);
+  if (params.repeatType === "DAILY") {
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addDaysToShamsi(params.currentTriggerShamsi, 1),
+      nextTriggerTime: baseHHMM
+    };
+  }
+  if (params.repeatType === "EVERY_N_DAYS") {
+    const daysStep = Math.max(1, Math.round(params.repeatIntervalMinutes || 2));
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addDaysToShamsi(params.currentTriggerShamsi, daysStep),
+      nextTriggerTime: baseHHMM
+    };
+  }
+  if (params.repeatType === "WEEKLY") {
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addDaysToShamsi(params.currentTriggerShamsi, 7),
+      nextTriggerTime: baseHHMM
+    };
+  }
+  if (params.repeatType === "MONTHLY") {
+    return {
+      isCompleted: false,
+      nextTriggerShamsi: addMonthsToShamsi(params.currentTriggerShamsi, 1),
+      nextTriggerTime: baseHHMM
+    };
+  }
+  return {
+    isCompleted: true,
+    nextTriggerShamsi: params.currentTriggerShamsi,
+    nextTriggerTime: params.currentTriggerTime
+  };
+}
 
 // src/shared/calculationEngine.ts
 function normalizeTimeHHMMSS(raw) {
@@ -2559,6 +2697,90 @@ function calculateLateAndAbsenceRates(settings) {
     isCustomAbsenceRate: customAbsenceRate !== null
   };
 }
+function getFinancialCycleYearMonthForShamsiDate(shamsiDate, anchorDay = 15, collabStartShamsi = "1405/06/15", calendarMode = false) {
+  const norm = isValidShamsiDate(shamsiDate) ? normalizeShamsiDate(shamsiDate) : "1405/08/01";
+  const [jy, jm, jd] = norm.split("/").map(Number);
+  if (calendarMode) {
+    return { jy, jm };
+  }
+  const safeAnchor = Math.min(29, Math.max(1, Math.round(Number(anchorDay) || 15)));
+  const normCollab = isValidShamsiDate(collabStartShamsi) ? normalizeShamsiDate(collabStartShamsi) : "1405/06/15";
+  if (jd > safeAnchor || jd === safeAnchor && norm <= normCollab) {
+    return { jy, jm };
+  }
+  const prevJm = jm === 1 ? 12 : jm - 1;
+  const prevJy = jm === 1 ? jy - 1 : jy;
+  return { jy: prevJy, jm: prevJm };
+}
+function calculateCumulativeFinancialSummaryAsOf(params) {
+  const {
+    transactions = [],
+    currentShamsiDate,
+    collabStartShamsi = "1405/06/15",
+    anchorDay = 15
+  } = params;
+  const normNow = isValidShamsiDate(currentShamsiDate) ? normalizeShamsiDate(currentShamsiDate) : "1405/08/01";
+  const curCycleKey = getMonthlyCycleKeyForShamsiDate(normNow, anchorDay);
+  const [curJy, curJm] = curCycleKey.split("/").map(Number);
+  let approvedTotalGrossToman = 0;
+  let approvedMaturedReceivedToman = 0;
+  let approvedPettyCashToman = 0;
+  let unamortizedDeferredDebtToman = 0;
+  let activeInstallmentsCount = 0;
+  let pendingTotalToman = 0;
+  let pendingCount = 0;
+  for (const tx of transactions) {
+    const amt = Math.max(0, Math.round(Number(tx.amount_toman) || 0));
+    if (amt <= 0) continue;
+    if (tx.status === "PENDING") {
+      pendingTotalToman += amt;
+      pendingCount += 1;
+      continue;
+    }
+    if (tx.status !== "APPROVED") {
+      continue;
+    }
+    approvedTotalGrossToman += amt;
+    if (tx.tx_type === "PETTY_CASH") {
+      approvedPettyCashToman += amt;
+      continue;
+    }
+    const isInstallment = tx.settlement_mode === "INSTALLMENT" && tx.monthly_deduction_toman && Number(tx.monthly_deduction_toman) > 0;
+    if (!isInstallment) {
+      approvedMaturedReceivedToman += amt;
+    } else {
+      const monthlyInst = Math.max(
+        1,
+        Math.min(amt, Math.round(Number(tx.monthly_deduction_toman) || amt))
+      );
+      const startShamsi = tx.installment_start_shamsi && isValidShamsiDate(tx.installment_start_shamsi) ? normalizeShamsiDate(tx.installment_start_shamsi) : isValidShamsiDate(tx.shamsi_date) ? normalizeShamsiDate(tx.shamsi_date) : normNow;
+      const startCycle = getFinancialCycleYearMonthForShamsiDate(
+        startShamsi,
+        anchorDay,
+        collabStartShamsi,
+        false
+      );
+      const rawDiff = (curJy - startCycle.jy) * 12 + (curJm - startCycle.jm);
+      const effectiveElapsedCycles = startShamsi <= normNow ? Math.max(1, rawDiff + 1) : Math.max(0, rawDiff + 1);
+      const maturedAmt = Math.min(amt, effectiveElapsedCycles * monthlyInst);
+      const unamortizedAmt = Math.max(0, amt - maturedAmt);
+      approvedMaturedReceivedToman += maturedAmt;
+      if (unamortizedAmt > 0) {
+        unamortizedDeferredDebtToman += unamortizedAmt;
+        activeInstallmentsCount += 1;
+      }
+    }
+  }
+  return {
+    approvedTotalGrossToman,
+    approvedMaturedReceivedToman,
+    approvedPettyCashToman,
+    unamortizedDeferredDebtToman,
+    activeInstallmentsCount,
+    pendingTotalToman,
+    pendingCount
+  };
+}
 
 // src/server/melipayamak.ts
 var MELIPAYAMAK_ERROR_CODES = {
@@ -2919,6 +3141,56 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
     sizeBytes: buffer.length
   };
 }
+function getBaseMediaDirPath() {
+  return process.env.PRIVATE_MEDIA_DIR ? import_path3.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path3.default.resolve(process.cwd(), ".data/private_media");
+}
+function resolveMediaDiskPath(fileUrl) {
+  if (typeof fileUrl !== "string") return null;
+  const trimmed = fileUrl.trim();
+  if (!trimmed.startsWith("/assets/media/")) return null;
+  const relPart = trimmed.slice("/assets/media/".length);
+  const parts = relPart.split("/").filter(Boolean);
+  if (parts.length !== 2) return null;
+  const [subFolder, fileName] = parts;
+  const allowedFolders = ["avatars", "attachments", "excel", "audio", "receipts", "reports"];
+  if (!allowedFolders.includes(subFolder)) return null;
+  const safeFileName = import_path3.default.basename(fileName);
+  if (!safeFileName || safeFileName !== fileName || safeFileName.includes("..")) return null;
+  const baseDir = getBaseMediaDirPath();
+  const fullPath = import_path3.default.resolve(baseDir, subFolder, safeFileName);
+  if (!fullPath.startsWith(baseDir + import_path3.default.sep)) return null;
+  return fullPath;
+}
+function getMediaFileInfoOnDisk(fileUrl) {
+  const fullPath = resolveMediaDiskPath(fileUrl);
+  if (!fullPath) return { exists: false, sizeBytes: 0, mtimeIso: null };
+  try {
+    if (!import_fs3.default.existsSync(fullPath)) return { exists: false, sizeBytes: 0, mtimeIso: null };
+    const stat = import_fs3.default.statSync(fullPath);
+    if (!stat.isFile()) return { exists: false, sizeBytes: 0, mtimeIso: null };
+    return {
+      exists: true,
+      sizeBytes: stat.size,
+      mtimeIso: stat.mtime.toISOString()
+    };
+  } catch {
+    return { exists: false, sizeBytes: 0, mtimeIso: null };
+  }
+}
+function unlinkMediaUrlFromDisk(fileUrl) {
+  const fullPath = resolveMediaDiskPath(fileUrl);
+  if (!fullPath) return 0;
+  try {
+    if (!import_fs3.default.existsSync(fullPath)) return 0;
+    const stat = import_fs3.default.statSync(fullPath);
+    if (!stat.isFile()) return 0;
+    const size = stat.size;
+    import_fs3.default.unlinkSync(fullPath);
+    return size;
+  } catch {
+    return 0;
+  }
+}
 function extractSqlDateString(val, fallbackShamsi) {
   if (typeof val === "string" && /^\d{4}-\d{2}-\d{2}/.test(val.trim())) {
     return val.trim().slice(0, 10);
@@ -2959,6 +3231,10 @@ function mapRowToAttendanceLog(row) {
 }
 function mapRowToFinancialTx(row) {
   const txDate = extractSqlDateString(row.tx_date, row.shamsi_date);
+  const rawSettlement = String(row.settlement_mode || "LUMP_SUM").trim();
+  const settlementMode = rawSettlement === "INSTALLMENT" ? "INSTALLMENT" : "LUMP_SUM";
+  const monthlyDeductionToman = row.monthly_deduction_toman !== null && row.monthly_deduction_toman !== void 0 && Number(row.monthly_deduction_toman) > 0 ? Number(row.monthly_deduction_toman) : null;
+  const installmentCount = row.installment_count !== null && row.installment_count !== void 0 && Number(row.installment_count) > 0 ? Number(row.installment_count) : monthlyDeductionToman && monthlyDeductionToman > 0 ? Math.max(1, Math.ceil(Number(row.amount_toman) / monthlyDeductionToman)) : null;
   return {
     id: Number(row.id),
     user_id: Number(row.user_id),
@@ -2977,6 +3253,10 @@ function mapRowToFinancialTx(row) {
     reviewed_by_user_id: row.reviewed_by_user_id ? Number(row.reviewed_by_user_id) : null,
     reviewed_at: row.reviewed_at ? new Date(row.reviewed_at).toISOString() : null,
     manager_note: row.manager_note ? String(row.manager_note) : null,
+    settlement_mode: settlementMode,
+    monthly_deduction_toman: monthlyDeductionToman,
+    installment_count: installmentCount,
+    installment_start_shamsi: row.installment_start_shamsi ? String(row.installment_start_shamsi) : null,
     idempotency_key: row.idempotency_key ? String(row.idempotency_key) : null,
     created_at: row.created_at ? new Date(row.created_at).toISOString() : ""
   };
@@ -3013,7 +3293,7 @@ function mapRowToHistoricalWork(row) {
     created_at: row.created_at ? new Date(row.created_at).toISOString() : ""
   };
 }
-function inferHistoricalCheckInOut(netMins, otMins, note, explicitIn, explicitOut) {
+function inferHistoricalCheckInOut(netMins, otMins, note, explicitIn, explicitOut, dayName) {
   if (explicitIn && explicitOut) {
     return { firstIn: explicitIn, lastOut: explicitOut };
   }
@@ -3021,11 +3301,14 @@ function inferHistoricalCheckInOut(netMins, otMins, note, explicitIn, explicitOu
   if (noteStr.includes("\u06F0\u06F8:\u06F0\u06F0") && noteStr.includes("\u06F1\u06F4:\u06F3\u06F0")) {
     return { firstIn: "08:00", lastOut: "14:30" };
   }
-  const startMinutes = netMins > 0 && netMins <= 480 ? 7 * 60 + (480 - netMins) : 7 * 60;
+  const isThursday = dayName === "\u067E\u0646\u062C\u0634\u0646\u0628\u0647";
+  const expectedShiftMins = isThursday ? 420 : 480;
+  const shiftEndHour = isThursday ? 14 : 15;
+  const startMinutes = netMins > 0 && netMins <= expectedShiftMins ? 7 * 60 + (expectedShiftMins - netMins) : 7 * 60;
   const inH = Math.floor(startMinutes / 60);
   const inM = startMinutes % 60;
   const firstIn = explicitIn || `${String(inH).padStart(2, "0")}:${String(inM).padStart(2, "0")}`;
-  const endMinutes = 15 * 60 + Math.max(0, otMins);
+  const endMinutes = shiftEndHour * 60 + Math.max(0, otMins);
   const outH = Math.floor(endMinutes / 60);
   const outM = endMinutes % 60;
   const lastOut = explicitOut || `${String(outH).padStart(2, "0")}:${String(outM).padStart(2, "0")}`;
@@ -3047,14 +3330,21 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
         if (byShamsi.has(normShamsi)) continue;
         const workDate = shamsiToGregorian(normShamsi);
         const dayName = getShamsiDayOfWeekName(normShamsi);
+        const isThursday = dayName === "\u067E\u0646\u062C\u0634\u0646\u0628\u0647";
+        const expectedShiftMins = isThursday ? 420 : 480;
         const isMission = Boolean(row.note && row.note.includes("\u0645\u0623\u0645\u0648\u0631\u06CC\u062A"));
         const { firstIn, lastOut } = inferHistoricalCheckInOut(
           row.net_work_minutes,
           row.overtime_minutes,
           row.note,
           row.check_in,
-          row.check_out
+          row.check_out,
+          dayName
         );
+        const rawLateMins = dayName === "\u062C\u0645\u0639\u0647" ? 0 : row.check_in ? Math.max(0, parseTimeToMinutes(row.check_in) - 7 * 60) : row.net_work_minutes > 0 && row.net_work_minutes < expectedShiftMins ? expectedShiftMins - row.net_work_minutes : 0;
+        const savedLateStatus = row.late_status && row.late_status !== "NONE" ? row.late_status : rawLateMins > 0 ? "PENDING" : "NONE";
+        const effectiveIsLate = rawLateMins > 0 && savedLateStatus !== "EXCUSED" && savedLateStatus !== "DEDUCT_LEAVE";
+        const effectiveLateMins = savedLateStatus === "EXCUSED" || savedLateStatus === "DEDUCT_LEAVE" ? 0 : rawLateMins;
         byShamsi.set(normShamsi, {
           work_date: workDate,
           shamsi_date: normShamsi,
@@ -3065,14 +3355,19 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
           first_in_time: firstIn,
           last_out_time: lastOut,
           is_incomplete: false,
-          is_late: row.net_work_minutes > 0 && row.net_work_minutes < 480 && dayName !== "\u062C\u0645\u0639\u0647",
-          late_minutes: row.net_work_minutes > 0 && row.net_work_minutes < 480 && dayName !== "\u062C\u0645\u0639\u0647" ? 480 - row.net_work_minutes : 0,
+          is_late: effectiveIsLate,
+          raw_late_minutes: rawLateMins,
+          late_minutes: effectiveLateMins,
+          late_status: savedLateStatus,
+          manager_late_note: row.manager_late_note || null,
+          custom_deduction_toman: row.custom_deduction_toman ?? null,
+          late_deduction_toman: row.late_deduction_toman ?? 0,
           gross_presence_minutes: row.net_work_minutes + row.overtime_minutes,
           mission_minutes: isMission ? 60 : 0,
           break_deducted_minutes: 0,
-          net_work_minutes: row.net_work_minutes,
+          net_work_minutes: savedLateStatus === "ABSENCE" ? 0 : savedLateStatus === "EXCUSED" && row.net_work_minutes < expectedShiftMins ? expectedShiftMins + row.overtime_minutes : row.net_work_minutes,
           provisional_work_minutes: row.net_work_minutes,
-          overtime_minutes: row.overtime_minutes,
+          overtime_minutes: savedLateStatus === "ABSENCE" ? 0 : row.overtime_minutes,
           status_label: row.note || row.title || "\u062B\u0628\u062A\u200C\u0634\u062F\u0647 \u062F\u0631 \u0633\u0648\u0627\u0628\u0642 \u06A9\u0627\u0631\u06A9\u0631\u062F"
         });
       }
@@ -3086,7 +3381,10 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
       const { firstIn, lastOut } = inferHistoricalCheckInOut(
         rec.net_work_minutes,
         rec.overtime_minutes,
-        rec.note
+        rec.note,
+        void 0,
+        void 0,
+        dayName
       );
       byShamsi.set(normShamsi, {
         work_date: workDate,
@@ -3100,6 +3398,7 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
         is_incomplete: false,
         is_late: false,
         late_minutes: 0,
+        late_status: "NONE",
         gross_presence_minutes: rec.net_work_minutes + rec.overtime_minutes,
         mission_minutes: 0,
         break_deducted_minutes: 0,
@@ -3476,6 +3775,39 @@ apiRouter.get("/auth/me", requireAuth, async (req, res) => {
       serverTime: nowInfo,
       settings: sanitizeSettingsForRole(settings, req.user.role)
     });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+apiRouter.post("/auth/verify-unlock", requireAuth, async (req, res) => {
+  try {
+    const password = String(req.body?.password || "");
+    if (!password) {
+      res.status(400).json({ ok: false, message: "\u0644\u0637\u0641\u0627\u064B \u0631\u0645\u0632 \u0631\u0627 \u0648\u0627\u0631\u062F \u0646\u0645\u0627\u06CC\u06CC\u062F." });
+      return;
+    }
+    const pool2 = getPool();
+    const [rows] = await pool2.execute(
+      "SELECT password_hash FROM users WHERE id = ? AND is_active = 1 LIMIT 1",
+      [req.user.id]
+    );
+    if (rows.length === 0) {
+      res.status(401).json({ ok: false, message: "\u062D\u0633\u0627\u0628 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
+      return;
+    }
+    const hash = String(rows[0].password_hash);
+    let match = await import_bcryptjs2.default.compare(password, hash);
+    if (!match) {
+      const normalized = toEnglishDigits(password).trim();
+      if (normalized !== password) {
+        match = await import_bcryptjs2.default.compare(normalized, hash);
+      }
+    }
+    if (!match) {
+      res.status(401).json({ ok: false, message: "\u0631\u0645\u0632 \u0648\u0627\u0631\u062F\u0634\u062F\u0647 \u0635\u062D\u06CC\u062D \u0646\u06CC\u0633\u062A." });
+      return;
+    }
+    res.json({ ok: true, unlocked: true });
   } catch (err) {
     handleServerError(res, err);
   }
@@ -4067,18 +4399,23 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
     }
     const hasMonthlyFixedSalary = settings.base_salary_toman !== null && settings.base_salary_toman !== void 0 && Number(settings.base_salary_toman) > 0 && (settings.hourly_rate_toman === null || settings.hourly_rate_toman === void 0 || Number(settings.hourly_rate_toman) <= 0);
     const earnedRegularWorkToman = hasMonthlyFixedSalary ? activeMonthlyCycles.size * Math.round(Number(settings.base_salary_toman)) : hourlyEarnedRegularWorkToman;
-    const [finTotals] = await pool2.execute(
-      `SELECT
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN amount_toman ELSE 0 END), 0) AS approved_total,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type != 'PETTY_CASH' THEN amount_toman ELSE 0 END), 0) AS approved_received_salary_advance,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type = 'PETTY_CASH' THEN amount_toman ELSE 0 END), 0) AS approved_petty_cash
-       FROM financial_transactions
-       WHERE user_id = ?`,
+    const [finAllRows] = await pool2.execute(
+      `SELECT f.*, u.role AS creator_role, u.full_name AS creator_name
+       FROM financial_transactions f
+       LEFT JOIN users u ON u.id = f.created_by_user_id
+       WHERE f.user_id = ?`,
       [workerInfo.id]
     );
-    const approvedTotalToman = Number(finTotals[0]?.approved_total || 0);
-    const approvedReceivedToman = Number(finTotals[0]?.approved_received_salary_advance || 0);
-    const approvedPettyCashToman = Number(finTotals[0]?.approved_petty_cash || 0);
+    const allWorkerTxs = finAllRows.map(mapRowToFinancialTx);
+    const finCumulative = calculateCumulativeFinancialSummaryAsOf({
+      transactions: allWorkerTxs,
+      currentShamsiDate: nowInfo.shamsiDate,
+      collabStartShamsi: settings.collaboration_start_shamsi || "1405/06/15",
+      anchorDay: 15
+    });
+    const approvedTotalToman = finCumulative.approvedTotalGrossToman;
+    const approvedReceivedToman = finCumulative.approvedMaturedReceivedToman;
+    const approvedPettyCashToman = finCumulative.approvedPettyCashToman;
     const netSalaryPlusOvertimeToman = Math.max(
       0,
       earnedRegularWorkToman + earnedOvertimeToman - totalLateAndAbsenceDeductionToman
@@ -4288,6 +4625,374 @@ apiRouter.post(
           message: "\u0627\u06CC\u0646 \u062F\u0631\u062E\u0648\u0627\u0633\u062A \u062A\u0631\u062F\u062F \u0642\u0628\u0644\u0627\u064B \u062B\u0628\u062A \u0634\u062F\u0647 \u0627\u0633\u062A."
         });
         return;
+      }
+      handleServerError(res, err);
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+apiRouter.post(
+  "/attendance/flexible-clock",
+  requireAuth,
+  async (req, res) => {
+    const pool2 = getPool();
+    let conn = null;
+    try {
+      const workerInfo = await getWorkerInfo(pool2);
+      const workerId = workerInfo.id;
+      const actorId = req.user.id;
+      const actorRole = req.user.role;
+      const currentSettings = await getSystemSettingsFromDb();
+      const nowInfo = getNowInTimezone(currentSettings.timezone);
+      const rawShamsiDate = req.body?.shamsi_date ? toEnglishDigits(String(req.body.shamsi_date)).trim() : nowInfo.shamsiDate;
+      if (!isValidShamsiDate(rawShamsiDate)) {
+        res.status(400).json({
+          ok: false,
+          message: "\u0641\u0631\u0645\u062A \u062A\u0627\u0631\u06CC\u062E \u0634\u0645\u0633\u06CC \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A (\u0645\u062B\u0627\u0644: \u06F1\u06F4\u06F0\u06F5/\u06F0\u06F8/\u06F1\u06F0)."
+        });
+        return;
+      }
+      const shamsiDate = normalizeShamsiDate(rawShamsiDate);
+      const workDate = shamsiToGregorian(shamsiDate);
+      const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
+      const rawEntryMode = String(req.body?.entry_mode || "START_ONLY").trim().toUpperCase();
+      const entryMode = rawEntryMode === "END_ONLY" || rawEntryMode === "FULL_SHIFT" ? rawEntryMode : "START_ONLY";
+      const shiftCategory = String(req.body?.shift_category || "WORK").toUpperCase() === "MISSION" ? "MISSION" : "WORK";
+      const checkInRaw = toEnglishDigits(String(req.body?.check_in_time || "")).trim();
+      const checkOutRaw = toEnglishDigits(String(req.body?.check_out_time || "")).trim();
+      const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
+      const lateReason = req.body?.late_reason ? String(req.body.late_reason).trim().slice(0, 500) : null;
+      conn = await pool2.getConnection();
+      await conn.beginTransaction();
+      await conn.execute(
+        `SELECT id FROM users WHERE id = ? FOR UPDATE`,
+        [workerId]
+      );
+      const [existingRows] = await conn.execute(
+        `SELECT * FROM attendance_logs
+         WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+         ORDER BY recorded_time ASC, id ASC
+         FOR UPDATE`,
+        [workerId, workDate]
+      );
+      const existingLogs = existingRows.map(mapRowToAttendanceLog);
+      if (entryMode === "START_ONLY") {
+        if (!isValidTimeHHMMOrHHMMSS(checkInRaw, true)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: "\u0644\u0637\u0641\u0627\u064B \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (\u0648\u0631\u0648\u062F) \u0631\u0627 \u0628\u0627 \u0641\u0631\u0645\u062A \u0645\u0639\u062A\u0628\u0631 (\u0645\u062B\u0644\u0627\u064B 07:30) \u0648\u0627\u0631\u062F \u0646\u0645\u0627\u06CC\u06CC\u062F."
+          });
+          return;
+        }
+        const checkInTime2 = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
+        const startEventType2 = shiftCategory === "MISSION" ? "MISSION_START" : "WORK_START";
+        const simulatedLogs2 = [
+          ...existingLogs.map((l) => ({
+            event_type: l.event_type,
+            recorded_time: l.recorded_time
+          })),
+          { event_type: startEventType2, recorded_time: checkInTime2 }
+        ];
+        const seqCheck2 = validateFullDayLogSequence(simulatedLogs2);
+        if (!seqCheck2.valid) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: seqCheck2.error || "\u062F\u0631 \u0627\u06CC\u0646 \u062A\u0627\u0631\u06CC\u062E \u06CC\u06A9 \u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u0628\u0627\u0632 \u0648\u062C\u0648\u062F \u062F\u0627\u0631\u062F \u06CC\u0627 \u062A\u0631\u062A\u06CC\u0628 \u0632\u0645\u0627\u0646\u06CC \u062A\u0631\u062F\u062F \u0647\u0645\u200C\u067E\u0648\u0634\u0627\u0646\u06CC \u062F\u0627\u0631\u062F."
+          });
+          return;
+        }
+        const isFirstWorkStart2 = startEventType2 === "WORK_START" && !existingLogs.some((l) => l.event_type === "WORK_START");
+        const isThursday2 = getDayOfWeekFromGregorian(workDate) === 5;
+        const isHoliday2 = getDayOfWeekFromGregorian(workDate) === 6 || effectiveSettings.official_holidays.includes(shamsiDate);
+        const isWorkingDay2 = !isHoliday2 && effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+        const shiftStartMin2 = parseTimeToMinutes(
+          isThursday2 ? effectiveSettings.thursday_shift_start_time || effectiveSettings.shift_start_time || "07:00" : effectiveSettings.shift_start_time || "07:00"
+        );
+        const recordedMin2 = parseTimeToMinutes(checkInTime2);
+        const isLateArrival2 = isFirstWorkStart2 && isWorkingDay2 && recordedMin2 > shiftStartMin2 + effectiveSettings.grace_period_minutes;
+        const lateStatus2 = isLateArrival2 ? "PENDING" : "NONE";
+        const recordedAt = `${workDate} ${checkInTime2}`;
+        const modReason2 = actorRole === "manager" ? "\u062B\u0628\u062A \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0634\u06CC\u0641\u062A \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A (\u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u0641\u0639\u0627\u0644 \u062F\u0631 \u062C\u0631\u06CC\u0627\u0646)" : "\u062B\u0628\u062A \u0628\u0627\u0632\u0646\u06AF\u0631\u06CC \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 \u062A\u0648\u0633\u0637 \u067E\u0631\u0633\u0646\u0644 (\u0634\u06CC\u0641\u062A \u0641\u0639\u0627\u0644 \u062F\u0631 \u062C\u0631\u06CC\u0627\u0646)";
+        const [ins] = await conn.execute(
+          `INSERT INTO attendance_logs
+            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, late_reason, late_status, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+          [
+            workerId,
+            workDate,
+            shamsiDate,
+            startEventType2,
+            recordedAt,
+            checkInTime2,
+            note,
+            isLateArrival2 ? lateReason || note : null,
+            lateStatus2,
+            actorId,
+            modReason2
+          ]
+        );
+        await recordAuditLog({
+          actorUserId: actorId,
+          actionType: "FLEXIBLE_CLOCK_START_ONLY",
+          targetEntity: "attendance_logs",
+          targetId: ins.insertId,
+          afterState: {
+            shamsi_date: shamsiDate,
+            event_type: startEventType2,
+            check_in_time: checkInTime2,
+            late_status: lateStatus2
+          },
+          reason: modReason2,
+          ipAddress: req.ip || null,
+          connection: conn
+        });
+        await conn.commit();
+        const [todayRows2] = await pool2.execute(
+          `SELECT * FROM attendance_logs
+           WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+           ORDER BY recorded_time ASC, id ASC`,
+          [workerId, nowInfo.workDate]
+        );
+        const todayLogs2 = todayRows2.map(mapRowToAttendanceLog);
+        const liveState2 = evaluateWorkerLiveState(todayLogs2, currentSettings);
+        liveState2.worker_profile = {
+          full_name: workerInfo.full_name,
+          avatar_url: workerInfo.avatar_url,
+          collaboration_start_shamsi: currentSettings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi,
+          phone_number: currentSettings.worker_phone_number || workerInfo.phone_number
+        };
+        await attachForgottenCheckoutWarning(pool2, workerId, liveState2, currentSettings, nowInfo);
+        res.status(201).json({
+          ok: true,
+          logId: ins.insertId,
+          liveState: liveState2,
+          message: shamsiDate === nowInfo.shamsiDate ? `\u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (${checkInTime2.slice(0, 5)}) \u0628\u0631\u0627\u06CC \u0627\u0645\u0631\u0648\u0632 \u062B\u0628\u062A \u0634\u062F \u0648 \u0648\u0636\u0639\u06CC\u062A \u062D\u0636\u0648\u0631 \u0634\u0645\u0627 \u062F\u0631 \u062F\u0627\u0634\u0628\u0648\u0631\u062F \u0628\u0647 \xAB\u062F\u0631 \u062D\u0627\u0644 \u0627\u0646\u062C\u0627\u0645 \u06A9\u0627\u0631\xBB \u062A\u063A\u06CC\u06CC\u0631 \u06CC\u0627\u0641\u062A. \u062F\u0631 \u0632\u0645\u0627\u0646 \u0627\u062A\u0645\u0627\u0645 \u06A9\u0627\u0631 \u0645\u06CC\u200C\u062A\u0648\u0627\u0646\u06CC\u062F \u062F\u06A9\u0645\u0647 \xAB\u067E\u0627\u06CC\u0627\u0646 \u06A9\u0627\u0631\xBB \u0631\u0627 \u0628\u0632\u0646\u06CC\u062F \u06CC\u0627 \u0633\u0627\u0639\u062A \u062E\u0631\u0648\u062C \u0631\u0627 \u062B\u0628\u062A \u0646\u0645\u0627\u06CC\u06CC\u062F.` : `\u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (${checkInTime2.slice(0, 5)}) \u062F\u0631 \u062A\u0627\u0631\u06CC\u062E ${shamsiDate} \u062B\u0628\u062A \u06AF\u0631\u062F\u06CC\u062F. \u0647\u0631 \u0632\u0645\u0627\u0646 \u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 \u0645\u0634\u062E\u0635 \u0634\u062F \u0645\u06CC\u200C\u062A\u0648\u0627\u0646\u06CC\u062F \u0622\u0646 \u0631\u0627 \u062A\u06A9\u0645\u06CC\u0644 \u0646\u0645\u0627\u06CC\u06CC\u062F.`
+        });
+        return;
+      }
+      if (entryMode === "END_ONLY") {
+        if (!isValidTimeHHMMOrHHMMSS(checkOutRaw, true)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: "\u0644\u0637\u0641\u0627\u064B \u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 (\u062E\u0631\u0648\u062C) \u0631\u0627 \u0628\u0627 \u0641\u0631\u0645\u062A \u0645\u0639\u062A\u0628\u0631 (\u0645\u062B\u0644\u0627\u064B 17:30) \u0648\u0627\u0631\u062F \u0646\u0645\u0627\u06CC\u06CC\u062F."
+          });
+          return;
+        }
+        const checkOutTime2 = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
+        if (existingLogs.length === 0) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: "\u062F\u0631 \u0627\u06CC\u0646 \u062A\u0627\u0631\u06CC\u062E \u0647\u0646\u0648\u0632 \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (\u0648\u0631\u0648\u062F) \u062B\u0628\u062A \u0646\u0634\u062F\u0647 \u0627\u0633\u062A\u061B \u0627\u0628\u062A\u062F\u0627 \u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F \u0631\u0627 \u062B\u0628\u062A \u06A9\u0646\u06CC\u062F \u06CC\u0627 \u0627\u0632 \u062D\u0627\u0644\u062A \xAB\u062B\u0628\u062A \u06A9\u0627\u0645\u0644 \u0648\u0631\u0648\u062F \u0648 \u062E\u0631\u0648\u062C\xBB \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0646\u0645\u0627\u06CC\u06CC\u062F."
+          });
+          return;
+        }
+        const lastLog = existingLogs[existingLogs.length - 1];
+        const endEventType2 = lastLog.event_type === "MISSION_START" ? "MISSION_END" : "WORK_END";
+        const simulatedLogs2 = [
+          ...existingLogs.map((l) => ({
+            event_type: l.event_type,
+            recorded_time: l.recorded_time
+          })),
+          { event_type: endEventType2, recorded_time: checkOutTime2 }
+        ];
+        const seqCheck2 = validateFullDayLogSequence(simulatedLogs2);
+        if (!seqCheck2.valid) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: seqCheck2.error || "\u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 \u0628\u0627\u06CC\u062F \u067E\u0633 \u0627\u0632 \u0622\u062E\u0631\u06CC\u0646 \u0633\u0627\u0639\u062A \u0634\u0631\u0648\u0639 \u062B\u0628\u062A\u200C\u0634\u062F\u0647 \u062F\u0631 \u0627\u06CC\u0646 \u0631\u0648\u0632 \u0628\u0627\u0634\u062F."
+          });
+          return;
+        }
+        const recordedAt = `${workDate} ${checkOutTime2}`;
+        const modReason2 = actorRole === "manager" ? "\u062B\u0628\u062A \u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u0634\u06CC\u0641\u062A \u0628\u0627\u0632 \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A" : "\u062B\u0628\u062A \u062A\u06A9\u0645\u06CC\u0644\u06CC \u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 (\u062E\u0631\u0648\u062C) \u062A\u0648\u0633\u0637 \u067E\u0631\u0633\u0646\u0644";
+        const [ins] = await conn.execute(
+          `INSERT INTO attendance_logs
+            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+          [
+            workerId,
+            workDate,
+            shamsiDate,
+            endEventType2,
+            recordedAt,
+            checkOutTime2,
+            note,
+            actorId,
+            modReason2
+          ]
+        );
+        await recordAuditLog({
+          actorUserId: actorId,
+          actionType: "FLEXIBLE_CLOCK_END_ONLY",
+          targetEntity: "attendance_logs",
+          targetId: ins.insertId,
+          afterState: {
+            shamsi_date: shamsiDate,
+            event_type: endEventType2,
+            check_out_time: checkOutTime2
+          },
+          reason: modReason2,
+          ipAddress: req.ip || null,
+          connection: conn
+        });
+        await conn.commit();
+        const [todayRows2] = await pool2.execute(
+          `SELECT * FROM attendance_logs
+           WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+           ORDER BY recorded_time ASC, id ASC`,
+          [workerId, nowInfo.workDate]
+        );
+        const todayLogs2 = todayRows2.map(mapRowToAttendanceLog);
+        const liveState2 = evaluateWorkerLiveState(todayLogs2, currentSettings);
+        liveState2.worker_profile = {
+          full_name: workerInfo.full_name,
+          avatar_url: workerInfo.avatar_url,
+          collaboration_start_shamsi: currentSettings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi,
+          phone_number: currentSettings.worker_phone_number || workerInfo.phone_number
+        };
+        await attachForgottenCheckoutWarning(pool2, workerId, liveState2, currentSettings, nowInfo);
+        res.status(201).json({
+          ok: true,
+          logId: ins.insertId,
+          liveState: liveState2,
+          message: `\u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 (${checkOutTime2.slice(0, 5)}) \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062B\u0628\u062A \u0648 \u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u062A\u0627\u0631\u06CC\u062E ${shamsiDate} \u062A\u06A9\u0645\u06CC\u0644 \u06AF\u0631\u062F\u06CC\u062F.`
+        });
+        return;
+      }
+      if (!isValidTimeHHMMOrHHMMSS(checkInRaw, true) || !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: "\u0641\u0631\u0645\u062A \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0648 \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 \u0628\u0627\u06CC\u062F \u0645\u0639\u062A\u0628\u0631 \u0648 \u0628\u06CC\u0646 00:00 \u062A\u0627 23:59 \u0628\u0627\u0634\u062F."
+        });
+        return;
+      }
+      const checkInTime = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
+      const checkOutTime = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
+      if (parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: "\u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 (\u062E\u0631\u0648\u062C) \u0628\u0627\u06CC\u062F \u067E\u0633 \u0627\u0632 \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (\u0648\u0631\u0648\u062F) \u0628\u0627\u0634\u062F."
+        });
+        return;
+      }
+      const startEventType = shiftCategory === "MISSION" ? "MISSION_START" : "WORK_START";
+      const endEventType = shiftCategory === "MISSION" ? "MISSION_END" : "WORK_END";
+      const simulatedLogs = [
+        ...existingLogs.map((l) => ({
+          event_type: l.event_type,
+          recorded_time: l.recorded_time
+        })),
+        { event_type: startEventType, recorded_time: checkInTime },
+        { event_type: endEventType, recorded_time: checkOutTime }
+      ];
+      const seqCheck = validateFullDayLogSequence(simulatedLogs);
+      if (!seqCheck.valid) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: seqCheck.error || "\u062A\u062F\u0627\u062E\u0644 \u0632\u0645\u0627\u0646\u06CC \u0628\u0627 \u062A\u0631\u062F\u062F\u0647\u0627\u06CC \u062B\u0628\u062A\u200C\u0634\u062F\u0647 \u062F\u0631 \u0627\u06CC\u0646 \u0631\u0648\u0632 \u0648\u062C\u0648\u062F \u062F\u0627\u0631\u062F."
+        });
+        return;
+      }
+      const isFirstWorkStart = startEventType === "WORK_START" && !existingLogs.some((l) => l.event_type === "WORK_START");
+      const isThursday = getDayOfWeekFromGregorian(workDate) === 5;
+      const isHoliday = getDayOfWeekFromGregorian(workDate) === 6 || effectiveSettings.official_holidays.includes(shamsiDate);
+      const isWorkingDay = !isHoliday && effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+      const shiftStartMin = parseTimeToMinutes(
+        isThursday ? effectiveSettings.thursday_shift_start_time || effectiveSettings.shift_start_time || "07:00" : effectiveSettings.shift_start_time || "07:00"
+      );
+      const recordedMin = parseTimeToMinutes(checkInTime);
+      const isLateArrival = isFirstWorkStart && isWorkingDay && recordedMin > shiftStartMin + effectiveSettings.grace_period_minutes;
+      const lateStatus = isLateArrival ? "PENDING" : "NONE";
+      const recordedAtIn = `${workDate} ${checkInTime}`;
+      const recordedAtOut = `${workDate} ${checkOutTime}`;
+      const modReason = actorRole === "manager" ? "\u062B\u0628\u062A \u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u06A9\u0627\u0645\u0644 \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A" : "\u062B\u0628\u062A \u0628\u0627\u0632\u0646\u06AF\u0631\u06CC \u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u06A9\u0627\u0645\u0644 (\u0648\u0631\u0648\u062F \u0648 \u062E\u0631\u0648\u062C) \u062A\u0648\u0633\u0637 \u067E\u0631\u0633\u0646\u0644";
+      const [insIn] = await conn.execute(
+        `INSERT INTO attendance_logs
+          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, late_reason, late_status, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+        [
+          workerId,
+          workDate,
+          shamsiDate,
+          startEventType,
+          recordedAtIn,
+          checkInTime,
+          note,
+          isLateArrival ? lateReason || note : null,
+          lateStatus,
+          actorId,
+          modReason
+        ]
+      );
+      const [insOut] = await conn.execute(
+        `INSERT INTO attendance_logs
+          (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+        [
+          workerId,
+          workDate,
+          shamsiDate,
+          endEventType,
+          recordedAtOut,
+          checkOutTime,
+          note,
+          actorId,
+          modReason
+        ]
+      );
+      await recordAuditLog({
+        actorUserId: actorId,
+        actionType: "FLEXIBLE_CLOCK_FULL_SHIFT",
+        targetEntity: "attendance_logs",
+        targetId: insIn.insertId,
+        afterState: {
+          shamsi_date: shamsiDate,
+          check_in_time: checkInTime,
+          check_out_time: checkOutTime,
+          check_in_log_id: insIn.insertId,
+          check_out_log_id: insOut.insertId
+        },
+        reason: modReason,
+        ipAddress: req.ip || null,
+        connection: conn
+      });
+      await conn.commit();
+      const [todayRows] = await pool2.execute(
+        `SELECT * FROM attendance_logs
+         WHERE user_id = ? AND work_date = ? AND is_deleted = 0
+         ORDER BY recorded_time ASC, id ASC`,
+        [workerId, nowInfo.workDate]
+      );
+      const todayLogs = todayRows.map(mapRowToAttendanceLog);
+      const liveState = evaluateWorkerLiveState(todayLogs, currentSettings);
+      liveState.worker_profile = {
+        full_name: workerInfo.full_name,
+        avatar_url: workerInfo.avatar_url,
+        collaboration_start_shamsi: currentSettings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi,
+        phone_number: currentSettings.worker_phone_number || workerInfo.phone_number
+      };
+      await attachForgottenCheckoutWarning(pool2, workerId, liveState, currentSettings, nowInfo);
+      res.status(201).json({
+        ok: true,
+        logId: insIn.insertId,
+        liveState,
+        message: `\u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u062A\u0627\u0631\u06CC\u062E ${shamsiDate} (\u0648\u0631\u0648\u062F ${checkInTime.slice(0, 5)} \u062A\u0627 \u062E\u0631\u0648\u062C ${checkOutTime.slice(0, 5)}) \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062B\u0628\u062A \u06AF\u0631\u062F\u06CC\u062F.`
+      });
+    } catch (err) {
+      if (conn) {
+        try {
+          await conn.rollback();
+        } catch {
+        }
       }
       handleServerError(res, err);
     } finally {
@@ -5155,17 +5860,26 @@ apiRouter.post(
         const checkInRaw = toEnglishDigits(String(req.body?.check_in_time || "")).trim();
         const checkOutRaw = toEnglishDigits(String(req.body?.check_out_time || "")).trim();
         const note = req.body?.note ? String(req.body.note).trim().slice(0, 500) : null;
-        if (!isValidTimeHHMMOrHHMMSS(checkInRaw, true) || !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)) {
+        if (!isValidTimeHHMMOrHHMMSS(checkInRaw, true)) {
           await conn.rollback();
           res.status(400).json({
             ok: false,
-            message: "\u0641\u0631\u0645\u062A \u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F \u0648 \u062E\u0631\u0648\u062C \u0628\u0627\u06CC\u062F \u0645\u0639\u062A\u0628\u0631 \u0648 \u0628\u06CC\u0646 00:00 \u062A\u0627 23:59 \u0628\u0627\u0634\u062F."
+            message: "\u0641\u0631\u0645\u062A \u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (\u0648\u0631\u0648\u062F) \u0628\u0627\u06CC\u062F \u0645\u0639\u062A\u0628\u0631 \u0648 \u0628\u06CC\u0646 00:00 \u062A\u0627 23:59 \u0628\u0627\u0634\u062F."
           });
           return;
         }
         const checkInTime = checkInRaw.length === 5 ? `${checkInRaw}:00` : checkInRaw;
-        const checkOutTime = checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw;
-        if (parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
+        const hasCheckOut = checkOutRaw.length > 0;
+        if (hasCheckOut && !isValidTimeHHMMOrHHMMSS(checkOutRaw, true)) {
+          await conn.rollback();
+          res.status(400).json({
+            ok: false,
+            message: "\u0641\u0631\u0645\u062A \u0633\u0627\u0639\u062A \u062E\u0627\u062A\u0645\u0647 \u06A9\u0627\u0631 (\u062E\u0631\u0648\u062C) \u0628\u0627\u06CC\u062F \u0645\u0639\u062A\u0628\u0631 \u0648 \u0628\u06CC\u0646 00:00 \u062A\u0627 23:59 \u0628\u0627\u0634\u062F."
+          });
+          return;
+        }
+        const checkOutTime = hasCheckOut ? checkOutRaw.length === 5 ? `${checkOutRaw}:00` : checkOutRaw : null;
+        if (checkOutTime && parseTimeToMinutes(checkOutTime) <= parseTimeToMinutes(checkInTime)) {
           await conn.rollback();
           res.status(400).json({
             ok: false,
@@ -5183,7 +5897,7 @@ apiRouter.post(
             recorded_time: String(r.recorded_time)
           })),
           { event_type: "WORK_START", recorded_time: checkInTime },
-          { event_type: "WORK_END", recorded_time: checkOutTime }
+          ...checkOutTime ? [{ event_type: "WORK_END", recorded_time: checkOutTime }] : []
         ];
         const seqCheck = validateFullDayLogSequence(simulatedLogs);
         if (!seqCheck.valid) {
@@ -5195,19 +5909,23 @@ apiRouter.post(
           return;
         }
         const recordedAtIn = `${workDate} ${checkInTime}`;
-        const recordedAtOut = `${workDate} ${checkOutTime}`;
         const [insIn] = await conn.execute(
           `INSERT INTO attendance_logs
             (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
            VALUES (?, ?, ?, 'WORK_START', ?, ?, ?, 1, ?, ?, 0)`,
           [workerId, workDate, shamsiDate, recordedAtIn, checkInTime, note, managerId, reason]
         );
-        const [insOut] = await conn.execute(
-          `INSERT INTO attendance_logs
-            (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
-           VALUES (?, ?, ?, 'WORK_END', ?, ?, ?, 1, ?, ?, 0)`,
-          [workerId, workDate, shamsiDate, recordedAtOut, checkOutTime, note, managerId, reason]
-        );
+        let checkOutLogId = null;
+        if (checkOutTime) {
+          const recordedAtOut = `${workDate} ${checkOutTime}`;
+          const [insOut] = await conn.execute(
+            `INSERT INTO attendance_logs
+              (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+             VALUES (?, ?, ?, 'WORK_END', ?, ?, ?, 1, ?, ?, 0)`,
+            [workerId, workDate, shamsiDate, recordedAtOut, checkOutTime, note, managerId, reason]
+          );
+          checkOutLogId = insOut.insertId;
+        }
         await recordAuditLog({
           actorUserId: managerId,
           actionType: "ATTENDANCE_OVERRIDE",
@@ -5219,7 +5937,7 @@ apiRouter.post(
             check_in_time: checkInTime,
             check_out_time: checkOutTime,
             check_in_log_id: insIn.insertId,
-            check_out_log_id: insOut.insertId
+            check_out_log_id: checkOutLogId
           },
           reason,
           ipAddress: req.ip || null,
@@ -5228,7 +5946,7 @@ apiRouter.post(
         await conn.commit();
         res.status(201).json({
           ok: true,
-          message: "\u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC (\u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F \u0648 \u062E\u0631\u0648\u062C) \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062F\u0631 \u06A9\u0627\u0631\u06A9\u0631\u062F \u067E\u0631\u0633\u0646\u0644 \u062B\u0628\u062A \u06AF\u0631\u062F\u06CC\u062F."
+          message: checkOutTime ? "\u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC (\u0633\u0627\u0639\u062A \u0648\u0631\u0648\u062F \u0648 \u062E\u0631\u0648\u062C) \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062F\u0631 \u06A9\u0627\u0631\u06A9\u0631\u062F \u067E\u0631\u0633\u0646\u0644 \u062B\u0628\u062A \u06AF\u0631\u062F\u06CC\u062F." : "\u0633\u0627\u0639\u062A \u0622\u063A\u0627\u0632 \u0628\u0647 \u06A9\u0627\u0631 (\u0648\u0631\u0648\u062F) \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062B\u0628\u062A \u0634\u062F \u0648 \u0646\u0648\u0628\u062A \u06A9\u0627\u0631\u06CC \u062F\u0631 \u0648\u0636\u0639\u06CC\u062A \xAB\u062F\u0631 \u062C\u0631\u06CC\u0627\u0646\xBB \u0641\u0639\u0627\u0644 \u06AF\u0631\u062F\u06CC\u062F."
         });
         return;
       }
@@ -5429,7 +6147,7 @@ apiRouter.post(
     let conn = null;
     try {
       const logId = req.body?.log_id ? Number(req.body.log_id) : 0;
-      const shamsiRaw = req.body?.shamsi_date ? String(req.body.shamsi_date).trim() : "";
+      const shamsiRaw = req.body?.shamsi_date ? toEnglishDigits(String(req.body.shamsi_date)).trim() : "";
       const decision = String(req.body?.decision || "").trim();
       const managerNote = req.body?.manager_note ? String(req.body.manager_note).trim().slice(0, 500) : null;
       const customDeductionRaw = req.body?.custom_deduction_toman;
@@ -5465,7 +6183,8 @@ apiRouter.post(
         if (rows.length > 0) {
           targetRow = rows[0];
         }
-      } else if (shamsiRaw && isValidShamsiDate(shamsiRaw)) {
+      }
+      if (!targetRow && shamsiRaw && isValidShamsiDate(shamsiRaw)) {
         const normShamsi = normalizeShamsiDate(shamsiRaw);
         const [rows] = await conn.execute(
           `SELECT * FROM attendance_logs
@@ -5476,6 +6195,73 @@ apiRouter.post(
         );
         if (rows.length > 0) {
           targetRow = rows[0];
+        } else {
+          const [histRows] = await conn.execute(
+            `SELECT * FROM historical_work_records WHERE user_id = ? AND status = 'APPROVED' FOR UPDATE`,
+            [workerId]
+          );
+          let matchedHistRow = null;
+          for (const hr of histRows) {
+            const mapped = mapRowToHistoricalWork(hr);
+            if (mapped.parsed_rows && mapped.parsed_rows.length > 0) {
+              const found = mapped.parsed_rows.find(
+                (r) => r.shamsi_date && isValidShamsiDate(r.shamsi_date) && normalizeShamsiDate(r.shamsi_date) === normShamsi
+              );
+              if (found) {
+                matchedHistRow = found;
+                break;
+              }
+            }
+          }
+          const workDate = shamsiToGregorian(normShamsi);
+          const dayName = getShamsiDayOfWeekName(normShamsi);
+          const { firstIn, lastOut } = matchedHistRow ? inferHistoricalCheckInOut(
+            matchedHistRow.net_work_minutes,
+            matchedHistRow.overtime_minutes,
+            matchedHistRow.note,
+            matchedHistRow.check_in,
+            matchedHistRow.check_out,
+            dayName
+          ) : { firstIn: "07:05", lastOut: dayName === "\u067E\u0646\u062C\u0634\u0646\u0628\u0647" ? "14:00" : "15:00" };
+          const startHHMMSS = firstIn.length === 5 ? `${firstIn}:00` : firstIn;
+          const endHHMMSS = lastOut.length === 5 ? `${lastOut}:00` : lastOut;
+          const [insStart] = await conn.execute(
+            `INSERT INTO attendance_logs
+              (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted, late_status, manager_late_note, custom_deduction_toman, late_reviewed_by_user_id, late_reviewed_at, is_late_seen_by_worker)
+             VALUES (?, ?, ?, 'WORK_START', NOW(), ?, ?, 1, ?, '\u062A\u0639\u06CC\u06CC\u0646 \u062A\u06A9\u0644\u06CC\u0641 \u062A\u0623\u062E\u06CC\u0631 \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A', 0, ?, ?, ?, ?, NOW(), 0)`,
+            [
+              workerId,
+              workDate,
+              normShamsi,
+              startHHMMSS,
+              matchedHistRow?.note || null,
+              req.user.id,
+              decision,
+              managerNote,
+              decision === "CUSTOM" ? customDeductionToman : null,
+              req.user.id
+            ]
+          );
+          await conn.execute(
+            `INSERT INTO attendance_logs
+              (user_id, work_date, shamsi_date, event_type, recorded_at, recorded_time, note, is_manual_override, modified_by_user_id, modification_reason, is_deleted)
+             VALUES (?, ?, ?, 'WORK_END', NOW(), ?, ?, 1, ?, '\u062A\u0639\u06CC\u06CC\u0646 \u062A\u06A9\u0644\u06CC\u0641 \u062A\u0623\u062E\u06CC\u0631 \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A', 0)`,
+            [
+              workerId,
+              workDate,
+              normShamsi,
+              endHHMMSS,
+              matchedHistRow?.note || null,
+              req.user.id
+            ]
+          );
+          const [createdRows] = await conn.execute(
+            `SELECT * FROM attendance_logs WHERE id = ? LIMIT 1`,
+            [insStart.insertId]
+          );
+          if (createdRows.length > 0) {
+            targetRow = createdRows[0];
+          }
         }
       }
       if (!targetRow) {
@@ -5487,7 +6273,8 @@ apiRouter.post(
         return;
       }
       const targetLog = mapRowToAttendanceLog(targetRow);
-      const effectiveSettings = await getSystemSettingsFromDb(targetLog.shamsi_date);
+      const normTargetShamsi = normalizeShamsiDate(targetLog.shamsi_date);
+      const effectiveSettings = await getSystemSettingsFromDb(normTargetShamsi);
       const dayOfWeek = getDayOfWeekFromGregorian(targetLog.work_date);
       const { shiftStartHHMM, shiftStartMin } = getDayShiftSchedule(dayOfWeek, effectiveSettings);
       const firstInMin = parseTimeToMinutes(targetLog.recorded_time);
@@ -5500,15 +6287,47 @@ apiRouter.post(
              late_reviewed_by_user_id = ?,
              late_reviewed_at = NOW(),
              is_late_seen_by_worker = 0
-         WHERE id = ?`,
+         WHERE user_id = ? AND shamsi_date = ? AND is_deleted = 0 AND event_type = 'WORK_START'`,
         [
           decision,
           managerNote,
           decision === "CUSTOM" ? customDeductionToman : null,
           req.user.id,
-          targetLog.id
+          workerId,
+          normTargetShamsi
         ]
       );
+      const [histUpdateRows] = await conn.execute(
+        `SELECT id, parsed_rows_json FROM historical_work_records WHERE user_id = ? AND parsed_rows_json IS NOT NULL FOR UPDATE`,
+        [workerId]
+      );
+      for (const hr of histUpdateRows) {
+        try {
+          const parsed = typeof hr.parsed_rows_json === "string" ? JSON.parse(hr.parsed_rows_json) : hr.parsed_rows_json;
+          if (Array.isArray(parsed)) {
+            let changed = false;
+            const updatedRows = parsed.map((r) => {
+              if (r.shamsi_date && isValidShamsiDate(r.shamsi_date) && normalizeShamsiDate(r.shamsi_date) === normTargetShamsi) {
+                changed = true;
+                return {
+                  ...r,
+                  late_status: decision,
+                  manager_late_note: managerNote,
+                  custom_deduction_toman: decision === "CUSTOM" ? customDeductionToman : null
+                };
+              }
+              return r;
+            });
+            if (changed) {
+              await conn.execute(
+                `UPDATE historical_work_records SET parsed_rows_json = ? WHERE id = ?`,
+                [JSON.stringify(updatedRows), hr.id]
+              );
+            }
+          }
+        } catch {
+        }
+      }
       const leaveIdempotencyKey = `late_leave_log_${targetLog.id}`;
       if (decision === "DEDUCT_LEAVE" && rawLateMins > 0) {
         const [existingLeave] = await conn.execute(
@@ -5855,6 +6674,365 @@ apiRouter.delete("/tasks/:id", requireAuth, requireRole("manager"), async (req, 
     handleServerError(res, err);
   }
 });
+var ALLOWED_REMINDER_REPEAT_TYPES = /* @__PURE__ */ new Set([
+  "ONCE",
+  "SAME_DAY_INTERVAL",
+  "DAILY",
+  "EVERY_N_DAYS",
+  "WEEKLY",
+  "MONTHLY"
+]);
+function mapRowToUserReminder(row) {
+  return {
+    id: Number(row.id),
+    user_id: Number(row.user_id),
+    created_by_user_id: Number(row.created_by_user_id),
+    creator_role: row.creator_role === "manager" ? "manager" : "worker",
+    target_scope: row.target_scope === "WORKER" || row.target_scope === "BOTH" ? row.target_scope : "SELF",
+    title: String(row.title || ""),
+    message_text: String(row.message_text || ""),
+    shamsi_date: String(row.shamsi_date || ""),
+    reminder_time: String(row.reminder_time || "09:00").slice(0, 5),
+    repeat_type: ALLOWED_REMINDER_REPEAT_TYPES.has(row.repeat_type) ? row.repeat_type : "ONCE",
+    repeat_count: Math.max(1, Number(row.repeat_count || 1)),
+    repeat_interval_minutes: Math.max(1, Number(row.repeat_interval_minutes || 15)),
+    triggered_count: Math.max(0, Number(row.triggered_count || 0)),
+    next_trigger_shamsi: String(row.next_trigger_shamsi || row.shamsi_date || ""),
+    next_trigger_time: String(row.next_trigger_time || row.reminder_time || "09:00").slice(0, 5),
+    last_triggered_at: row.last_triggered_at ? new Date(row.last_triggered_at).toISOString() : null,
+    is_completed: Boolean(row.is_completed),
+    is_active: Boolean(row.is_active),
+    created_at: row.created_at ? new Date(row.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+apiRouter.get("/reminders", requireAuth, async (req, res) => {
+  try {
+    const pool2 = getPool();
+    const settings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(settings.timezone);
+    let sql = `
+      SELECT r.*, u.role AS creator_role
+      FROM user_reminders r
+      LEFT JOIN users u ON u.id = r.created_by_user_id
+    `;
+    const params = [];
+    if (req.user.role === "manager") {
+      sql += " WHERE r.user_id = ? OR r.created_by_user_id = ?";
+      params.push(req.user.id, req.user.id);
+    } else {
+      sql += " WHERE r.user_id = ? OR r.target_scope IN ('WORKER', 'BOTH')";
+      params.push(req.user.id);
+    }
+    sql += " ORDER BY r.is_completed ASC, r.next_trigger_shamsi ASC, r.next_trigger_time ASC, r.id DESC LIMIT 200";
+    const [rows] = await pool2.execute(sql, params);
+    res.json({
+      ok: true,
+      serverTime: {
+        shamsiDate: nowInfo.shamsiDate,
+        timeHHMM: nowInfo.timeHHMM
+      },
+      reminders: rows.map(mapRowToUserReminder)
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+apiRouter.post("/reminders", requireAuth, async (req, res) => {
+  try {
+    const rawTitle = String(req.body?.title || "").trim();
+    const rawMessage = String(req.body?.message_text || "").trim();
+    const messageText = rawMessage || rawTitle;
+    const title = rawTitle || messageText.slice(0, 80);
+    if (!messageText) {
+      res.status(400).json({ ok: false, message: "\u0645\u062A\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
+      return;
+    }
+    const settings = await getSystemSettingsFromDb();
+    const nowInfo = getNowInTimezone(settings.timezone);
+    const rawShamsi = String(req.body?.shamsi_date || "").trim();
+    const shamsiDate = rawShamsi && isValidShamsiDate(rawShamsi) ? normalizeShamsiDate(rawShamsi) : nowInfo.shamsiDate;
+    const rawTime = toEnglishDigits(String(req.body?.reminder_time || "")).trim().slice(0, 5);
+    const reminderTime = isValidTimeHHMMOrHHMMSS(rawTime, false) ? rawTime : nowInfo.timeHHMM;
+    const rawRepeatType = String(req.body?.repeat_type || "ONCE").trim();
+    const repeatType = ALLOWED_REMINDER_REPEAT_TYPES.has(rawRepeatType) ? rawRepeatType : "ONCE";
+    const repeatCount = repeatType === "ONCE" ? 1 : Math.min(365, Math.max(1, Math.round(Number(req.body?.repeat_count) || 2)));
+    const repeatIntervalMinutes = Math.min(
+      1440,
+      Math.max(1, Math.round(Number(req.body?.repeat_interval_minutes) || 15))
+    );
+    const rawScope = String(req.body?.target_scope || "SELF").trim();
+    const targetScope = req.user.role === "manager" && (rawScope === "WORKER" || rawScope === "BOTH") ? rawScope : "SELF";
+    const pool2 = getPool();
+    let targetUserId = req.user.id;
+    if (req.user.role === "manager" && targetScope === "WORKER") {
+      const workerInfo = await getWorkerInfo(pool2);
+      targetUserId = workerInfo.id;
+    }
+    const [ins] = await pool2.execute(
+      `INSERT INTO user_reminders (
+        user_id,
+        created_by_user_id,
+        target_scope,
+        title,
+        message_text,
+        shamsi_date,
+        reminder_time,
+        repeat_type,
+        repeat_count,
+        repeat_interval_minutes,
+        triggered_count,
+        next_trigger_shamsi,
+        next_trigger_time,
+        is_completed,
+        is_active
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 1)`,
+      [
+        targetUserId,
+        req.user.id,
+        targetScope,
+        title.slice(0, 250),
+        messageText.slice(0, 2e3),
+        shamsiDate,
+        reminderTime,
+        repeatType,
+        repeatCount,
+        repeatIntervalMinutes,
+        shamsiDate,
+        reminderTime
+      ]
+    );
+    res.status(201).json({
+      ok: true,
+      id: ins.insertId,
+      message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u062C\u062F\u06CC\u062F \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u0632\u0645\u0627\u0646\u200C\u0628\u0646\u062F\u06CC \u0648 \u062B\u0628\u062A \u0634\u062F."
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+apiRouter.put("/reminders/:id", requireAuth, async (req, res) => {
+  try {
+    const reminderId = Number(req.params.id);
+    if (!reminderId) {
+      res.status(400).json({ ok: false, message: "\u0634\u0646\u0627\u0633\u0647 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
+      return;
+    }
+    const pool2 = getPool();
+    const [rows] = await pool2.execute(
+      "SELECT * FROM user_reminders WHERE id = ? LIMIT 1",
+      [reminderId]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ ok: false, message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0645\u0648\u0631\u062F \u0646\u0638\u0631 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
+      return;
+    }
+    const existing = rows[0];
+    if (req.user.role !== "manager" && Number(existing.user_id) !== req.user.id && Number(existing.created_by_user_id) !== req.user.id) {
+      res.status(403).json({ ok: false, message: "\u0645\u062C\u0648\u0632 \u0648\u06CC\u0631\u0627\u06CC\u0634 \u0627\u06CC\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0631\u0627 \u0646\u062F\u0627\u0631\u06CC\u062F." });
+      return;
+    }
+    const rawTitle = String(req.body?.title ?? existing.title ?? "").trim();
+    const rawMessage = String(req.body?.message_text ?? existing.message_text ?? "").trim();
+    const messageText = rawMessage || rawTitle;
+    const title = rawTitle || messageText.slice(0, 80);
+    if (!messageText) {
+      res.status(400).json({ ok: false, message: "\u0645\u062A\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
+      return;
+    }
+    const rawShamsi = String(req.body?.shamsi_date || existing.shamsi_date).trim();
+    const shamsiDate = isValidShamsiDate(rawShamsi) ? normalizeShamsiDate(rawShamsi) : String(existing.shamsi_date);
+    const rawTime = toEnglishDigits(String(req.body?.reminder_time || existing.reminder_time)).trim().slice(0, 5);
+    const reminderTime = isValidTimeHHMMOrHHMMSS(rawTime, false) ? rawTime : String(existing.reminder_time).slice(0, 5);
+    const rawRepeatType = String(
+      req.body?.repeat_type || existing.repeat_type
+    ).trim();
+    const repeatType = ALLOWED_REMINDER_REPEAT_TYPES.has(rawRepeatType) ? rawRepeatType : "ONCE";
+    const repeatCount = repeatType === "ONCE" ? 1 : Math.min(365, Math.max(1, Math.round(Number(req.body?.repeat_count) || 2)));
+    const repeatIntervalMinutes = Math.min(
+      1440,
+      Math.max(1, Math.round(Number(req.body?.repeat_interval_minutes) || 15))
+    );
+    const rawScope = String(
+      req.body?.target_scope || existing.target_scope
+    ).trim();
+    const targetScope = req.user.role === "manager" && (rawScope === "WORKER" || rawScope === "BOTH") ? rawScope : "SELF";
+    await pool2.execute(
+      `UPDATE user_reminders
+       SET target_scope = ?,
+           title = ?,
+           message_text = ?,
+           shamsi_date = ?,
+           reminder_time = ?,
+           repeat_type = ?,
+           repeat_count = ?,
+           repeat_interval_minutes = ?,
+           triggered_count = 0,
+           next_trigger_shamsi = ?,
+           next_trigger_time = ?,
+           is_completed = 0,
+           is_active = 1
+       WHERE id = ?`,
+      [
+        targetScope,
+        title.slice(0, 250),
+        messageText.slice(0, 2e3),
+        shamsiDate,
+        reminderTime,
+        repeatType,
+        repeatCount,
+        repeatIntervalMinutes,
+        shamsiDate,
+        reminderTime,
+        reminderId
+      ]
+    );
+    res.json({
+      ok: true,
+      message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06CC \u0648 \u0641\u0639\u0627\u0644 \u0634\u062F."
+    });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+apiRouter.post(
+  "/reminders/:id/acknowledge",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const reminderId = Number(req.params.id);
+      if (!reminderId) {
+        res.status(400).json({ ok: false, message: "\u0634\u0646\u0627\u0633\u0647 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
+        return;
+      }
+      const action = String(req.body?.action || "ACKNOWLEDGE").trim();
+      const pool2 = getPool();
+      const [rows] = await pool2.execute(
+        "SELECT * FROM user_reminders WHERE id = ? LIMIT 1",
+        [reminderId]
+      );
+      if (rows.length === 0) {
+        res.status(404).json({ ok: false, message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
+        return;
+      }
+      const row = rows[0];
+      const reminder = mapRowToUserReminder(row);
+      if (action === "SNOOZE_10M") {
+        const settings = await getSystemSettingsFromDb();
+        const nowInfo = getNowInTimezone(settings.timezone);
+        const nowMins = parseTimeToMinutes(nowInfo.timeHHMM);
+        const snoozedTotal = nowMins + 10;
+        const wrappedMins = snoozedTotal % 1440;
+        const nextTime = `${pad2(Math.floor(wrappedMins / 60))}:${pad2(wrappedMins % 60)}`;
+        await pool2.execute(
+          `UPDATE user_reminders
+           SET next_trigger_shamsi = ?, next_trigger_time = ?, is_completed = 0, is_active = 1
+           WHERE id = ?`,
+          [nowInfo.shamsiDate, nextTime, reminderId]
+        );
+        res.json({
+          ok: true,
+          message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0628\u0631\u0627\u06CC \u06F1\u06F0 \u062F\u0642\u06CC\u0642\u0647 \u062F\u06CC\u06AF\u0631 \u062A\u0646\u0638\u06CC\u0645 \u0634\u062F."
+        });
+        return;
+      }
+      if (action === "COMPLETE_ALL") {
+        await pool2.execute(
+          `UPDATE user_reminders
+           SET is_completed = 1, triggered_count = repeat_count, last_triggered_at = NOW()
+           WHERE id = ?`,
+          [reminderId]
+        );
+        res.json({
+          ok: true,
+          message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0628\u0647 \u0639\u0646\u0648\u0627\u0646 \u0627\u0646\u062C\u0627\u0645\u200C\u0634\u062F\u0647 \u062F\u0631 \u0622\u0631\u0634\u06CC\u0648 \u062B\u0628\u062A \u06AF\u0631\u062F\u06CC\u062F."
+        });
+        return;
+      }
+      if (action === "REACTIVATE") {
+        const settings = await getSystemSettingsFromDb();
+        const nowInfo = getNowInTimezone(settings.timezone);
+        const nextDate = reminder.shamsi_date >= nowInfo.shamsiDate ? reminder.shamsi_date : nowInfo.shamsiDate;
+        await pool2.execute(
+          `UPDATE user_reminders
+           SET triggered_count = 0,
+               next_trigger_shamsi = ?,
+               next_trigger_time = ?,
+               is_completed = 0,
+               is_active = 1
+           WHERE id = ?`,
+          [nextDate, reminder.reminder_time, reminderId]
+        );
+        res.json({
+          ok: true,
+          message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0645\u062C\u062F\u062F\u0627\u064B \u0641\u0639\u0627\u0644 \u0634\u062F."
+        });
+        return;
+      }
+      const newTriggeredCount = reminder.triggered_count + 1;
+      const nextSchedule = computeNextReminderOccurrence({
+        currentTriggerShamsi: reminder.next_trigger_shamsi,
+        currentTriggerTime: reminder.next_trigger_time,
+        baseReminderTime: reminder.reminder_time,
+        repeatType: reminder.repeat_type,
+        repeatCount: reminder.repeat_count,
+        repeatIntervalMinutes: reminder.repeat_interval_minutes,
+        newTriggeredCount
+      });
+      await pool2.execute(
+        `UPDATE user_reminders
+         SET triggered_count = ?,
+             next_trigger_shamsi = ?,
+             next_trigger_time = ?,
+             is_completed = ?,
+             last_triggered_at = NOW()
+         WHERE id = ?`,
+        [
+          newTriggeredCount,
+          nextSchedule.nextTriggerShamsi,
+          nextSchedule.nextTriggerTime,
+          nextSchedule.isCompleted ? 1 : 0,
+          reminderId
+        ]
+      );
+      res.json({
+        ok: true,
+        isCompleted: nextSchedule.isCompleted,
+        nextTriggerShamsi: nextSchedule.nextTriggerShamsi,
+        nextTriggerTime: nextSchedule.nextTriggerTime,
+        triggeredCount: newTriggeredCount,
+        message: nextSchedule.isCompleted ? "\u062A\u0645\u0627\u0645 \u0646\u0648\u0628\u062A\u200C\u0647\u0627\u06CC \u0627\u06CC\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0628\u0647 \u067E\u0627\u06CC\u0627\u0646 \u0631\u0633\u06CC\u062F \u0648 \u062F\u0631 \u0622\u0631\u0634\u06CC\u0648 \u062B\u0628\u062A \u0634\u062F." : `\u0646\u0648\u0628\u062A ${toPersianDigits(newTriggeredCount)} \u062B\u0628\u062A \u0634\u062F\u061B \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0628\u0639\u062F\u06CC \u062F\u0631 ${toPersianDigits(nextSchedule.nextTriggerShamsi)} \u0633\u0627\u0639\u062A ${toPersianDigits(nextSchedule.nextTriggerTime)} \u0627\u0646\u062C\u0627\u0645 \u0645\u06CC\u200C\u0634\u0648\u062F.`
+      });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+apiRouter.delete(
+  "/reminders/:id",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const reminderId = Number(req.params.id);
+      const pool2 = getPool();
+      const [rows] = await pool2.execute(
+        "SELECT * FROM user_reminders WHERE id = ? LIMIT 1",
+        [reminderId]
+      );
+      if (rows.length === 0) {
+        res.status(404).json({ ok: false, message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
+        return;
+      }
+      if (req.user.role !== "manager" && Number(rows[0].user_id) !== req.user.id && Number(rows[0].created_by_user_id) !== req.user.id) {
+        res.status(403).json({ ok: false, message: "\u0645\u062C\u0648\u0632 \u062D\u0630\u0641 \u0627\u06CC\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0631\u0627 \u0646\u062F\u0627\u0631\u06CC\u062F." });
+        return;
+      }
+      await pool2.execute("DELETE FROM user_reminders WHERE id = ?", [reminderId]);
+      res.json({ ok: true, message: "\u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u062D\u0630\u0641 \u0634\u062F." });
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
 apiRouter.post(
   "/manager/mark-seen",
   requireAuth,
@@ -6137,10 +7315,28 @@ apiRouter.post(
         }
       }
       const managerNoteInput = req.body?.manager_note ? String(req.body.manager_note).trim().slice(0, 500) : "\u062B\u0628\u062A \u0645\u0633\u062A\u0642\u06CC\u0645 \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A";
+      const rawSettlementMode = String(req.body?.settlement_mode || "LUMP_SUM").trim();
+      const settlementMode = txType !== "PETTY_CASH" && rawSettlementMode === "INSTALLMENT" ? "INSTALLMENT" : "LUMP_SUM";
+      const rawMonthlyDeduction = toEnglishDigits(
+        String(req.body?.monthly_deduction_toman || "")
+      ).replace(/,/g, "").trim();
+      const parsedMonthlyDeduction = Number(rawMonthlyDeduction);
+      const monthlyDeductionToman = settlementMode === "INSTALLMENT" && Number.isFinite(parsedMonthlyDeduction) && parsedMonthlyDeduction > 0 ? Math.min(amountToman, Math.round(parsedMonthlyDeduction)) : null;
+      if (settlementMode === "INSTALLMENT" && (!monthlyDeductionToman || monthlyDeductionToman <= 0)) {
+        await conn.rollback();
+        res.status(400).json({
+          ok: false,
+          message: "\u0628\u0631\u0627\u06CC \u0627\u0639\u0645\u0627\u0644 \u0627\u0633\u062A\u0647\u0644\u0627\u06A9 \u062A\u062F\u0631\u06CC\u062C\u06CC \u0645\u0627\u0647\u0627\u0646\u0647\u060C \u062A\u0639\u06CC\u06CC\u0646 \u0645\u0628\u0644\u063A \u06A9\u0633\u0631 \u062E\u0648\u062F\u06A9\u0627\u0631 \u062F\u0631 \u0647\u0631 \u062F\u0648\u0631\u0647 \u0645\u0627\u0647\u0627\u0646\u0647 \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A."
+        });
+        return;
+      }
+      const installmentCount = settlementMode === "INSTALLMENT" && monthlyDeductionToman ? Math.max(1, Math.ceil(amountToman / monthlyDeductionToman)) : null;
+      const rawInstStart = req.body?.installment_start_shamsi ? toEnglishDigits(String(req.body.installment_start_shamsi)).trim() : "";
+      const installmentStartShamsi = settlementMode === "INSTALLMENT" ? rawInstStart && isValidShamsiDate(rawInstStart) ? normalizeShamsiDate(rawInstStart) : shamsiDate : null;
       const [result] = await conn.execute(
         `INSERT INTO financial_transactions
-          (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, receipt_file_url, receipt_file_name, status, is_seen_by_manager, reviewed_by_user_id, reviewed_at, manager_note, idempotency_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', 1, ?, NOW(), ?, ?)`,
+          (user_id, created_by_user_id, amount_toman, tx_type, tx_date, shamsi_date, description, receipt_file_url, receipt_file_name, status, is_seen_by_manager, reviewed_by_user_id, reviewed_at, manager_note, settlement_mode, monthly_deduction_toman, installment_count, installment_start_shamsi, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', 1, ?, NOW(), ?, ?, ?, ?, ?, ?)`,
         [
           workerId,
           managerId,
@@ -6153,6 +7349,10 @@ apiRouter.post(
           savedReceiptUrl ? receiptFileName : null,
           managerId,
           managerNoteInput || "\u062B\u0628\u062A \u0645\u0633\u062A\u0642\u06CC\u0645 \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A",
+          settlementMode,
+          monthlyDeductionToman,
+          installmentCount,
+          installmentStartShamsi,
           idempotencyKey
         ]
       );
@@ -6165,6 +7365,9 @@ apiRouter.post(
           amount_toman: amountToman,
           tx_type: txType,
           shamsi_date: shamsiDate,
+          settlement_mode: settlementMode,
+          monthly_deduction_toman: monthlyDeductionToman,
+          installment_count: installmentCount,
           status: "APPROVED"
         },
         ipAddress: req.ip || null,
@@ -6177,7 +7380,11 @@ apiRouter.post(
       res.status(201).json({
         ok: true,
         transactionId: result.insertId,
-        message: "\u067E\u0631\u062F\u0627\u062E\u062A / \u0633\u0627\u0628\u0642\u0647 \u0645\u0627\u0644\u06CC \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062B\u0628\u062A \u0648 \u0628\u0647 \u0645\u062C\u0645\u0648\u0639 \u067E\u0631\u062F\u0627\u062E\u062A\u200C\u0647\u0627\u06CC \u0642\u0637\u0639\u06CC \u0627\u0636\u0627\u0641\u0647 \u0634\u062F."
+        message: settlementMode === "INSTALLMENT" && monthlyDeductionToman ? `\u062A\u0639\u0647\u062F \u0645\u0627\u0644\u06CC \u067E\u0631\u0633\u0646\u0644 \u0628\u0627 \u0628\u0631\u0646\u0627\u0645\u0647 \u0627\u0633\u062A\u0647\u0644\u0627\u06A9 \u062E\u0648\u062F\u06A9\u0627\u0631 \u0645\u0627\u0647\u0627\u0646\u0647 (${toPersianDigits(
+          monthlyDeductionToman.toLocaleString("en-US")
+        )} \u062A\u0648\u0645\u0627\u0646 \u062F\u0631 \u0647\u0631 \u062F\u0648\u0631\u0647\u060C \u0637\u06CC ${toPersianDigits(
+          installmentCount || 1
+        )} \u062F\u0648\u0631\u0647 \u0645\u0627\u0647\u0627\u0646\u0647) \u062B\u0628\u062A \u0634\u062F.` : "\u067E\u0631\u062F\u0627\u062E\u062A / \u0633\u0627\u0628\u0642\u0647 \u0645\u0627\u0644\u06CC \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u062B\u0628\u062A \u0648 \u0628\u0647 \u0645\u062C\u0645\u0648\u0639 \u067E\u0631\u062F\u0627\u062E\u062A\u200C\u0647\u0627\u06CC \u0642\u0637\u0639\u06CC \u0627\u0636\u0627\u0641\u0647 \u0634\u062F."
       });
     } catch (err) {
       if (conn) {
@@ -6341,6 +7548,37 @@ apiRouter.put(
       const txDate = shamsiToGregorian(shamsiDate);
       const nextStatus = isManager && ["PENDING", "APPROVED", "REJECTED"].includes(statusInput) ? statusInput : existing.status;
       const nextManagerNote = isManager ? managerNote : existing.manager_note;
+      let nextSettlementMode = existing.settlement_mode || "LUMP_SUM";
+      let nextMonthlyDeduction = existing.monthly_deduction_toman ?? null;
+      let nextInstallmentCount = existing.installment_count ?? null;
+      let nextInstallmentStart = existing.installment_start_shamsi ?? null;
+      if (isManager && req.body?.settlement_mode !== void 0) {
+        const rawMode = String(req.body.settlement_mode || "LUMP_SUM").trim();
+        nextSettlementMode = txType !== "PETTY_CASH" && rawMode === "INSTALLMENT" ? "INSTALLMENT" : "LUMP_SUM";
+        if (nextSettlementMode === "INSTALLMENT") {
+          const rawM = toEnglishDigits(String(req.body?.monthly_deduction_toman || "")).replace(/,/g, "").trim();
+          const parsedM = Number(rawM);
+          if (!Number.isFinite(parsedM) || parsedM <= 0) {
+            await conn.rollback();
+            res.status(400).json({
+              ok: false,
+              message: "\u0644\u0637\u0641\u0627\u064B \u0645\u0628\u0644\u063A \u06A9\u0633\u0631 \u062E\u0648\u062F\u06A9\u0627\u0631 \u062F\u0631 \u0647\u0631 \u062F\u0648\u0631\u0647 \u0645\u0627\u0647\u0627\u0646\u0647 \u0631\u0627 \u0628\u0647 \u0635\u0648\u0631\u062A \u0639\u062F\u062F \u0635\u062D\u06CC\u062D \u0645\u062B\u0628\u062A \u0648\u0627\u0631\u062F \u06A9\u0646\u06CC\u062F."
+            });
+            return;
+          }
+          nextMonthlyDeduction = Math.min(amountToman, Math.round(parsedM));
+          nextInstallmentCount = Math.max(1, Math.ceil(amountToman / nextMonthlyDeduction));
+          const rawStart = req.body?.installment_start_shamsi ? toEnglishDigits(String(req.body.installment_start_shamsi)).trim() : "";
+          nextInstallmentStart = rawStart && isValidShamsiDate(rawStart) ? normalizeShamsiDate(rawStart) : shamsiDate;
+        } else {
+          nextMonthlyDeduction = null;
+          nextInstallmentCount = null;
+          nextInstallmentStart = null;
+        }
+      } else if (nextSettlementMode === "INSTALLMENT" && nextMonthlyDeduction) {
+        nextMonthlyDeduction = Math.min(amountToman, nextMonthlyDeduction);
+        nextInstallmentCount = Math.max(1, Math.ceil(amountToman / nextMonthlyDeduction));
+      }
       await conn.execute(
         `UPDATE financial_transactions
          SET amount_toman = ?,
@@ -6350,6 +7588,10 @@ apiRouter.put(
              description = ?,
              manager_note = ?,
              status = ?,
+             settlement_mode = ?,
+             monthly_deduction_toman = ?,
+             installment_count = ?,
+             installment_start_shamsi = ?,
              reviewed_by_user_id = CASE WHEN ? = 1 THEN ? ELSE reviewed_by_user_id END,
              reviewed_at = CASE WHEN ? = 1 THEN NOW() ELSE reviewed_at END
          WHERE id = ?`,
@@ -6361,6 +7603,10 @@ apiRouter.put(
           description,
           nextManagerNote,
           nextStatus,
+          nextSettlementMode,
+          nextMonthlyDeduction,
+          nextInstallmentCount,
+          nextInstallmentStart,
           isManager ? 1 : 0,
           req.user.id,
           isManager ? 1 : 0,
@@ -6376,12 +7622,16 @@ apiRouter.put(
           amount_toman: existing.amount_toman,
           tx_type: existing.tx_type,
           shamsi_date: existing.shamsi_date,
+          settlement_mode: existing.settlement_mode,
+          monthly_deduction_toman: existing.monthly_deduction_toman,
           status: existing.status
         },
         afterState: {
           amount_toman: amountToman,
           tx_type: txType,
           shamsi_date: shamsiDate,
+          settlement_mode: nextSettlementMode,
+          monthly_deduction_toman: nextMonthlyDeduction,
           status: nextStatus
         },
         ipAddress: req.ip || null,
@@ -6800,14 +8050,24 @@ apiRouter.get(
             confirmedAttendanceShamsiDates.add(normShamsi);
             const rowNetMins = Number(row.net_work_minutes || 0);
             const rowOtMins = Number(row.overtime_minutes || 0);
-            if (rowNetMins > 0 || rowOtMins > 0) {
+            if (rowNetMins > 0 || rowOtMins > 0 || row.late_status === "ABSENCE") {
               activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
             }
-            totalRecordedWorkDays += 1;
+            if (row.late_status !== "ABSENCE") {
+              totalRecordedWorkDays += 1;
+            }
             totalConfirmedNetWorkMinutes += rowNetMins;
             totalConfirmedOvertimeMinutes += rowOtMins;
             const effSet = await getSystemSettingsFromDb(normShamsi);
             const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+            const deductionRatesRow = calculateLateAndAbsenceRates(effSet);
+            if (row.late_deduction_toman && row.late_deduction_toman > 0) {
+              totalLateDeductionTomanAccum += Math.round(row.late_deduction_toman);
+            } else if (row.late_status === "ABSENCE") {
+              totalLateDeductionTomanAccum += deductionRatesRow.effectiveDailyAbsenceRateToman;
+            } else if (row.late_status === "CUSTOM") {
+              totalLateDeductionTomanAccum += row.custom_deduction_toman && row.custom_deduction_toman > 0 ? Math.round(row.custom_deduction_toman) : 0;
+            }
             hourlyEarnedRegularWorkToman += Math.round(
               rowNetMins / 60 * rowCalc.effectiveHourlyRateToman
             );
@@ -6876,6 +8136,17 @@ apiRouter.get(
         dailySummaries,
         historicalRecords
       );
+      pendingLateReviews.length = 0;
+      reviewedLateSummaries.length = 0;
+      for (const summary of mergedDailySummaries) {
+        if ((summary.raw_late_minutes || 0) > 0 || summary.late_status && summary.late_status !== "NONE") {
+          if (!summary.late_status || summary.late_status === "PENDING") {
+            pendingLateReviews.push(summary);
+          } else if (reviewedLateSummaries.length < 30) {
+            reviewedLateSummaries.push(summary);
+          }
+        }
+      }
       const confirmedChronological = [...mergedDailySummaries].filter((d) => d.logs.length > 0 || d.net_work_minutes > 0 || d.overtime_minutes > 0).sort((a, b) => a.work_date.localeCompare(b.work_date));
       const weeklyChartData = confirmedChronological.slice(-7).map((d) => ({
         shamsiDate: d.shamsi_date,
@@ -7263,6 +8534,7 @@ apiRouter.get(
       const [reports] = await pool2.execute("SELECT * FROM daily_work_reports");
       const [tasks] = await pool2.execute("SELECT * FROM work_tasks");
       const [correspondences] = await pool2.execute("SELECT * FROM work_correspondences");
+      const [reminders] = await pool2.execute("SELECT * FROM user_reminders");
       const backupPayload = {
         exported_at: (/* @__PURE__ */ new Date()).toISOString(),
         app: "Mgammon",
@@ -7273,11 +8545,37 @@ apiRouter.get(
         leaves,
         reports,
         tasks,
-        correspondences
+        correspondences,
+        reminders
       };
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.setHeader("Content-Disposition", 'attachment; filename="mgammon-backup.json"');
       res.send(JSON.stringify(backupPayload, null, 2));
+    } catch (err) {
+      handleServerError(res, err);
+    }
+  }
+);
+apiRouter.get(
+  "/manager/deploy-package",
+  requireAuth,
+  requireRole("manager"),
+  (_req, res) => {
+    try {
+      const zipPath = import_path3.default.resolve(process.cwd(), "mgammon-duo-cpanel-deploy.zip");
+      if (!import_fs3.default.existsSync(zipPath)) {
+        res.status(404).json({
+          ok: false,
+          message: "\u0641\u0627\u06CC\u0644 \u0628\u0633\u062A\u0647 \u0646\u0635\u0628\u06CC cPanel \u06CC\u0627\u0641\u062A \u0646\u0634\u062F."
+        });
+        return;
+      }
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="mgammon-duo-cpanel-deploy.zip"'
+      );
+      res.sendFile(zipPath);
     } catch (err) {
       handleServerError(res, err);
     }
@@ -7695,6 +8993,463 @@ apiRouter.get(
     }
   }
 );
+apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
+  try {
+    const pool2 = getPool();
+    const items = [];
+    const referencedUrls = /* @__PURE__ */ new Set();
+    const [corrRows] = await pool2.execute(
+      `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
+       FROM work_correspondences c
+       LEFT JOIN users u ON u.id = c.sender_user_id
+       ORDER BY c.id DESC`
+    );
+    for (const r of corrRows) {
+      const recordId = Number(r.id);
+      const senderLabel = r.sender_name || (r.sender_role === "manager" ? "\u0645\u062F\u06CC\u0631\u06CC\u062A" : "\u067E\u0631\u0633\u0646\u0644");
+      const shamsiDate = String(r.shamsi_date || "");
+      const recordedTime = String(r.recorded_time || "").slice(0, 5);
+      const createdAt = r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+      const msgPreview = String(r.message_text || "").trim().slice(0, 60) || "\u067E\u06CC\u0627\u0645 \u06A9\u0627\u0631\u06CC";
+      if (r.audio_url) {
+        const audioUrl = String(r.audio_url).trim();
+        referencedUrls.add(audioUrl);
+        const info = getMediaFileInfoOnDisk(audioUrl);
+        items.push({
+          id: `CORR_AUDIO_${recordId}`,
+          source_type: "CORRESPONDENCE_AUDIO",
+          category: "AUDIO",
+          record_id: recordId,
+          file_url: audioUrl,
+          file_name: import_path3.default.basename(audioUrl),
+          size_bytes: info.sizeBytes,
+          shamsi_date: shamsiDate,
+          recorded_time: recordedTime,
+          title_or_context: `\u0641\u0627\u06CC\u0644 \u0635\u0648\u062A\u06CC \u067E\u06CC\u0627\u0645: ${msgPreview}`,
+          sender_or_creator: senderLabel,
+          exists_on_disk: info.exists,
+          created_at: createdAt
+        });
+      }
+      if (r.attachments_json) {
+        let parsedAtts = [];
+        try {
+          parsedAtts = typeof r.attachments_json === "string" ? JSON.parse(r.attachments_json) : r.attachments_json;
+        } catch {
+          parsedAtts = [];
+        }
+        if (Array.isArray(parsedAtts)) {
+          parsedAtts.forEach((att, idx) => {
+            if (!att || !att.file_url) return;
+            const fileUrl = String(att.file_url).trim();
+            referencedUrls.add(fileUrl);
+            const info = getMediaFileInfoOnDisk(fileUrl);
+            const ext = import_path3.default.extname(fileUrl).toLowerCase();
+            const isImg = [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
+            const isAud = [".webm", ".ogg", ".mp3", ".m4a", ".wav"].includes(ext);
+            items.push({
+              id: `CORR_ATT_${recordId}_${idx}`,
+              source_type: "CORRESPONDENCE_ATTACHMENT",
+              category: isAud ? "AUDIO" : isImg ? "IMAGE" : "DOCUMENT",
+              record_id: recordId,
+              file_url: fileUrl,
+              file_name: att.file_name || import_path3.default.basename(fileUrl),
+              size_bytes: info.exists ? info.sizeBytes : Number(att.file_size || 0),
+              shamsi_date: shamsiDate,
+              recorded_time: recordedTime,
+              title_or_context: `\u067E\u06CC\u0648\u0633\u062A \u0645\u06A9\u0627\u062A\u0628\u0647: ${att.file_name || msgPreview}`,
+              sender_or_creator: senderLabel,
+              exists_on_disk: info.exists,
+              created_at: createdAt
+            });
+          });
+        }
+      }
+    }
+    const [repRows] = await pool2.execute(
+      `SELECT id, shamsi_date, recorded_time, activity_description, report_image_url, created_at
+       FROM daily_work_reports
+       WHERE report_image_url IS NOT NULL AND report_image_url != ''
+       ORDER BY id DESC`
+    );
+    for (const r of repRows) {
+      const recordId = Number(r.id);
+      const fileUrl = String(r.report_image_url).trim();
+      referencedUrls.add(fileUrl);
+      const info = getMediaFileInfoOnDisk(fileUrl);
+      items.push({
+        id: `REP_PHOTO_${recordId}`,
+        source_type: "REPORT_PHOTO",
+        category: "IMAGE",
+        record_id: recordId,
+        file_url: fileUrl,
+        file_name: import_path3.default.basename(fileUrl),
+        size_bytes: info.sizeBytes,
+        shamsi_date: String(r.shamsi_date || ""),
+        recorded_time: String(r.recorded_time || "").slice(0, 5),
+        title_or_context: `\u062A\u0635\u0648\u06CC\u0631 \u06AF\u0632\u0627\u0631\u0634 \u06A9\u0627\u0631: ${String(r.activity_description || "").slice(0, 60)}`,
+        sender_or_creator: "\u067E\u0631\u0633\u0646\u0644",
+        exists_on_disk: info.exists,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+    const [finRows] = await pool2.execute(
+      `SELECT f.id, f.shamsi_date, f.recorded_time, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
+       FROM financial_transactions f
+       LEFT JOIN users u ON u.id = f.created_by_user_id
+       WHERE f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
+       ORDER BY f.id DESC`
+    );
+    for (const r of finRows) {
+      const recordId = Number(r.id);
+      const fileUrl = String(r.receipt_file_url).trim();
+      referencedUrls.add(fileUrl);
+      const info = getMediaFileInfoOnDisk(fileUrl);
+      const ext = import_path3.default.extname(fileUrl).toLowerCase();
+      items.push({
+        id: `FIN_RECEIPT_${recordId}`,
+        source_type: "FINANCE_RECEIPT",
+        category: ext === ".pdf" ? "DOCUMENT" : "IMAGE",
+        record_id: recordId,
+        file_url: fileUrl,
+        file_name: r.receipt_file_name ? String(r.receipt_file_name) : import_path3.default.basename(fileUrl),
+        size_bytes: info.sizeBytes,
+        shamsi_date: String(r.shamsi_date || ""),
+        recorded_time: String(r.recorded_time || "").slice(0, 5),
+        title_or_context: `\u067E\u06CC\u0648\u0633\u062A \u0633\u0646\u062F \u0645\u0627\u0644\u06CC: ${String(r.description || "\u0631\u0633\u06CC\u062F \u062A\u0631\u0627\u06A9\u0646\u0634 \u0645\u0627\u0644\u06CC").slice(0, 60)}`,
+        sender_or_creator: r.creator_name ? String(r.creator_name) : "\u062B\u0628\u062A \u0645\u0627\u0644\u06CC",
+        exists_on_disk: info.exists,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+    const [histRows] = await pool2.execute(
+      `SELECT id, shamsi_date, title, excel_file_url, excel_file_name, created_at
+       FROM historical_work_records
+       WHERE excel_file_url IS NOT NULL AND excel_file_url != ''
+       ORDER BY id DESC`
+    );
+    for (const r of histRows) {
+      const recordId = Number(r.id);
+      const fileUrl = String(r.excel_file_url).trim();
+      referencedUrls.add(fileUrl);
+      const info = getMediaFileInfoOnDisk(fileUrl);
+      items.push({
+        id: `HIST_EXCEL_${recordId}`,
+        source_type: "HISTORICAL_EXCEL",
+        category: "DOCUMENT",
+        record_id: recordId,
+        file_url: fileUrl,
+        file_name: r.excel_file_name ? String(r.excel_file_name) : import_path3.default.basename(fileUrl),
+        size_bytes: info.sizeBytes,
+        shamsi_date: String(r.shamsi_date || ""),
+        title_or_context: `\u0641\u0627\u06CC\u0644 \u0627\u06A9\u0633\u0644 \u0633\u0648\u0627\u0628\u0642: ${String(r.title || "").slice(0, 60)}`,
+        sender_or_creator: "\u0622\u0631\u0634\u06CC\u0648 \u06A9\u0627\u0631\u06A9\u0631\u062F",
+        exists_on_disk: info.exists,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+    const baseDir = getBaseMediaDirPath();
+    const scanFolders = [
+      { folder: "audio", cat: "AUDIO" },
+      { folder: "reports", cat: "IMAGE" },
+      { folder: "receipts", cat: "IMAGE" },
+      { folder: "attachments", cat: "DOCUMENT" },
+      { folder: "excel", cat: "DOCUMENT" }
+    ];
+    for (const { folder, cat } of scanFolders) {
+      const dirPath = import_path3.default.join(baseDir, folder);
+      if (!import_fs3.default.existsSync(dirPath)) continue;
+      let fileNames = [];
+      try {
+        fileNames = import_fs3.default.readdirSync(dirPath);
+      } catch {
+        fileNames = [];
+      }
+      for (const fName of fileNames) {
+        const publicUrl = `/assets/media/${folder}/${fName}`;
+        if (referencedUrls.has(publicUrl)) continue;
+        const info = getMediaFileInfoOnDisk(publicUrl);
+        if (!info.exists) continue;
+        const mtimeIso = info.mtimeIso || (/* @__PURE__ */ new Date()).toISOString();
+        const shamsiDate = gregorianToShamsi(mtimeIso.slice(0, 10));
+        items.push({
+          id: `ORPHAN_${folder}_${fName}`,
+          source_type: "ORPHAN_FILE",
+          category: cat,
+          record_id: null,
+          file_url: publicUrl,
+          file_name: fName,
+          size_bytes: info.sizeBytes,
+          shamsi_date: shamsiDate,
+          title_or_context: `\u0641\u0627\u06CC\u0644 \u0630\u062E\u06CC\u0631\u0647\u200C\u0634\u062F\u0647 \u0631\u0648\u06CC \u0647\u0627\u0633\u062A (${folder})`,
+          sender_or_creator: "\u0633\u06CC\u0633\u062A\u0645",
+          exists_on_disk: true,
+          created_at: mtimeIso
+        });
+      }
+    }
+    let totalSizeBytes = 0;
+    let audioCount = 0;
+    let audioBytes = 0;
+    let imageCount = 0;
+    let imageBytes = 0;
+    let docCount = 0;
+    let docBytes = 0;
+    for (const item of items) {
+      totalSizeBytes += item.size_bytes;
+      if (item.category === "AUDIO") {
+        audioCount += 1;
+        audioBytes += item.size_bytes;
+      } else if (item.category === "IMAGE") {
+        imageCount += 1;
+        imageBytes += item.size_bytes;
+      } else {
+        docCount += 1;
+        docBytes += item.size_bytes;
+      }
+    }
+    const summary = {
+      total_files_count: items.length,
+      total_size_bytes: totalSizeBytes,
+      audio_files_count: audioCount,
+      audio_size_bytes: audioBytes,
+      image_files_count: imageCount,
+      image_size_bytes: imageBytes,
+      document_files_count: docCount,
+      document_size_bytes: docBytes,
+      items
+    };
+    res.json({ ok: true, storage: summary });
+  } catch (err) {
+    handleServerError(res, err);
+  }
+});
+apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
+  const pool2 = getPool();
+  let conn = null;
+  try {
+    const actorId = req.user.id;
+    const actorRole = req.user.role;
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const olderThanDays = req.body?.older_than_days !== void 0 && req.body?.older_than_days !== null ? Number(req.body.older_than_days) : null;
+    const targetCategory = req.body?.category ? String(req.body.category).toUpperCase() : "ALL";
+    conn = await pool2.getConnection();
+    await conn.beginTransaction();
+    const targets = [...rawItems];
+    if (targets.length === 0 && olderThanDays !== null && !Number.isNaN(olderThanDays) && olderThanDays >= 0) {
+      const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1e3;
+      const [corrRows] = await conn.execute(
+        `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences FOR UPDATE`
+      );
+      for (const r of corrRows) {
+        const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+        if (createdMs > cutoffMs) continue;
+        const recId = Number(r.id);
+        if (r.audio_url && (targetCategory === "ALL" || targetCategory === "AUDIO")) {
+          targets.push({
+            source_type: "CORRESPONDENCE_AUDIO",
+            record_id: recId,
+            file_url: String(r.audio_url).trim()
+          });
+        }
+        if (r.attachments_json) {
+          let parsedAtts = [];
+          try {
+            parsedAtts = typeof r.attachments_json === "string" ? JSON.parse(r.attachments_json) : r.attachments_json;
+          } catch {
+            parsedAtts = [];
+          }
+          if (Array.isArray(parsedAtts)) {
+            for (const att of parsedAtts) {
+              if (!att?.file_url) continue;
+              const ext = import_path3.default.extname(att.file_url).toLowerCase();
+              const isImg = [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
+              const isAud = [".webm", ".ogg", ".mp3", ".m4a", ".wav"].includes(ext);
+              const cat = isAud ? "AUDIO" : isImg ? "IMAGE" : "DOCUMENT";
+              if (targetCategory === "ALL" || targetCategory === cat) {
+                targets.push({
+                  source_type: "CORRESPONDENCE_ATTACHMENT",
+                  record_id: recId,
+                  file_url: String(att.file_url).trim()
+                });
+              }
+            }
+          }
+        }
+      }
+      if (targetCategory === "ALL" || targetCategory === "IMAGE") {
+        const [repRows] = await conn.execute(
+          `SELECT id, report_image_url, created_at FROM daily_work_reports WHERE report_image_url IS NOT NULL AND report_image_url != '' FOR UPDATE`
+        );
+        for (const r of repRows) {
+          const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+          if (createdMs > cutoffMs) continue;
+          targets.push({
+            source_type: "REPORT_PHOTO",
+            record_id: Number(r.id),
+            file_url: String(r.report_image_url).trim()
+          });
+        }
+      }
+      if (targetCategory === "ALL" || targetCategory === "IMAGE" || targetCategory === "DOCUMENT") {
+        const [finRows] = await conn.execute(
+          `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`
+        );
+        for (const r of finRows) {
+          const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+          if (createdMs > cutoffMs) continue;
+          targets.push({
+            source_type: "FINANCE_RECEIPT",
+            record_id: Number(r.id),
+            file_url: String(r.receipt_file_url).trim()
+          });
+        }
+      }
+      if (targetCategory === "ALL" || targetCategory === "DOCUMENT") {
+        const [histRows] = await conn.execute(
+          `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`
+        );
+        for (const r of histRows) {
+          const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+          if (createdMs > cutoffMs) continue;
+          targets.push({
+            source_type: "HISTORICAL_EXCEL",
+            record_id: Number(r.id),
+            file_url: String(r.excel_file_url).trim()
+          });
+        }
+      }
+    }
+    if (targets.length === 0) {
+      await conn.rollback();
+      res.status(200).json({
+        ok: true,
+        deletedCount: 0,
+        freedBytes: 0,
+        message: "\u0641\u0627\u06CC\u0644\u06CC \u0645\u0637\u0627\u0628\u0642 \u0628\u0627 \u0634\u0631\u0627\u06CC\u0637 \u0627\u0646\u062A\u062E\u0627\u0628\u06CC \u062C\u0647\u062A \u067E\u0627\u06A9\u0633\u0627\u0632\u06CC \u06CC\u0627\u0641\u062A \u0646\u0634\u062F."
+      });
+      return;
+    }
+    let deletedCount = 0;
+    let freedBytes = 0;
+    for (const target of targets) {
+      const sourceType = String(target.source_type || "").toUpperCase();
+      const recordId = target.record_id ? Number(target.record_id) : null;
+      const fileUrl = String(target.file_url || "").trim();
+      if (!fileUrl) continue;
+      if (sourceType === "CORRESPONDENCE_AUDIO" && recordId) {
+        const [rows] = await conn.execute(
+          `SELECT id, message_text, audio_url FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          const currentMsg = String(rows[0].message_text || "").trim();
+          const updatedMsg = !currentMsg || currentMsg === "\u067E\u06CC\u0627\u0645 \u0635\u0648\u062A\u06CC \u062C\u062F\u06CC\u062F" ? "\u067E\u06CC\u0627\u0645 \u0635\u0648\u062A\u06CC (\u0641\u0627\u06CC\u0644 \u0635\u0648\u062A\u06CC \u062C\u0647\u062A \u0622\u0632\u0627\u062F\u0633\u0627\u0632\u06CC \u0641\u0636\u0627\u06CC \u0647\u0627\u0633\u062A \u062D\u0630\u0641 \u0634\u062F)" : currentMsg;
+          await conn.execute(
+            `UPDATE work_correspondences SET audio_url = NULL, audio_duration_seconds = NULL, message_text = ? WHERE id = ?`,
+            [updatedMsg, recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].audio_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === "CORRESPONDENCE_ATTACHMENT" && recordId) {
+        const [rows] = await conn.execute(
+          `SELECT id, message_text, attachments_json FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          let parsedAtts = [];
+          try {
+            parsedAtts = typeof rows[0].attachments_json === "string" ? JSON.parse(rows[0].attachments_json) : rows[0].attachments_json || [];
+          } catch {
+            parsedAtts = [];
+          }
+          const remaining = Array.isArray(parsedAtts) ? parsedAtts.filter((a) => String(a?.file_url || "").trim() !== fileUrl) : [];
+          const currentMsg = String(rows[0].message_text || "").trim();
+          const updatedMsg = !currentMsg || currentMsg === "\u0641\u0627\u06CC\u0644 \u067E\u06CC\u0648\u0633\u062A \u062C\u062F\u06CC\u062F" ? "\u067E\u06CC\u0648\u0633\u062A \u0645\u06A9\u0627\u062A\u0628\u0647 (\u0641\u0627\u06CC\u0644 \u067E\u06CC\u0648\u0633\u062A \u062C\u0647\u062A \u0622\u0632\u0627\u062F\u0633\u0627\u0632\u06CC \u0641\u0636\u0627\u06CC \u0647\u0627\u0633\u062A \u062D\u0630\u0641 \u0634\u062F)" : currentMsg;
+          await conn.execute(
+            `UPDATE work_correspondences SET attachments_json = ?, message_text = ? WHERE id = ?`,
+            [remaining.length > 0 ? JSON.stringify(remaining) : null, updatedMsg, recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === "REPORT_PHOTO" && recordId) {
+        const [rows] = await conn.execute(
+          `SELECT id, report_image_url FROM daily_work_reports WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          await conn.execute(
+            `UPDATE daily_work_reports SET report_image_url = NULL WHERE id = ?`,
+            [recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].report_image_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === "FINANCE_RECEIPT" && recordId) {
+        const [rows] = await conn.execute(
+          `SELECT id, receipt_file_url FROM financial_transactions WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          await conn.execute(
+            `UPDATE financial_transactions SET receipt_file_url = NULL, receipt_file_name = NULL WHERE id = ?`,
+            [recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].receipt_file_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === "HISTORICAL_EXCEL" && recordId) {
+        const [rows] = await conn.execute(
+          `SELECT id, excel_file_url FROM historical_work_records WHERE id = ? FOR UPDATE`,
+          [recordId]
+        );
+        if (rows.length > 0) {
+          await conn.execute(
+            `UPDATE historical_work_records SET excel_file_url = NULL, excel_file_name = NULL WHERE id = ?`,
+            [recordId]
+          );
+          freedBytes += unlinkMediaUrlFromDisk(rows[0].excel_file_url || fileUrl);
+          deletedCount += 1;
+        }
+      } else if (sourceType === "ORPHAN_FILE") {
+        freedBytes += unlinkMediaUrlFromDisk(fileUrl);
+        deletedCount += 1;
+      }
+    }
+    await recordAuditLog({
+      actorUserId: actorId,
+      actionType: "MEDIA_STORAGE_CLEANUP",
+      targetEntity: "private_media",
+      afterState: {
+        actor_role: actorRole,
+        deleted_count: deletedCount,
+        freed_bytes: freedBytes
+      },
+      reason: "\u067E\u0627\u06A9\u0633\u0627\u0632\u06CC \u0641\u0627\u06CC\u0644\u200C\u0647\u0627\u06CC \u0686\u0646\u062F\u0631\u0633\u0627\u0646\u0647\u200C\u0627\u06CC \u0648 \u0622\u0632\u0627\u062F\u0633\u0627\u0632\u06CC \u0641\u0636\u0627\u06CC \u0630\u062E\u06CC\u0631\u0647\u200C\u0633\u0627\u0632\u06CC \u0647\u0627\u0633\u062A",
+      ipAddress: req.ip || null,
+      connection: conn
+    });
+    await conn.commit();
+    res.json({
+      ok: true,
+      deletedCount,
+      freedBytes,
+      message: `${deletedCount} \u0641\u0627\u06CC\u0644 \u0686\u0646\u062F\u0631\u0633\u0627\u0646\u0647\u200C\u0627\u06CC \u0628\u0627 \u0645\u0648\u0641\u0642\u06CC\u062A \u0627\u0632 \u062D\u0627\u0641\u0638\u0647 \u0647\u0627\u0633\u062A \u062D\u0630\u0641 \u0648 \u0641\u0636\u0627\u06CC \u0630\u062E\u06CC\u0631\u0647\u200C\u0633\u0627\u0632\u06CC \u0622\u0632\u0627\u062F\u0633\u0627\u0632\u06CC \u06AF\u0631\u062F\u06CC\u062F (\u0627\u0637\u0644\u0627\u0639\u0627\u062A \u0645\u062A\u0646\u06CC \u0648 \u0645\u0627\u0644\u06CC \u06A9\u0627\u0645\u0644\u0627\u064B \u0645\u062D\u0641\u0648\u0638 \u0645\u0627\u0646\u062F).`
+    });
+  } catch (err) {
+    if (conn) {
+      try {
+        await conn.rollback();
+      } catch {
+      }
+    }
+    handleServerError(res, err);
+  } finally {
+    if (conn) conn.release();
+  }
+});
 
 // server.ts
 var PRIVATE_MEDIA_FOLDERS = /* @__PURE__ */ new Set([
@@ -7748,6 +9503,12 @@ async function createApp() {
     }
     if (!isDatabaseInitialized()) {
       await waitForPendingDatabaseInit();
+    }
+    if (!isDatabaseInitialized() && process.env.VITEST !== "true") {
+      try {
+        await initializeDatabase();
+      } catch {
+      }
     }
     if (!isDatabaseInitialized()) {
       res.status(503).json({

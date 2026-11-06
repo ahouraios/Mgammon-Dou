@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { SystemSettings, UserProfile } from './shared/types';
 import {
   AUTH_EXPIRED_EVENT,
@@ -7,9 +7,15 @@ import {
   setStoredToken,
 } from './services/api';
 import {
+  APP_LOCK_CONFIG_CHANGED_EVENT,
+  APP_LOCK_TRIGGER_EVENT,
   authenticateWithDeviceBiometric,
+  getAppLockConfig,
   getStoredBiometricInfo,
+  isAppCurrentlyLocked,
+  setAppCurrentlyLocked,
   StoredBiometricInfo,
+  triggerImmediateAppLock,
 } from './services/biometric';
 import { BrandLogo, updateAppNotificationBadge } from './components/BrandLogo';
 import { PWAInstallButton } from './components/PWAInstallButton';
@@ -18,7 +24,9 @@ import { ForgotPasswordModal } from './components/ForgotPasswordModal';
 import { Footer } from './components/Footer';
 import { WorkerPanel } from './components/WorkerPanel';
 import { ManagerPanel } from './components/ManagerPanel';
-import { LogOut, AlertTriangle, Fingerprint, Eye, EyeOff } from 'lucide-react';
+import { AppLockOverlay } from './components/AppLockOverlay';
+import { HeaderRemindersManager } from './components/RemindersSection';
+import { LogOut, AlertTriangle, Fingerprint, Eye, EyeOff, Lock } from 'lucide-react';
 
 const REMEMBERED_USERNAME_KEY = 'mgammon_remembered_username';
 const REMEMBER_ME_KEY = 'mgammon_remember_me';
@@ -37,6 +45,9 @@ export default function App() {
   const [serverShamsiDate, setServerShamsiDate] = useState('1405/07/30');
   const [bannerBgUrl, setBannerBgUrl] = useState<string | null>('/assets/media/banner-bg.webp');
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [isLocked, setIsLocked] = useState<boolean>(() => isAppCurrentlyLocked());
+  const lastActivityRef = useRef<number>(Date.now());
+  const hiddenSinceRef = useRef<number | null>(null);
 
   // فرم ورود
   const [username, setUsername] = useState(() => getRememberedUsername());
@@ -52,10 +63,86 @@ export default function App() {
     setStoredBio(getStoredBiometricInfo());
   }, [user]);
 
+  // پایش عدم استفاده (Auto-Lock) و قفل شدن خودکار صفحه پس از زمان تعیین‌شده
+  useEffect(() => {
+    if (!user) {
+      setIsLocked(false);
+      setAppCurrentlyLocked(false);
+      return;
+    }
+
+    const updateActivity = () => {
+      lastActivityRef.current = Date.now();
+    };
+
+    const handleTriggerLock = () => {
+      setAppCurrentlyLocked(true);
+      setIsLocked(true);
+    };
+
+    const handleConfigChange = () => {
+      const cfg = getAppLockConfig();
+      if (!cfg.enabled) {
+        setAppCurrentlyLocked(false);
+        setIsLocked(false);
+      }
+      lastActivityRef.current = Date.now();
+    };
+
+    const handleVisibilityChange = () => {
+      const cfg = getAppLockConfig();
+      if (document.hidden) {
+        hiddenSinceRef.current = Date.now();
+      } else {
+        if (
+          cfg.enabled &&
+          cfg.lockOnBackground &&
+          hiddenSinceRef.current &&
+          Date.now() - hiddenSinceRef.current >= 15000
+        ) {
+          setAppCurrentlyLocked(true);
+          setIsLocked(true);
+        }
+        hiddenSinceRef.current = null;
+      }
+    };
+
+    const activityEvents = ['mousedown', 'mousemove', 'keydown', 'touchstart', 'scroll', 'click'];
+    for (const ev of activityEvents) {
+      window.addEventListener(ev, updateActivity, { passive: true });
+    }
+    window.addEventListener(APP_LOCK_TRIGGER_EVENT, handleTriggerLock);
+    window.addEventListener(APP_LOCK_CONFIG_CHANGED_EVENT, handleConfigChange);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    const checkInterval = setInterval(() => {
+      const cfg = getAppLockConfig();
+      if (!cfg.enabled) return;
+      const idleMs = Date.now() - lastActivityRef.current;
+      const timeoutMs = Math.max(1, cfg.timeoutMinutes) * 60 * 1000;
+      if (idleMs >= timeoutMs) {
+        setAppCurrentlyLocked(true);
+        setIsLocked(true);
+      }
+    }, 5000);
+
+    return () => {
+      for (const ev of activityEvents) {
+        window.removeEventListener(ev, updateActivity);
+      }
+      window.removeEventListener(APP_LOCK_TRIGGER_EVENT, handleTriggerLock);
+      window.removeEventListener(APP_LOCK_CONFIG_CHANGED_EVENT, handleConfigChange);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      clearInterval(checkInterval);
+    };
+  }, [user]);
+
   useEffect(() => {
     const handleAuthExpired = () => {
       setStoredToken(null);
       setUser(null);
+      setAppCurrentlyLocked(false);
+      setIsLocked(false);
       updateAppNotificationBadge(0);
     };
     const handleConnectionRestored = () => {
@@ -180,6 +267,9 @@ export default function App() {
       } catch {
         // ignore storage errors
       }
+      setAppCurrentlyLocked(false);
+      setIsLocked(false);
+      lastActivityRef.current = Date.now();
       setUser(res.user);
       setPassword('');
       setShowPassword(false);
@@ -196,6 +286,9 @@ export default function App() {
     setLoginLoading(true);
     try {
       const loggedInUser = await authenticateWithDeviceBiometric();
+      setAppCurrentlyLocked(false);
+      setIsLocked(false);
+      lastActivityRef.current = Date.now();
       setUser(loggedInUser);
     } catch (err) {
       setLoginError((err as Error).message);
@@ -212,6 +305,8 @@ export default function App() {
     } finally {
       setStoredToken(null);
       setUser(null);
+      setAppCurrentlyLocked(false);
+      setIsLocked(false);
       updateAppNotificationBadge(0);
       const savedUsername = getRememberedUsername();
       setUsername(savedUsername);
@@ -245,6 +340,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F9FAFB] text-[#0B192C] overflow-x-hidden">
+      {/* صفحه قفل خودکار و دستی برنامه با اثر انگشت / چهره / رمز */}
+      {user && isLocked && (
+        <AppLockOverlay
+          user={user}
+          onUnlock={() => {
+            setAppCurrentlyLocked(false);
+            setIsLocked(false);
+            lastActivityRef.current = Date.now();
+          }}
+          onLogout={handleLogout}
+        />
+      )}
+
       {/* هدر مینیمال سفید، سرمه‌ای و طلایی همراه با تقویم کوچک شمسی */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-[#C5A059]/45 px-3.5 py-2.5">
         <div className="max-w-5xl mx-auto flex items-center justify-between gap-2 sm:gap-3">
@@ -264,17 +372,34 @@ export default function App() {
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             <TopShamsiCalendarBar serverShamsiDate={serverShamsiDate} />
+            {user && (
+              <HeaderRemindersManager
+                role={user.role}
+                serverShamsiDate={serverShamsiDate}
+              />
+            )}
             <PWAInstallButton />
             {user && (
-              <button
-                type="button"
-                onClick={handleLogout}
-                title="خروج از حساب کاربری"
-                className="min-h-[38px] px-3 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059]/60 hover:bg-[#142844] text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-                <span>خروج</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={triggerImmediateAppLock}
+                  title="قفل فوری صفحه برنامه"
+                  className="min-h-[38px] px-2.5 rounded-xl bg-[#FCF9F2] hover:bg-[#C5A059]/25 text-[#0B192C] border border-[#C5A059]/60 text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                >
+                  <Lock className="w-3.5 h-3.5 text-[#9A7428]" />
+                  <span className="hidden sm:inline">قفل</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  title="خروج از حساب کاربری"
+                  className="min-h-[38px] px-3 rounded-xl bg-[#0B192C] text-[#C5A059] border border-[#C5A059]/60 hover:bg-[#142844] text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>خروج</span>
+                </button>
+              </>
             )}
           </div>
         </div>
