@@ -4762,11 +4762,11 @@ apiRouter.post('/reminders', requireAuth, async (req: AuthenticatedRequest, res:
   try {
     const rawTitle = String(req.body?.title || '').trim();
     const rawMessage = String(req.body?.message_text || '').trim();
-    const messageText = rawMessage || rawTitle;
-    const title = rawTitle || messageText.slice(0, 80);
+    const title = rawTitle || rawMessage.slice(0, 80);
+    const messageText = rawMessage;
 
-    if (!messageText) {
-      res.status(400).json({ ok: false, message: 'متن یادآوری الزامی است.' });
+    if (!title) {
+      res.status(400).json({ ok: false, message: 'عنوان یادآوری الزامی است.' });
       return;
     }
 
@@ -4881,12 +4881,15 @@ apiRouter.put('/reminders/:id', requireAuth, async (req: AuthenticatedRequest, r
     }
 
     const rawTitle = String(req.body?.title ?? existing.title ?? '').trim();
-    const rawMessage = String(req.body?.message_text ?? existing.message_text ?? '').trim();
-    const messageText = rawMessage || rawTitle;
-    const title = rawTitle || messageText.slice(0, 80);
+    const rawMessage =
+      req.body?.message_text !== undefined
+        ? String(req.body.message_text || '').trim()
+        : String(existing.message_text || '').trim();
+    const title = rawTitle;
+    const messageText = rawMessage;
 
-    if (!messageText) {
-      res.status(400).json({ ok: false, message: 'متن یادآوری الزامی است.' });
+    if (!title) {
+      res.status(400).json({ ok: false, message: 'عنوان یادآوری الزامی است.' });
       return;
     }
 

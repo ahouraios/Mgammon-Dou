@@ -218,12 +218,12 @@ export const RemindersSection: React.FC<RemindersSectionProps> = ({
     e.preventDefault();
     setFeedback(null);
 
-    const cleanMessage = messageText.trim() || title.trim();
-    const cleanTitle = title.trim() || cleanMessage.slice(0, 60);
-    if (!cleanMessage) {
+    const cleanTitle = title.trim();
+    const cleanMessage = messageText.trim();
+    if (!cleanTitle) {
       setFeedback({
         type: 'error',
-        text: 'لطفاً متن دلخواه یادآوری را وارد نمایید.',
+        text: 'لطفاً عنوان یادآوری را وارد نمایید.',
       });
       return;
     }
@@ -374,14 +374,16 @@ export const RemindersSection: React.FC<RemindersSectionProps> = ({
               />
             </div>
 
-            {/* عنوان و متن دلخواه یادآوری */}
+            {/* عنوان (الزامی با ستاره قرمز ریز) و متن دلخواه یادآوری */}
             <div className="space-y-2.5">
               <div>
                 <label className="block text-xs font-bold text-[#0B192C] mb-1">
-                  عنوان کوتاه یادآوری (اختیاری)
+                  عنوان یادآوری
+                  <span className="text-red-600 text-[11px] font-extrabold mr-1 align-middle">*</span>
                 </label>
                 <input
                   type="text"
+                  required
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   placeholder="مثلاً: پیگیری فاکتور، تماس با مشتری، سررسید چک..."
@@ -391,14 +393,13 @@ export const RemindersSection: React.FC<RemindersSectionProps> = ({
 
               <div>
                 <label className="block text-xs font-bold text-[#0B192C] mb-1">
-                  متن دلخواه یادآوری (الزامی)
+                  متن دلخواه یادآوری
                 </label>
                 <textarea
                   rows={3}
-                  required
                   value={messageText}
                   onChange={(e) => setMessageText(e.target.value)}
-                  placeholder="متن کامل یادآوری یا توضیحات مورد نظر خود را اینجا بنویسید..."
+                  placeholder="توضیحات یا متن دلخواه یادآوری (در صورت نیاز)..."
                   className="w-full rounded-xl border border-slate-200 bg-white p-3 text-xs leading-6 focus:outline-none focus:border-[#0B192C]"
                 />
               </div>

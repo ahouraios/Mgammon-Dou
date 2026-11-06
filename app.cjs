@@ -6741,10 +6741,10 @@ apiRouter.post("/reminders", requireAuth, async (req, res) => {
   try {
     const rawTitle = String(req.body?.title || "").trim();
     const rawMessage = String(req.body?.message_text || "").trim();
-    const messageText = rawMessage || rawTitle;
-    const title = rawTitle || messageText.slice(0, 80);
-    if (!messageText) {
-      res.status(400).json({ ok: false, message: "\u0645\u062A\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
+    const title = rawTitle || rawMessage.slice(0, 80);
+    const messageText = rawMessage;
+    if (!title) {
+      res.status(400).json({ ok: false, message: "\u0639\u0646\u0648\u0627\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
       return;
     }
     const settings = await getSystemSettingsFromDb();
@@ -6832,11 +6832,11 @@ apiRouter.put("/reminders/:id", requireAuth, async (req, res) => {
       return;
     }
     const rawTitle = String(req.body?.title ?? existing.title ?? "").trim();
-    const rawMessage = String(req.body?.message_text ?? existing.message_text ?? "").trim();
-    const messageText = rawMessage || rawTitle;
-    const title = rawTitle || messageText.slice(0, 80);
-    if (!messageText) {
-      res.status(400).json({ ok: false, message: "\u0645\u062A\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
+    const rawMessage = req.body?.message_text !== void 0 ? String(req.body.message_text || "").trim() : String(existing.message_text || "").trim();
+    const title = rawTitle;
+    const messageText = rawMessage;
+    if (!title) {
+      res.status(400).json({ ok: false, message: "\u0639\u0646\u0648\u0627\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0627\u0644\u0632\u0627\u0645\u06CC \u0627\u0633\u062A." });
       return;
     }
     const rawShamsi = String(req.body?.shamsi_date || existing.shamsi_date).trim();
