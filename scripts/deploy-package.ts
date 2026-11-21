@@ -39,7 +39,6 @@ function validatePrePackageArtifacts(): void {
     'dist/sw.js',
     'database/schema.sql',
     'package.json',
-    'package-lock.json',
     '.env.example',
     'DEPLOYMENT_CPANEL.md',
   ];
@@ -53,6 +52,12 @@ function validatePrePackageArtifacts(): void {
     if (stat.size === 0) {
       throw new Error(`FILE_EMPTY: فایل "${rel}" خالی (۰ بایت) است.`);
     }
+  }
+
+  if (!fs.existsSync(path.resolve(ROOT_DIR, 'package-lock.json'))) {
+    console.warn(
+      '[DEPLOY:PACKAGE INFO] فایل package-lock.json موجود نیست؛ بسته‌بندی بر اساس package.json انجام می‌شود و cPanel در Run NPM Install وابستگی‌ها را از روی آن نصب خواهد کرد.'
+    );
   }
 
   // بررسی عدم نشت فایل‌های باینری تست یا فایل محرمانه .env

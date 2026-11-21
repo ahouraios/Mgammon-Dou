@@ -1,6 +1,16 @@
-const SESSION_TOKEN_STORAGE_KEY = 'mgammon_session_token';
+const LEGACY_SESSION_TOKEN_STORAGE_KEY = 'mgammon_session_token';
 let inMemoryCsrfToken: string | null = null;
 let inMemorySessionToken: string | null = null;
+
+// پاکسازی خودکار هرگونه توکن نشست قدیمی باقی‌مانده از نسخه‌های قبلی در localStorage / sessionStorage
+if (typeof window !== 'undefined') {
+  try {
+    window.localStorage?.removeItem(LEGACY_SESSION_TOKEN_STORAGE_KEY);
+    window.sessionStorage?.removeItem(LEGACY_SESSION_TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
 
 function readCookie(name: string): string | null {
   if (typeof document === 'undefined' || !document.cookie) return null;
@@ -15,47 +25,36 @@ function readCookie(name: string): string | null {
 }
 
 export function getStoredToken(): string | null {
-  if (inMemorySessionToken) return inMemorySessionToken;
-  try {
-    const stored =
-      sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY) ||
-      localStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
-    if (stored && stored.trim().length >= 32) {
-      inMemorySessionToken = stored.trim();
-      return inMemorySessionToken;
-    }
-  } catch {
-    // ignore storage errors
-  }
-  return null;
+  return inMemorySessionToken;
 }
 
 export function setStoredToken(token: string | null): void {
   const normalized = token && token.trim().length >= 32 ? token.trim() : null;
   inMemorySessionToken = normalized;
+  if (!normalized) {
+    inMemoryCsrfToken = null;
+  }
   try {
-    if (normalized) {
-      sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
-      localStorage.setItem(SESSION_TOKEN_STORAGE_KEY, normalized);
-    } else {
-      sessionStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
-      localStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
+    if (typeof window !== 'undefined') {
+      window.sessionStorage?.removeItem(LEGACY_SESSION_TOKEN_STORAGE_KEY);
+      window.localStorage?.removeItem(LEGACY_SESSION_TOKEN_STORAGE_KEY);
     }
   } catch {
     // ignore storage errors
   }
 }
 
+/**
+ * نشانی امن فایل‌ها و گزارش‌ها:
+ * احراز هویت از طریق کوکی HttpOnly نشست انجام می‌شود و توکن هرگز در Query String قرار نمی‌گیرد.
+ */
 export function withAuthTokenUrl(url: string | null | undefined): string {
   if (!url) return '';
-  const token = getStoredToken();
-  if (!token) return url;
-  if (url.startsWith('data:') || url.startsWith('blob:')) return url;
-  const separator = url.includes('?') ? '&' : '?';
-  return `${url}${separator}token=${encodeURIComponent(token)}`;
+  return url;
 }
 
 export const AUTH_EXPIRED_EVENT = 'mgammon:auth-expired';
+export const PASSWORD_CHANGE_REQUIRED_EVENT = 'mgammon:password-change-required';
 export const CONNECTION_RESTORED_EVENT = 'mgammon:connection-restored';
 
 export function isConnectionErrorMessage(msg: string | null | undefined): boolean {
@@ -77,14 +76,17 @@ export async function apiRequest<T>(
     ...(options.headers as Record<string, string> | undefined),
   };
 
-  const sessionToken = getStoredToken();
-  if (sessionToken && !headers['Authorization']) {
-    headers['Authorization'] = `Bearer ${sessionToken}`;
-  }
-
-  const csrfToken = inMemoryCsrfToken || readCookie('mgammon_csrf_token');
+  const cookieCsrfToken = readCookie('mgammon_csrf_token');
+  const csrfToken = inMemoryCsrfToken || cookieCsrfToken;
   if (csrfToken) {
     headers['X-CSRF-Token'] = csrfToken;
+  }
+
+  // در محیط عادی مرورگر (Same-Origin)، احراز هویت کاملاً از طریق کوکی HttpOnly + توکن CSRF انجام می‌شود.
+  // تنها در صورت مسدود بودن کوکی (مثلاً پیش‌نمایش داخل iframe با دامنه متفاوت)، توکن حافظه موقت (RAM) ارسال می‌شود.
+  const sessionToken = getStoredToken();
+  if (sessionToken && !cookieCsrfToken && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${sessionToken}`;
   }
 
   const method = (options.method || 'GET').toUpperCase();
@@ -161,6 +163,13 @@ export async function apiRequest<T>(
       if (typeof window !== 'undefined' && !endpoint.includes('/api/auth/me')) {
         window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
       }
+    }
+    if (
+      response.status === 403 &&
+      data.code === 'PASSWORD_CHANGE_REQUIRED' &&
+      typeof window !== 'undefined'
+    ) {
+      window.dispatchEvent(new CustomEvent(PASSWORD_CHANGE_REQUIRED_EVENT));
     }
     const msg =
       typeof data.message === 'string'

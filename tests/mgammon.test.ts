@@ -13,6 +13,7 @@ import {
 import {
   gregorianToShamsi,
   shamsiToGregorian,
+  getDayOfWeekFromGregorian,
   isValidShamsiDate,
   isValidTimeHHMMOrHHMMSS,
   isShamsiLeapYear,
@@ -23,10 +24,13 @@ import {
   numberToPersianTomanWords,
 } from '../src/shared/jalali';
 import { AttendanceLog, SystemSettings, SystemSettingsSnapshot } from '../src/shared/types';
+import { getAppConfig } from '../src/server/config';
+import { runPreflightDiagnostics } from '../src/server/preflight';
 import {
   columnExists,
   getDbConfig,
   getPool,
+  getSystemSettingsSnapshotsFromDb,
   indexExists,
   initializeDatabase,
   isCpanelOrProductionEnvironment,
@@ -36,6 +40,7 @@ import {
   setSimulatedMidTransactionFailure,
   validateProductionSecurityConfig,
 } from '../src/server/db';
+import * as XLSX from 'xlsx';
 import {
   BACKUP_TABLES_ORDERED,
   collectDatabaseMetrics,
@@ -2501,7 +2506,727 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(stmt.lateAndAbsenceDeductionToman).toBe(0);
     expect(stmt.periodBalanceToman).toBe(0);
   });
+
+  it('آزمون امنیتی تکمیلی ۱: رد کامل احراز هویت با ?token= در نشانی و مدیریت امن نشانی‌های خراب (Malformed URI -> 400)', async () => {
+    const queryTokenAuthRes = await fetch(
+      `${baseUrl}/api/auth/me?token=${encodeURIComponent(managerToken)}`
+    );
+    expect(queryTokenAuthRes.status).toBe(401);
+
+    const queryTokenMediaRes = await fetch(
+      `${baseUrl}/assets/media/receipts/manager_private_doc.png?token=${encodeURIComponent(managerToken)}`
+    );
+    expect(queryTokenMediaRes.status).toBe(401);
+
+    const malformedUriRes = await fetch(`${baseUrl}/assets/media/receipts/%E0%A4%A`);
+    expect(malformedUriRes.status).toBe(400);
+    const malformedData = await malformedUriRes.json();
+    expect(malformedData.code).toBe('BAD_REQUEST');
+  });
+
+  it('آزمون امنیتی تکمیلی ۲: کارکرد صحیح /api/media/storage و /api/media/cleanup بدون خطای SQL و کنترل دسترسی کارمند روی فایل‌های مدیر و فایل‌های سیستمی', async () => {
+    const pool = getPool();
+    const validPngBase64 =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    // ثبت یک گزارش روزانه دارای تصویر برای بررسی ستون واقعی photo_url
+    const reportRes = await fetch(`${baseUrl}/api/reports`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        shamsi_date: '1405/08/02',
+        activity_description: 'گزارش تست عکس دار برای ممیزی رسانه',
+        photo_base64: validPngBase64,
+        photo_name: 'report-audit.png',
+      }),
+    });
+    expect(reportRes.status).toBe(201);
+
+    // ایجاد یک فایل بدون مرجع (ORPHAN_FILE) در دیسک تست
+    const testMediaBase = path.resolve(process.cwd(), '.data/test_private_media');
+    fs.mkdirSync(path.join(testMediaBase, 'attachments'), { recursive: true, mode: 0o700 });
+    const orphanDiskPath = path.join(testMediaBase, 'attachments', 'orphan_audit_file.png');
+    fs.writeFileSync(orphanDiskPath, Buffer.from(validPngBase64.split(',')[1], 'base64'));
+    const orphanUrl = '/assets/media/attachments/orphan_audit_file.png';
+
+    // ۱) دریافت فهرست رسانه‌ها توسط کارمند نباید خطای SQL بدهد و نباید فایل‌های مدیر یا ORPHAN_FILE را افشا کند
+    const workerStorageRes = await fetch(`${baseUrl}/api/media/storage`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(workerStorageRes.status).toBe(200);
+    const workerStorageData = await workerStorageRes.json();
+    expect(workerStorageData.ok).toBe(true);
+    expect(
+      workerStorageData.storage.items.some(
+        (i: { source_type: string }) => i.source_type === 'ORPHAN_FILE'
+      )
+    ).toBe(false);
+    expect(
+      workerStorageData.storage.items.some(
+        (i: { file_url: string }) => i.file_url === '/assets/media/receipts/manager_private_doc.png'
+      )
+    ).toBe(false);
+    expect(
+      workerStorageData.storage.items.some(
+        (i: { source_type: string }) => i.source_type === 'REPORT_PHOTO'
+      )
+    ).toBe(true);
+
+    // ۲) دریافت فهرست رسانه‌ها توسط مدیر باید بدون خطای SQL همه‌ی فایل‌ها (از جمله ORPHAN_FILE) را برگرداند
+    const mgrStorageRes = await fetch(`${baseUrl}/api/media/storage`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    expect(mgrStorageRes.status).toBe(200);
+    const mgrStorageData = await mgrStorageRes.json();
+    const mgrFinanceReceipt = mgrStorageData.storage.items.find(
+      (i: { file_url: string }) => i.file_url === '/assets/media/receipts/manager_private_doc.png'
+    );
+    expect(mgrFinanceReceipt).toBeDefined();
+    expect(
+      mgrStorageData.storage.items.some(
+        (i: { source_type: string; file_url: string }) =>
+          i.source_type === 'ORPHAN_FILE' && i.file_url === orphanUrl
+      )
+    ).toBe(true);
+
+    // ۳) تلاش کارمند برای پاکسازی ORPHAN_FILE یا رسید متعلق به مدیر باید با 403 مسدود شود
+    const workerDeleteOrphanRes = await fetch(`${baseUrl}/api/media/cleanup`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        items: [{ source_type: 'ORPHAN_FILE', record_id: null, file_url: orphanUrl }],
+      }),
+    });
+    expect(workerDeleteOrphanRes.status).toBe(403);
+    expect(fs.existsSync(orphanDiskPath)).toBe(true);
+
+    const workerDeleteMgrDocRes = await fetch(`${baseUrl}/api/media/cleanup`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        items: [
+          {
+            source_type: 'FINANCE_RECEIPT',
+            record_id: mgrFinanceReceipt.record_id,
+            file_url: mgrFinanceReceipt.file_url,
+          },
+        ],
+      }),
+    });
+    expect(workerDeleteMgrDocRes.status).toBe(403);
+
+    // بررسی اینکه رسید مدیر همچنان در دیتابیس سالم است
+    const [mgrFinCheck] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT receipt_file_url FROM financial_transactions WHERE id = ?',
+      [mgrFinanceReceipt.record_id]
+    );
+    expect(mgrFinCheck[0].receipt_file_url).toBe('/assets/media/receipts/manager_private_doc.png');
+
+    // ۴) پاکسازی ORPHAN_FILE توسط مدیر باید مجاز و موفق باشد
+    const mgrDeleteOrphanRes = await fetch(`${baseUrl}/api/media/cleanup`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        items: [{ source_type: 'ORPHAN_FILE', record_id: null, file_url: orphanUrl }],
+      }),
+    });
+    expect(mgrDeleteOrphanRes.status).toBe(200);
+    const mgrDeleteOrphanData = await mgrDeleteOrphanRes.json();
+    expect(mgrDeleteOrphanData.deletedCount).toBe(1);
+    expect(fs.existsSync(orphanDiskPath)).toBe(false);
+  });
+
+  it('آزمون امنیتی تکمیلی ۳: جلوگیری از بازنویسی رکورد تاییدشده اکسل سوابق کاری توسط کارمند (APPROVED_RECORD_LOCKED)', async () => {
+    // ساخت یک فایل اکسل معتبر در حافظه
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([
+      ['تاریخ', 'توضیحات', 'روز کاری', 'ساعت کارکرد', 'ساعت اضافه کاری'],
+      ['1405/08/03', 'کارکرد تاییدشده', 1, 8, 1],
+    ]);
+    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+    const xlsxBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+    const xlsxBase64 = xlsxBuffer.toString('base64');
+
+    // ثبت اولیه توسط مدیر به‌صورت تاییدشده (APPROVED)
+    const mgrUploadRes = await fetch(`${baseUrl}/api/historical-work/upload-excel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        shamsi_date: '1405/08/03',
+        title: 'کارکرد تاییدشده قفل‌شده',
+        file_name: 'approved-history.xlsx',
+        file_base64: xlsxBase64,
+      }),
+    });
+    expect(mgrUploadRes.status).toBe(201);
+
+    // تلاش کارمند برای بازنویسی رکورد تاییدشده در همان تاریخ و عنوان باید با 409 رد شود
+    const workerOverwriteRes = await fetch(`${baseUrl}/api/historical-work/upload-excel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({
+        shamsi_date: '1405/08/03',
+        title: 'کارکرد تاییدشده قفل‌شده',
+        file_name: 'tamper-attempt.xlsx',
+        file_base64: xlsxBase64,
+      }),
+    });
+    expect(workerOverwriteRes.status).toBe(409);
+    const overwriteData = await workerOverwriteRes.json();
+    expect(overwriteData.code).toBe('APPROVED_RECORD_LOCKED');
+  });
+
+  it('آزمون امنیتی تکمیلی ۴ و ۵: الزام تغییر رمز اولیه (PASSWORD_CHANGE_REQUIRED)، ابطال بیومتریک پس از تغییر رمز، و محدودیت تلاش /api/auth/verify-unlock', async () => {
+    const pool = getPool();
+    resetAllLoginRateLimits();
+
+    // الف) ثبت بیومتریک برای کارمند و فعال‌سازی پرچم must_change_password = 1
+    const bioRegRes = await fetch(`${baseUrl}/api/auth/biometric/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${workerToken}`,
+      },
+      body: JSON.stringify({ credential_id: 'cred_test_revoke_01' }),
+    });
+    expect(bioRegRes.status).toBe(200);
+    const bioRegData = await bioRegRes.json();
+    expect(bioRegData.biometric_token).toBeTruthy();
+
+    const prevEnforce = process.env.ENFORCE_PASSWORD_CHANGE;
+    process.env.ENFORCE_PASSWORD_CHANGE = 'true';
+    await pool.execute("UPDATE users SET must_change_password = 1 WHERE username = 'worker'");
+
+    const newForcedPassword = 'ForcedUpdated@1405!';
+    try {
+      // وقتی must_change_password=1 و ENFORCE_PASSWORD_CHANGE=true است، دسترسی به مسیرهای عادی مسدود می‌شود (403)
+      const blockedFinanceRes = await fetch(`${baseUrl}/api/finance`, {
+        headers: { Authorization: `Bearer ${workerToken}` },
+      });
+      expect(blockedFinanceRes.status).toBe(403);
+      const blockedFinanceData = await blockedFinanceRes.json();
+      expect(blockedFinanceData.code).toBe('PASSWORD_CHANGE_REQUIRED');
+
+      // بررسی /api/auth/me باید مجاز باشد و passwordChangeRequired: true برگرداند
+      const meForcedRes = await fetch(`${baseUrl}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${workerToken}` },
+      });
+      expect(meForcedRes.status).toBe(200);
+      const meForcedData = await meForcedRes.json();
+      expect(meForcedData.passwordChangeRequired).toBe(true);
+
+      // تغییر رمز عبور اجباری
+      const changeRes = await fetch(`${baseUrl}/api/auth/change-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({
+          currentPassword: wrkInitialPass,
+          newPassword: newForcedPassword,
+        }),
+      });
+      expect(changeRes.status).toBe(200);
+      const changeData = await changeRes.json();
+      workerToken = changeData.token;
+
+      // پس از تغییر رمز عبور، دسترسی مجدداً باز می‌شود و کلید بیومتریک قبلی نیز ابطال شده است
+      const unlockedFinanceRes = await fetch(`${baseUrl}/api/finance`, {
+        headers: { Authorization: `Bearer ${workerToken}` },
+      });
+      expect(unlockedFinanceRes.status).toBe(200);
+
+      const staleBioLoginRes = await fetch(`${baseUrl}/api/auth/biometric/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'worker',
+          credential_id: 'cred_test_revoke_01',
+          biometric_token: bioRegData.biometric_token,
+        }),
+      });
+      expect(staleBioLoginRes.status).toBe(401);
+
+      // ب) بررسی محدودیت تلاش ناموفق روی /api/auth/verify-unlock
+      for (let i = 0; i < 4; i++) {
+        const badUnlock = await fetch(`${baseUrl}/api/auth/verify-unlock`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${workerToken}`,
+          },
+          body: JSON.stringify({ password: `BadUnlock_${i}` }),
+        });
+        expect(badUnlock.status).toBe(401);
+      }
+      const fifthLockedUnlock = await fetch(`${baseUrl}/api/auth/verify-unlock`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({ password: 'BadUnlock_5' }),
+      });
+      expect(fifthLockedUnlock.status).toBe(429);
+      const lockedUnlockData = await fifthLockedUnlock.json();
+      expect(lockedUnlockData.code).toBe('TOO_MANY_ATTEMPTS');
+    } finally {
+      if (prevEnforce === undefined) delete process.env.ENFORCE_PASSWORD_CHANGE;
+      else process.env.ENFORCE_PASSWORD_CHANGE = prevEnforce;
+      resetAllLoginRateLimits();
+
+      const bcrypt = await import('bcryptjs');
+      const restoredHash = await bcrypt.default.hash(wrkInitialPass, 10);
+      await pool.execute(
+        "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE username = 'worker'",
+        [restoredHash]
+      );
+    }
+  });
+
+  it('آزمون تکمیلی ۶: حفظ جدول یادآورها (user_reminders) در پشتیبان‌گیری و بازیابی + خواندن بدون خطای سوابق تنظیمات (getSystemSettingsSnapshotsFromDb)', async () => {
+    const pool = getPool();
+
+    // ثبت تغییر تنظیمات توسط مدیر و سپس تغییر بعدی تا نسخه قبلی در system_settings_snapshots بایگانی شود
+    const putSettingsRes = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        ...BASE_SETTINGS,
+        grace_period_minutes: 20,
+      }),
+    });
+    expect(putSettingsRes.status).toBe(200);
+
+    const putSettings2Res = await fetch(`${baseUrl}/api/settings`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        ...BASE_SETTINGS,
+        grace_period_minutes: 25,
+      }),
+    });
+    expect(putSettings2Res.status).toBe(200);
+
+    const snapshots = await getSystemSettingsSnapshotsFromDb();
+    expect(snapshots.length).toBeGreaterThanOrEqual(1);
+    expect(snapshots.some((s) => s.settings.grace_period_minutes === 20)).toBe(true);
+    expect(typeof snapshots[0].changed_by_user_id).toBe('number');
+
+    // ثبت یک یادآور برای بررسی بقا پس از Backup / Wipe / Restore
+    const remCreateRes = await fetch(`${baseUrl}/api/reminders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        title: 'یادآور تست پشتیبان‌گیری',
+        description: 'بررسی بقا در فایل پشتیبان',
+        due_shamsi_date: '1405/08/10',
+        due_time: '10:30',
+        repeat_type: 'ONCE',
+        target_scope: 'WORKER',
+        send_sms: false,
+      }),
+    });
+    expect(remCreateRes.status).toBe(201);
+    const remData = await remCreateRes.json();
+    const reminderId = Number(remData.id);
+
+    const [beforeRemRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt FROM user_reminders WHERE id = ?',
+      [reminderId]
+    );
+    expect(Number(beforeRemRows[0].cnt)).toBe(1);
+
+    const testBackupDir = path.resolve(process.cwd(), '.data/test_backups');
+    const testMediaBase = path.resolve(process.cwd(), '.data/test_private_media');
+    const bkp = await createFullBackup({
+      backupDir: testBackupDir,
+      privateMediaDir: testMediaBase,
+      customPool: pool,
+    });
+
+    await pool.execute('DELETE FROM user_reminders');
+    const [wipedRemRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT COUNT(*) AS cnt FROM user_reminders'
+    );
+    expect(Number(wipedRemRows[0].cnt)).toBe(0);
+
+    await restoreFromBackupArchive(bkp.backupFilePath, {
+      targetMediaDir: testMediaBase,
+      customPool: pool,
+    });
+
+    const [restoredRemRows] = await pool.execute<mysql.RowDataPacket[]>(
+      'SELECT title, shamsi_date FROM user_reminders WHERE id = ?',
+      [reminderId]
+    );
+    expect(restoredRemRows.length).toBe(1);
+    expect(restoredRemRows[0].title).toBe('یادآور تست پشتیبان‌گیری');
+  });
+
+  it('آزمون ممیزی مستقل ۱: خروجی اکسل مدیر (/api/manager/export/excel و backup/excel) و خروجی اکسل پرسنل بدون خطای SQL ستون‌های گزارش کار', async () => {
+    // شیت گزارش‌ها باید پس از ثبت گزارش عکسی در آزمون‌های قبلی، بدون خطای ستون‌های ناموجود تولید شود
+    const mgrExcelAllRes = await fetch(`${baseUrl}/api/manager/export/excel?section=all`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    expect(mgrExcelAllRes.status).toBe(200);
+    expect(mgrExcelAllRes.headers.get('content-type') || '').toContain(
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    const allBuf = Buffer.from(await mgrExcelAllRes.arrayBuffer());
+    const allWb = XLSX.read(allBuf, { type: 'buffer' });
+    expect(allWb.SheetNames).toContain('ساعات کاری و کارکرد');
+    expect(allWb.SheetNames).toContain('گزارش کارها');
+    expect(allWb.SheetNames).toContain('لیست پرداختی‌ها و مالی');
+    const reportRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(
+      allWb.Sheets['گزارش کارها']
+    );
+    expect(reportRows.length).toBeGreaterThanOrEqual(1);
+    expect(
+      reportRows.some(
+        (r) =>
+          String(r['شرح کامل گزارش کار'] || '').includes('ممیزی رسانه') &&
+          r['تصویر پیوست'] === 'دارد'
+      )
+    ).toBe(true);
+
+    const mgrBackupExcelRes = await fetch(`${baseUrl}/api/manager/backup/excel`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    expect(mgrBackupExcelRes.status).toBe(200);
+    const backupBuf = Buffer.from(await mgrBackupExcelRes.arrayBuffer());
+    const backupWb = XLSX.read(backupBuf, { type: 'buffer' });
+    expect(backupWb.SheetNames).toContain('گزارش کارها');
+
+    const mgrReportsExcelRes = await fetch(`${baseUrl}/api/manager/export/excel?section=reports`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    expect(mgrReportsExcelRes.status).toBe(200);
+
+    const wrkForbiddenExcelRes = await fetch(`${baseUrl}/api/manager/export/excel?section=all`, {
+      headers: { Authorization: `Bearer ${workerToken}` },
+    });
+    expect(wrkForbiddenExcelRes.status).toBe(403);
+  });
+
+  it('آزمون ممیزی مستقل ۲: تشخیص دقیق روز هفته در /api/attendance/flexible-clock (شنبه کاری، پنجشنبه شیفت خاص، جمعه تعطیل)', async () => {
+    const pool = getPool();
+    // 1405/08/07 = پنجشنبه (4)، 1405/08/08 = جمعه (5)، 1405/08/09 = شنبه (6)
+    const thuShamsi = '1405/08/07';
+    const friShamsi = '1405/08/08';
+    const satShamsi = '1405/08/09';
+    expect(getDayOfWeekFromGregorian(shamsiToGregorian(thuShamsi))).toBe(4);
+    expect(getDayOfWeekFromGregorian(shamsiToGregorian(friShamsi))).toBe(5);
+    expect(getDayOfWeekFromGregorian(shamsiToGregorian(satShamsi))).toBe(6);
+
+    const insertedLogIds: number[] = [];
+    try {
+      // ۱) شنبه (روز کاری عادی، شروع 08:30 + تلورانس فعلی 25 دقیقه = 08:55): ورود در 09:30 باید PENDING شود
+      const satRes = await fetch(`${baseUrl}/api/attendance/flexible-clock`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({
+          entry_mode: 'FULL_SHIFT',
+          shift_category: 'WORK',
+          shamsi_date: satShamsi,
+          check_in_time: '09:30',
+          check_out_time: '17:00',
+          late_reason: 'ترافیک شنبه',
+        }),
+      });
+      expect(satRes.status).toBe(201);
+      const [satRows] = await pool.execute<mysql.RowDataPacket[]>(
+        "SELECT id, late_status FROM attendance_logs WHERE shamsi_date = ? AND event_type = 'WORK_START' AND is_deleted = 0",
+        [satShamsi]
+      );
+      expect(satRows.length).toBeGreaterThanOrEqual(1);
+      expect(satRows[0].late_status).toBe('PENDING');
+
+      // ۲) پنجشنبه (شروع 07:00 + تلورانس 25 دقیقه = 07:25): ورود در 08:00 باید PENDING شود (حتی با وجود اینکه < 08:30 عادی است)
+      const thuRes = await fetch(`${baseUrl}/api/attendance/flexible-clock`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({
+          entry_mode: 'START_ONLY',
+          shift_category: 'WORK',
+          shamsi_date: thuShamsi,
+          check_in_time: '08:00',
+          late_reason: 'تأخیر پنجشنبه',
+        }),
+      });
+      expect(thuRes.status).toBe(201);
+      const thuData = await thuRes.json();
+      insertedLogIds.push(Number(thuData.logId));
+      const [thuRows] = await pool.execute<mysql.RowDataPacket[]>(
+        'SELECT late_status FROM attendance_logs WHERE id = ?',
+        [thuData.logId]
+      );
+      expect(thuRows[0].late_status).toBe('PENDING');
+
+      // ۳) جمعه (تعطیل رسمی هفتگی): نباید تأخیر PENDING ثبت شود
+      const friRes = await fetch(`${baseUrl}/api/attendance/flexible-clock`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${workerToken}`,
+        },
+        body: JSON.stringify({
+          entry_mode: 'FULL_SHIFT',
+          shift_category: 'WORK',
+          shamsi_date: friShamsi,
+          check_in_time: '10:00',
+          check_out_time: '14:00',
+        }),
+      });
+      expect(friRes.status).toBe(201);
+      const [friRows] = await pool.execute<mysql.RowDataPacket[]>(
+        "SELECT late_status FROM attendance_logs WHERE shamsi_date = ? AND event_type = 'WORK_START' AND is_deleted = 0",
+        [friShamsi]
+      );
+      expect(friRows[0].late_status).toBe('NONE');
+
+      // ۴) تعیین تکلیف تأخیر شنبه توسط مدیر روی تمام حالت‌ها و اعتبارسنجی ورودی نامعتبر
+      const badReviewRes = await fetch(`${baseUrl}/api/attendance/review-late`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${managerToken}`,
+        },
+        body: JSON.stringify({
+          log_id: satRows[0].id,
+          decision: 'INVALID_OPTION',
+        }),
+      });
+      expect(badReviewRes.status).toBe(400);
+
+      for (const decision of [
+        'EXCUSED',
+        'APPROVED_DELAY',
+        'DEDUCT_LEAVE',
+        'ABSENCE',
+        'CUSTOM',
+      ] as const) {
+        const revRes = await fetch(`${baseUrl}/api/attendance/review-late`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${managerToken}`,
+          },
+          body: JSON.stringify({
+            log_id: satRows[0].id,
+            decision,
+            manager_note: `تصمیم ممیزی: ${decision}`,
+            ...(decision === 'CUSTOM' ? { custom_deduction_toman: 75000 } : {}),
+          }),
+        });
+        expect(revRes.status).toBe(200);
+        const [revDbRows] = await pool.execute<mysql.RowDataPacket[]>(
+          'SELECT late_status, manager_late_note, custom_deduction_toman FROM attendance_logs WHERE id = ?',
+          [satRows[0].id]
+        );
+        expect(revDbRows[0].late_status).toBe(decision);
+        expect(revDbRows[0].manager_late_note).toBe(`تصمیم ممیزی: ${decision}`);
+        if (decision === 'CUSTOM') {
+          expect(Number(revDbRows[0].custom_deduction_toman)).toBe(75000);
+        }
+      }
+    } finally {
+      await pool.execute('DELETE FROM leave_requests WHERE shamsi_date IN (?, ?, ?)', [
+        thuShamsi,
+        friShamsi,
+        satShamsi,
+      ]);
+      await pool.execute(
+        'DELETE FROM attendance_logs WHERE shamsi_date IN (?, ?, ?)',
+        [thuShamsi, friShamsi, satShamsi]
+      );
+    }
+  });
+
+  it('آزمون ممیزی مستقل ۳: همخوانی محاسبه کسر تأخیر اکسل تاریخی بین live-status و manager/dashboard + انقضای نشست و کاربر غیرفعال', async () => {
+    const pool = getPool();
+
+    // ۱) درج یک رکورد تاریخی تاییدشده دارای ردیفِ جریمه‌شده (CUSTOM) در تاریخی که تردد زنده ندارد
+    const histParsed = JSON.stringify([
+      {
+        row_index: 1,
+        shamsi_date: '1405/08/11',
+        net_work_minutes: 420,
+        overtime_minutes: 0,
+        work_days_count: 1,
+        late_status: 'CUSTOM',
+        late_deduction_toman: 0,
+        custom_deduction_toman: 125000,
+      },
+    ]);
+    const [histIns] = await pool.execute<mysql.ResultSetHeader>(
+      `INSERT INTO historical_work_records
+        (user_id, created_by_user_id, work_date, shamsi_date, title, net_work_minutes, overtime_minutes, work_days_count, status, parsed_rows_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?)`,
+      [2, 1, shamsiToGregorian('1405/08/11'), '1405/08/11', 'رکورد جریمه ممیزی', 420, 0, 1, histParsed]
+    );
+
+    try {
+      const [liveRes, dashRes] = await Promise.all([
+        fetch(`${baseUrl}/api/attendance/live-status`, {
+          headers: { Authorization: `Bearer ${workerToken}` },
+        }),
+        fetch(`${baseUrl}/api/manager/dashboard`, {
+          headers: { Authorization: `Bearer ${managerToken}` },
+        }),
+      ]);
+      expect(liveRes.status).toBe(200);
+      expect(dashRes.status).toBe(200);
+      const liveData = await liveRes.json();
+      const dashData = await dashRes.json();
+
+      expect(liveData.workerKpis.lateAndAbsenceDeductionToman).toBe(125000);
+      expect(liveData.workerKpis.lateAndAbsenceDeductionToman).toBe(
+        dashData.kpis.totalLateDeductionToman
+      );
+      expect(liveData.workerKpis.accountBalanceToman).toBe(dashData.kpis.accountBalanceToman);
+      expect(liveData.bannerBgUrl).not.toContain('banner-bg.svg');
+
+      const [prevBannerRows] = await pool.execute<mysql.RowDataPacket[]>(
+        'SELECT banner_bg_url FROM system_settings WHERE id = 1'
+      );
+      const prevBanner = prevBannerRows[0]?.banner_bg_url || null;
+      try {
+        await pool.execute('UPDATE system_settings SET banner_bg_url = NULL WHERE id = 1');
+        const defaultBannerLiveRes = await fetch(`${baseUrl}/api/attendance/live-status`, {
+          headers: { Authorization: `Bearer ${workerToken}` },
+        });
+        expect(defaultBannerLiveRes.status).toBe(200);
+        const defaultBannerData = await defaultBannerLiveRes.json();
+        expect(defaultBannerData.bannerBgUrl).toBe('/assets/media/banner-bg.webp');
+      } finally {
+        await pool.execute('UPDATE system_settings SET banner_bg_url = ? WHERE id = 1', [
+          prevBanner,
+        ]);
+      }
+
+      // ۲) مسدودسازی نشست منقضی‌شده و کاربر غیرفعال‌شده (is_active = 0)
+      const expiredRaw = 'expired-test-token-audit-001';
+      const { hashSessionToken } = await import('../src/server/auth');
+      await pool.execute(
+        'INSERT INTO user_sessions (user_id, token_hash, expires_at) VALUES (?, ?, DATE_SUB(NOW(), INTERVAL 1 HOUR))',
+        [2, hashSessionToken(expiredRaw)]
+      );
+      const expiredRes = await fetch(`${baseUrl}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${expiredRaw}` },
+      });
+      expect(expiredRes.status).toBe(401);
+
+      await pool.execute('UPDATE users SET is_active = 0 WHERE id = 2');
+      const inactiveUserRes = await fetch(`${baseUrl}/api/finance`, {
+        headers: { Authorization: `Bearer ${workerToken}` },
+      });
+      expect(inactiveUserRes.status).toBe(401);
+    } finally {
+      await pool.execute('UPDATE users SET is_active = 1 WHERE id = 2');
+      await pool.execute('DELETE FROM historical_work_records WHERE id = ?', [histIns.insertId]);
+      await pool.execute('DELETE FROM user_sessions WHERE expires_at <= NOW()');
+    }
+  });
+
+  it('آزمون ممیزی مستقل ۴: شبیه‌سازی کامل preflight و تنظیمات cPanel/Passenger (پورت سوکت یونیکس، SESSION_SECRET ضعیف، افشای .env عمومی)', async () => {
+    const validHexSecret = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+    // ۱) محیط Passenger cPanel معتبر با UNIX socket در متغیر PORT
+    const passengerEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'production',
+      PASSENGER_APP_ENV: 'production',
+      PORT: '/tmp/passenger_node_audit.sock',
+      SESSION_SECRET: validHexSecret,
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '3306',
+      DB_USER: 'cpanel_mgammon_usr',
+      DB_PASSWORD: 'StrongDbPassword!2026',
+      DB_NAME: 'cpanel_mgammon_db',
+      APP_TIMEZONE: 'Asia/Tehran',
+    };
+    const appCfg = getAppConfig(passengerEnv);
+    expect(appCfg.isProduction).toBe(true);
+    expect(appCfg.isPassenger).toBe(true);
+    expect(appCfg.isSocketOrPipe).toBe(true);
+    expect(appCfg.listenTarget).toBe('/tmp/passenger_node_audit.sock');
+
+    const validReport = await runPreflightDiagnostics({ env: passengerEnv, checkDb: false });
+    expect(validReport.checks.find((c) => c.id === 'session_secret')?.status).toBe('PASS');
+    expect(validReport.checks.find((c) => c.id === 'port_config')?.status).toBe('PASS');
+    expect(validReport.checks.find((c) => c.id === 'db_env_vars')?.status).toBe('PASS');
+
+    // ۲) شناسایی خطای قطعی هنگام نبود SESSION_SECRET یا مقدار ضعیف در Production
+    const weakSecretReport = await runPreflightDiagnostics({
+      env: { ...passengerEnv, SESSION_SECRET: 'weak-secret' },
+      checkDb: false,
+    });
+    expect(weakSecretReport.ok).toBe(false);
+    expect(weakSecretReport.checks.find((c) => c.id === 'session_secret')?.status).toBe('FAIL');
+
+    // ۳) هشدار/خطا برای کاراکترهای ناایمن پوسته cPanel ($) یا کوتیشن در SESSION_SECRET
+    const shellUnsafeReport = await runPreflightDiagnostics({
+      env: { ...passengerEnv, SESSION_SECRET: 'Aa1$Bb2$Cc3$Dd4$Ee5$Ff6$Gg7$Hh8$Ii9$' },
+      checkDb: false,
+    });
+    expect(shellUnsafeReport.checks.find((c) => c.id === 'session_secret')?.status).toBe(
+      'WARNING'
+    );
+
+    // ۴) تشخیص نشت فایل .env در پوشه عمومی شبیه‌سازی‌شده
+    const tmpLeakDir = path.resolve(process.cwd(), '.data/test_preflight_leak');
+    const tmpPublicDir = path.join(tmpLeakDir, 'public');
+    fs.mkdirSync(tmpPublicDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpPublicDir, '.env'), 'SESSION_SECRET=leak\n');
+    try {
+      const leakReport = await runPreflightDiagnostics({
+        env: passengerEnv,
+        checkDb: false,
+        searchDirs: [tmpLeakDir],
+      });
+      expect(leakReport.ok).toBe(false);
+      expect(leakReport.checks.find((c) => c.id === 'env_public_exposure')?.status).toBe('FAIL');
+    } finally {
+      fs.rmSync(tmpLeakDir, { recursive: true, force: true });
+    }
+  });
 });
+
+
 
 
 

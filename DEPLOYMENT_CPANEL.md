@@ -32,7 +32,7 @@
 - **`app.cjs`**: فایل اجرایی یکپارچه سرور Node.js + Express با فرمت CommonJS (سازگار با Node.js 22 و لودر **Phusion Passenger** در cPanel).
 - **`dist/`**: پوشه کامپایل‌شده فرانت‌اند React، سرویس‌ورکر PWA (`sw.js`, `registerSW.js`)، مانیفست (`manifest.webmanifest`) و فونت محلی `Vazirmatn-VF.woff2`.
 - **`public/`**: فایل‌های استاتیک پایه، آیکون‌های PWA و بنر پیش‌فرض.
-- **`package.json` و `package-lock.json`**: مشخصات وابستگی‌های سازگار با Node.js 22 که در نسخه داخل ZIP فقط شامل دستورات اجرایی Production (`"start": "node app.cjs"` و `"start:prod": "NODE_ENV=production node app.cjs"`) است و فاقد اسکریپت‌های توسعه می‌باشد.
+- **`package.json` (و در صورت وجود `package-lock.json`)**: مشخصات وابستگی‌های سازگار با Node.js 22 که در نسخه داخل ZIP فقط شامل دستورات اجرایی Production (`"start": "node app.cjs"` و `"start:prod": "NODE_ENV=production node app.cjs"`) است و فاقد اسکریپت‌های توسعه می‌باشد.
 - **`database/schema.sql`**: اسکریپت کامل ساختار ۱۳ جدول پایگاه داده (مورد استفاده در راه‌اندازی دیتابیس).
 - **`.env.example`**: الگوی متغیرهای محیطی (فاقد هرگونه کلید یا رمز محرمانه).
 - **`DEPLOYMENT_CPANEL.md`**: راهنمای جامع استقرار روی هاست.
@@ -68,8 +68,8 @@
    APP_TIMEZONE=Asia/Tehran
    ```
 5. روی دکمه **Create** کلیک کنید.
-6. **نصب وابستگی‌ها روی هاست:** پس از ساخته شدن اپلیکیشن، در همان صفحه **Setup Node.js App** روی دکمه **Run NPM Install** کلیک کنید تا پکیج‌های موردنیاز از روی `package.json` و `package-lock.json` روی هاست نصب شوند (در صورت استفاده از Terminal سی‌پنل نیز می‌توانید در محیط مجازی برنامه دستور `npm ci --omit=dev` یا `npm install --omit=dev` را اجرا کنید).
-7. **اجرای برنامه:** روی دکمه **Restart** در Setup Node.js App کلیک کنید تا Passenger فایل اجرایی **`app.cjs`** را اجرا کند (همچنین در صورت اجرای دستی یا از طریق خط فرمان، دستور **`npm start`** مستقیماً `node app.cjs` را اجرا می‌نماید).
+6. **نصب وابستگی‌ها روی هاست:** پس از ساخته شدن اپلیکیشن، در همان صفحه **Setup Node.js App** روی دکمه **Run NPM Install** کلیک کنید تا پکیج‌های موردنیاز از روی `package.json` روی هاست نصب شوند (در صورت استفاده از Terminal سی‌پنل نیز می‌توانید در محیط مجازی برنامه دستور `npm install --omit=dev` را اجرا کنید).
+7. **اجرای برنامه:** روی دکمه **Restart** در Setup Node.js App کلیک کنید تا Passenger فایل اجرایی **`app.cjs`** را اجرا کند (پشتیبانی خودکار از پورت عددی یا UNIX socket تزریق‌شده در متغیر `PORT` توسط Passenger انجام می‌شود؛ همچنین در اجرای دستی از خط فرمان، دستور **`npm start`** مستقیماً `node app.cjs` را اجرا می‌نماید).
 
 ---
 

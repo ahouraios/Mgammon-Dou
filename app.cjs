@@ -33,20 +33,568 @@ __export(server_exports, {
   startServer: () => startServer
 });
 module.exports = __toCommonJS(server_exports);
-var import_config = require("dotenv/config");
+var import_config5 = require("dotenv/config");
 var import_express2 = __toESM(require("express"), 1);
 var import_cookie_parser = __toESM(require("cookie-parser"), 1);
-var import_path4 = __toESM(require("path"), 1);
-var import_fs4 = __toESM(require("fs"), 1);
+var import_path5 = __toESM(require("path"), 1);
+var import_fs5 = __toESM(require("fs"), 1);
 
 // src/server/db.ts
 var import_promise = __toESM(require("mysql2/promise"), 1);
 var import_bcryptjs = __toESM(require("bcryptjs"), 1);
+var import_crypto2 = __toESM(require("crypto"), 1);
+var import_fs2 = __toESM(require("fs"), 1);
+var import_path2 = __toESM(require("path"), 1);
+var import_child_process = require("child_process");
+var import_util = require("util");
+
+// src/server/config.ts
+var import_dotenv = __toESM(require("dotenv"), 1);
 var import_crypto = __toESM(require("crypto"), 1);
 var import_fs = __toESM(require("fs"), 1);
 var import_path = __toESM(require("path"), 1);
-var import_child_process = require("child_process");
-var import_util = require("util");
+var FORBIDDEN_DEFAULT_SECRETS = /* @__PURE__ */ new Set([
+  "",
+  "undefined",
+  "null",
+  "mgammon-duo-default-server-secret-2026",
+  "mgammon-duo-enterprise-secret-2026",
+  "mgammon-duo-dev-only-ephemeral-secret-key-2026-local",
+  "CHANGE_THIS_TO_A_STRONG_64_CHAR_RANDOM_SECRET_KEY",
+  "replace_with_a_long_random_64_char_secret_string",
+  "your_session_secret",
+  "secret",
+  "changeme",
+  "default"
+]);
+var FORBIDDEN_DEFAULT_PASSWORDS = /* @__PURE__ */ new Set([
+  "Mgammon@1405",
+  "Worker@1405",
+  "CHANGE_ME_MANAGER_PASSWORD",
+  "CHANGE_ME_WORKER_PASSWORD",
+  "123456",
+  "12345678",
+  "password",
+  "admin"
+]);
+var PLACEHOLDER_DB_USERS = /* @__PURE__ */ new Set(["", "cpanel_username_mgammon", "your_db_user"]);
+var PLACEHOLDER_DB_PASSWORDS = /* @__PURE__ */ new Set([
+  "",
+  "YOUR_STRONG_MYSQL_PASSWORD",
+  "your_db_password"
+]);
+var PLACEHOLDER_DB_NAMES = /* @__PURE__ */ new Set(["", "cpanel_username_mgammon_duo", "your_db_name"]);
+var VALID_ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+var CONTROL_CHAR_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+var NEWLINE_RE = /[\r\n]/;
+var BOM_OR_ZERO_WIDTH_RE = /[\uFEFF\u200B-\u200F\u202A-\u202E\u2060]/;
+var NON_ASCII_RE = /[^\x20-\x7E\r\n\t]/;
+var CPANEL_SHELL_UNSAFE_RE = /["'`$\\;#\r\n]/;
+var envLoadMetadata = {
+  loaded: false,
+  sourceMode: "HOST_ENV_ONLY",
+  dotenvPathLoaded: null,
+  dotenvKeysApplied: [],
+  hostKeysPreserved: [],
+  publicEnvLeakPaths: [],
+  dotenvParseError: null
+};
+var devOnlyEphemeralSecret = null;
+function getCandidateAppRoots() {
+  const dirs = [];
+  const cwd = process.cwd();
+  dirs.push(cwd);
+  if (typeof __dirname === "string" && __dirname) {
+    const cleanDir = import_path.default.resolve(__dirname);
+    if (!dirs.includes(cleanDir)) {
+      dirs.push(cleanDir);
+    }
+    const parentDir = import_path.default.resolve(cleanDir, "..", "..");
+    if (!dirs.includes(parentDir)) {
+      dirs.push(parentDir);
+    }
+  }
+  if (process.argv[1]) {
+    const argvDir = import_path.default.resolve(import_path.default.dirname(process.argv[1]));
+    if (!dirs.includes(argvDir)) {
+      dirs.push(argvDir);
+    }
+  }
+  return dirs;
+}
+function isPublicWebDirectory(filePath) {
+  const normalized = import_path.default.resolve(filePath).replace(/\\/g, "/").toLowerCase();
+  return normalized.includes("/public/") || normalized.endsWith("/public") || normalized.includes("/dist/") || normalized.endsWith("/dist") || normalized.includes("/public_html/");
+}
+function scanForPublicEnvFiles(baseDirs = getCandidateAppRoots()) {
+  const found = [];
+  for (const base of baseDirs) {
+    for (const sub of ["public", "dist"]) {
+      for (const envName of [".env", ".env.local", ".env.production"]) {
+        const candidate = import_path.default.resolve(base, sub, envName);
+        try {
+          if (import_fs.default.existsSync(candidate) && import_fs.default.statSync(candidate).isFile()) {
+            if (!found.includes(candidate)) {
+              found.push(candidate);
+            }
+          }
+        } catch {
+        }
+      }
+    }
+  }
+  return found;
+}
+function loadEnvironmentOnce(options) {
+  if (envLoadMetadata.loaded && !options?.forceReload) {
+    return envLoadMetadata;
+  }
+  const isVitest = process.env.VITEST === "true";
+  const publicEnvLeakPaths = scanForPublicEnvFiles(options?.searchDirs);
+  if (isVitest && !options?.allowInVitest) {
+    envLoadMetadata = {
+      loaded: true,
+      sourceMode: "HOST_ENV_ONLY",
+      dotenvPathLoaded: null,
+      dotenvKeysApplied: [],
+      hostKeysPreserved: [],
+      publicEnvLeakPaths,
+      dotenvParseError: null
+    };
+    return envLoadMetadata;
+  }
+  const searchDirs = options?.searchDirs || getCandidateAppRoots();
+  const candidateEnvPaths = [];
+  if (process.env.MGAMMON_ENV_FILE) {
+    const explicitPath = import_path.default.resolve(process.cwd(), process.env.MGAMMON_ENV_FILE);
+    if (!isPublicWebDirectory(explicitPath)) {
+      candidateEnvPaths.push(explicitPath);
+    }
+  }
+  for (const dir of searchDirs) {
+    const envFile = import_path.default.resolve(dir, ".env");
+    if (!isPublicWebDirectory(envFile) && !candidateEnvPaths.includes(envFile)) {
+      candidateEnvPaths.push(envFile);
+    }
+  }
+  let dotenvPathLoaded = null;
+  let dotenvParseError = null;
+  const dotenvKeysApplied = [];
+  const hostKeysPreserved = [];
+  for (const candidate of candidateEnvPaths) {
+    try {
+      if (import_fs.default.existsSync(candidate) && import_fs.default.statSync(candidate).isFile()) {
+        const rawBytes = import_fs.default.readFileSync(candidate, "utf8").replace(/^\uFEFF/, "");
+        const parsed = import_dotenv.default.parse(rawBytes);
+        dotenvPathLoaded = candidate;
+        for (const [key, parsedVal] of Object.entries(parsed)) {
+          if (!isValidEnvVarName(key)) {
+            continue;
+          }
+          const existing = process.env[key];
+          const existingTrimmed = typeof existing === "string" ? existing.trim() : "";
+          if (existingTrimmed.length > 0) {
+            hostKeysPreserved.push(key);
+          } else if (typeof parsedVal === "string" && parsedVal.trim().length > 0) {
+            process.env[key] = parsedVal;
+            dotenvKeysApplied.push(key);
+          }
+        }
+        break;
+      }
+    } catch (err) {
+      dotenvParseError = err instanceof Error ? err.message : "Failed to parse .env file";
+      break;
+    }
+  }
+  const sourceMode = dotenvKeysApplied.length === 0 ? "HOST_ENV_ONLY" : hostKeysPreserved.length === 0 ? "DOTENV_FALLBACK_ONLY" : "MIXED_HOST_AND_DOTENV";
+  envLoadMetadata = {
+    loaded: true,
+    sourceMode,
+    dotenvPathLoaded,
+    dotenvKeysApplied,
+    hostKeysPreserved,
+    publicEnvLeakPaths,
+    dotenvParseError
+  };
+  return envLoadMetadata;
+}
+function isValidEnvVarName(name) {
+  return VALID_ENV_NAME_RE.test(name);
+}
+function analyzeEnvValue(rawValue, options) {
+  if (rawValue === void 0 || rawValue === null) {
+    return {
+      present: false,
+      rawLength: 0,
+      trimmedLength: 0,
+      hasLeadingOrTrailingWhitespace: false,
+      hasInternalWhitespace: false,
+      hasNewlines: false,
+      hasControlChars: false,
+      hasBomOrZeroWidth: false,
+      hasNonAscii: false,
+      hasSurroundingQuotes: false,
+      hasCpanelShellUnsafeChars: false,
+      cpanelUnsafeReasons: []
+    };
+  }
+  const str = String(rawValue);
+  const trimmed = str.trim();
+  const hasNewlines = NEWLINE_RE.test(str);
+  const hasControlChars = CONTROL_CHAR_RE.test(str);
+  const hasBomOrZeroWidth = BOM_OR_ZERO_WIDTH_RE.test(str);
+  const hasNonAscii = NON_ASCII_RE.test(str);
+  const hasLeadingOrTrailingWhitespace = str !== trimmed;
+  const hasInternalWhitespace = /[ \t]/.test(trimmed);
+  const hasSurroundingQuotes = trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2 || trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2;
+  const cpanelUnsafeReasons = [];
+  if (options?.checkCpanelSafety !== false && trimmed.length > 0) {
+    if (hasNewlines) cpanelUnsafeReasons.push("\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u062E\u0637 \u062C\u062F\u06CC\u062F (CR/LF)");
+    if (hasControlChars) cpanelUnsafeReasons.push("\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC \u06A9\u0646\u062A\u0631\u0644\u06CC \u0646\u0627\u0645\u0631\u0626\u06CC");
+    if (hasBomOrZeroWidth) cpanelUnsafeReasons.push("\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0645\u062E\u0641\u06CC BOM \u06CC\u0627 \u0646\u06CC\u0645\u200C\u0641\u0627\u0635\u0644\u0647 (ZWNJ)");
+    if (hasNonAscii) cpanelUnsafeReasons.push("\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u063A\u06CC\u0631\u0627\u0646\u06AF\u0644\u06CC\u0633\u06CC (\u063A\u06CC\u0631 ASCII / \u0641\u0627\u0631\u0633\u06CC)");
+    if (hasLeadingOrTrailingWhitespace) cpanelUnsafeReasons.push("\u062F\u0627\u0631\u0627\u06CC \u0641\u0627\u0635\u0644\u0647 \u062F\u0631 \u0627\u0628\u062A\u062F\u0627 \u06CC\u0627 \u0627\u0646\u062A\u0647\u0627");
+    if (hasInternalWhitespace) cpanelUnsafeReasons.push("\u062F\u0627\u0631\u0627\u06CC \u0641\u0627\u0635\u0644\u0647 (Space/Tab) \u062F\u0631\u0648\u0646 \u0645\u0642\u062F\u0627\u0631");
+    if (hasSurroundingQuotes) cpanelUnsafeReasons.push(`\u062F\u0627\u0631\u0627\u06CC \u0639\u0644\u0627\u0645\u062A \u06A9\u0648\u062A\u06CC\u0634\u0646 (" \u06CC\u0627 ') \u062F\u0631 \u0627\u0637\u0631\u0627\u0641 \u0645\u0642\u062F\u0627\u0631`);
+    if (CPANEL_SHELL_UNSAFE_RE.test(trimmed)) {
+      cpanelUnsafeReasons.push(`\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC \u062D\u0633\u0627\u0633 \u0634\u0650\u0644/Apache \u0645\u062B\u0644 $ \u06CC\u0627 " \u06CC\u0627 ' \u06CC\u0627 \\ \u06CC\u0627 # \u06CC\u0627 ;`);
+    }
+  }
+  return {
+    present: trimmed.length > 0,
+    rawLength: str.length,
+    trimmedLength: trimmed.length,
+    hasLeadingOrTrailingWhitespace,
+    hasInternalWhitespace,
+    hasNewlines,
+    hasControlChars,
+    hasBomOrZeroWidth,
+    hasNonAscii,
+    hasSurroundingQuotes,
+    hasCpanelShellUnsafeChars: cpanelUnsafeReasons.length > 0,
+    cpanelUnsafeReasons
+  };
+}
+function isBundledAppCjs() {
+  if (typeof __filename === "string" && import_path.default.basename(__filename) === "app.cjs") {
+    return true;
+  }
+  if (process.argv[1] && import_path.default.basename(process.argv[1]) === "app.cjs") {
+    return true;
+  }
+  return false;
+}
+function isPassengerEnvironment(env = process.env) {
+  return Boolean(
+    env.PASSENGER_BASE_URI || env.PASSENGER_APP_ENV || env.IN_PASSENGER || env.PASSENGER_SPAWN_METHOD || typeof globalThis.PhusionPassenger !== "undefined"
+  );
+}
+function isProductionMode(env = process.env) {
+  if (env.NODE_ENV === "production") return true;
+  if (env.NODE_ENV === "development" || env.NODE_ENV === "test") return false;
+  if (env.PASSENGER_APP_ENV === "production") return true;
+  if (env.VITEST === "true") return false;
+  if (isUsingProcessEnv(env) && (isBundledAppCjs() || env.CPANEL_ENV === "true")) {
+    return true;
+  }
+  return false;
+}
+function isCpanelOrProductionEnvironment(env = process.env) {
+  if (isProductionMode(env)) return true;
+  if (env.CPANEL_ENV === "true" || env.CPANEL === "1") return true;
+  if (isPassengerEnvironment(env)) return true;
+  const rawUser = (env.DB_USER || "").trim();
+  if (rawUser && !PLACEHOLDER_DB_USERS.has(rawUser) && rawUser !== "root") {
+    return true;
+  }
+  return false;
+}
+function isUsingProcessEnv(env) {
+  return env === process.env;
+}
+function validateSessionSecret(env = process.env) {
+  if (isUsingProcessEnv(env)) {
+    loadEnvironmentOnce();
+  }
+  const raw = env.SESSION_SECRET;
+  const inspection = analyzeEnvValue(raw, { isSecret: true, checkCpanelSafety: true });
+  const trimmed = (raw || "").trim();
+  const isProd = isProductionMode(env);
+  if (!inspection.present || trimmed === "undefined" || trimmed === "null") {
+    return {
+      valid: !isProd,
+      status: isProd ? "FAIL" : "NOT_CONFIGURED",
+      code: isProd ? "SECRET_EMPTY" : "NOT_CONFIGURED_DEV",
+      reason: isProd ? "SESSION_SECRET \u062F\u0631 \u0645\u062D\u06CC\u0637 Production \u062E\u0627\u0644\u06CC \u06CC\u0627 \u062A\u0639\u0631\u06CC\u0641\u200C\u0646\u0634\u062F\u0647 \u0627\u0633\u062A (\u0627\u062D\u062A\u0645\u0627\u0644\u0627\u064B \u062F\u0631 cPanel \u062B\u0628\u062A \u0646\u0634\u062F\u0647 \u06CC\u0627 \u062A\u0648\u0633\u0637 set_env_vars.py \u0631\u062F \u0634\u062F\u0647 \u0627\u0633\u062A)." : "SESSION_SECRET \u062F\u0631 \u0645\u062D\u06CC\u0637 \u062A\u0648\u0633\u0639\u0647 \u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647 \u0648 \u0627\u0632 \u06A9\u0644\u06CC\u062F \u0645\u0648\u0642\u062A \u062D\u0627\u0641\u0638\u0647\u200C\u0627\u06CC \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F.",
+      length: 0,
+      cpanelWarnings: []
+    };
+  }
+  if (inspection.hasNewlines || inspection.hasControlChars || inspection.hasBomOrZeroWidth || inspection.hasNonAscii || inspection.hasInternalWhitespace || inspection.hasSurroundingQuotes) {
+    const defects = [];
+    if (inspection.hasNewlines) defects.push("\u062E\u0637 \u062C\u062F\u06CC\u062F (CR/LF)");
+    if (inspection.hasControlChars) defects.push("\u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0646\u062A\u0631\u0644\u06CC");
+    if (inspection.hasBomOrZeroWidth) defects.push("BOM \u06CC\u0627 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0645\u062E\u0641\u06CC \u0646\u06CC\u0645\u200C\u0641\u0627\u0635\u0644\u0647");
+    if (inspection.hasNonAscii) defects.push("\u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u063A\u06CC\u0631 ASCII");
+    if (inspection.hasInternalWhitespace) defects.push("\u0641\u0627\u0635\u0644\u0647 \u0645\u06CC\u0627\u0646\u06CC");
+    if (inspection.hasSurroundingQuotes) defects.push("\u06A9\u0648\u062A\u06CC\u0634\u0646 \u0627\u0637\u0631\u0627\u0641 \u0645\u0642\u062F\u0627\u0631");
+    return {
+      valid: false,
+      status: "FAIL",
+      code: "SECRET_INVALID_CHARACTERS",
+      reason: `SESSION_SECRET \u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC \u0646\u0627\u0645\u0639\u062A\u0628\u0631 (${defects.join("\u060C ")}) \u0627\u0633\u062A\u061B \u0645\u0642\u062F\u0627\u0631 \u0628\u0627\u06CC\u062F \u06CC\u06A9 \u0631\u0634\u062A\u0647 \u06CC\u06A9\u062F\u0633\u062A \u0648 \u067E\u0627\u06A9 ASCII \u0628\u062F\u0648\u0646 \u0641\u0627\u0635\u0644\u0647\u060C \u06A9\u0648\u062A\u06CC\u0634\u0646 \u0648 \u062E\u0637 \u062C\u062F\u06CC\u062F \u0628\u0627\u0634\u062F.`,
+      length: trimmed.length,
+      cpanelWarnings: inspection.cpanelUnsafeReasons
+    };
+  }
+  const lower = trimmed.toLowerCase();
+  if (FORBIDDEN_DEFAULT_SECRETS.has(trimmed) || FORBIDDEN_DEFAULT_SECRETS.has(lower)) {
+    return {
+      valid: false,
+      status: "FAIL",
+      code: "SECRET_DEFAULT_FORBIDDEN",
+      reason: "SESSION_SECRET \u0631\u0648\u06CC \u0645\u0642\u062F\u0627\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u06CC\u0627 \u0627\u0644\u06AF\u0648\u0647\u0627\u06CC \u0646\u0645\u0648\u0646\u0647 \u0646\u0627\u0627\u0645\u0646 \u062A\u0646\u0638\u06CC\u0645 \u0634\u062F\u0647 \u0627\u0633\u062A.",
+      length: trimmed.length,
+      cpanelWarnings: inspection.cpanelUnsafeReasons
+    };
+  }
+  if (trimmed.length < 32) {
+    return {
+      valid: false,
+      status: "FAIL",
+      code: "SECRET_TOO_SHORT",
+      reason: `\u0637\u0648\u0644 SESSION_SECRET \u0628\u0631\u0627\u0628\u0631 ${trimmed.length} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0627\u0633\u062A \u0648 \u0627\u0632 \u062D\u062F\u0627\u0642\u0644 \u0645\u062C\u0627\u0632 \u06F3\u06F2 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0645\u062A\u0631 \u0627\u0633\u062A.`,
+      length: trimmed.length,
+      cpanelWarnings: inspection.cpanelUnsafeReasons
+    };
+  }
+  const uniqueCharsCount = new Set(trimmed.split("")).size;
+  if (uniqueCharsCount < 8) {
+    return {
+      valid: false,
+      status: "FAIL",
+      code: "SECRET_LOW_ENTROPY",
+      reason: `\u062A\u0646\u0648\u0639 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC SESSION_SECRET \u0628\u0633\u06CC\u0627\u0631 \u067E\u0627\u06CC\u06CC\u0646 (${uniqueCharsCount} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06CC\u06A9\u062A\u0627) \u0627\u0633\u062A \u0648 \u0627\u0645\u0646\u06CC\u062A \u06A9\u0627\u0641\u06CC \u0646\u062F\u0627\u0631\u062F.`,
+      length: trimmed.length,
+      cpanelWarnings: inspection.cpanelUnsafeReasons
+    };
+  }
+  const cpanelWarnings = [...inspection.cpanelUnsafeReasons];
+  if (trimmed.length < 64) {
+    cpanelWarnings.push(
+      `\u0637\u0648\u0644 \u06A9\u0644\u06CC\u062F ${trimmed.length} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0627\u0633\u062A (\u0645\u0639\u062A\u0628\u0631\u060C \u0627\u0645\u0627 \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0627\u0632 \u06F6\u06F4 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0647\u06AF\u0632 \u062A\u0648\u0635\u06CC\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F).`
+    );
+  }
+  return {
+    valid: true,
+    status: cpanelWarnings.length > 0 ? "WARNING" : "PASS",
+    code: cpanelWarnings.length > 0 ? "VALID_WITH_WARNINGS" : "VALID",
+    reason: cpanelWarnings.length > 0 ? `SESSION_SECRET \u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A (${trimmed.length} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631) \u0648\u0644\u06CC \u0647\u0634\u062F\u0627\u0631 \u0633\u0627\u0632\u06AF\u0627\u0631\u06CC cPanel \u062F\u0627\u0631\u062F.` : `SESSION_SECRET \u0645\u0639\u062A\u0628\u0631 \u0648 \u0627\u0645\u0646 \u0627\u0633\u062A (${trimmed.length} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631).`,
+    length: trimmed.length,
+    cpanelWarnings
+  };
+}
+function validateProductionSecurityConfig(env = process.env) {
+  if (isUsingProcessEnv(env)) {
+    loadEnvironmentOnce();
+  }
+  if (!isProductionMode(env)) {
+    return;
+  }
+  const secretCheck = validateSessionSecret(env);
+  if (!secretCheck.valid) {
+    throw new Error(`SECURITY_CONFIG_ERROR: ${secretCheck.reason}`);
+  }
+  const mgrPassRaw = env.INITIAL_MANAGER_PASSWORD;
+  const wrkPassRaw = env.INITIAL_WORKER_PASSWORD;
+  const mgrInspect = analyzeEnvValue(mgrPassRaw, { isSecret: true, checkCpanelSafety: false });
+  const wrkInspect = analyzeEnvValue(wrkPassRaw, { isSecret: true, checkCpanelSafety: false });
+  if (mgrInspect.hasNewlines || mgrInspect.hasControlChars || wrkInspect.hasNewlines || wrkInspect.hasControlChars) {
+    throw new Error(
+      "SECURITY_CONFIG_ERROR: \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0648\u0644\u06CC\u0647 \u062D\u0633\u0627\u0628\u200C\u0647\u0627 (INITIAL_MANAGER_PASSWORD / INITIAL_WORKER_PASSWORD) \u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0646\u062A\u0631\u0644\u06CC \u06CC\u0627 \u062E\u0637 \u062C\u062F\u06CC\u062F \u0627\u0633\u062A."
+    );
+  }
+  const mgrPass = (mgrPassRaw || "").trim();
+  const wrkPass = (wrkPassRaw || "").trim();
+  if (mgrPass && (mgrPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(mgrPass)) || wrkPass && (wrkPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(wrkPass))) {
+    throw new Error(
+      "SECURITY_CONFIG_ERROR: \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0627\u0632 \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u06CC\u0627 \u0636\u0639\u06CC\u0641 \u0628\u0631\u0627\u06CC \u062D\u0633\u0627\u0628\u200C\u0647\u0627\u06CC \u0627\u0648\u0644\u06CC\u0647 \u062F\u0631 \u0645\u062D\u06CC\u0637 \u0639\u0645\u0644\u06CC\u0627\u062A\u06CC (Production) \u0645\u062C\u0627\u0632 \u0646\u06CC\u0633\u062A."
+    );
+  }
+}
+function validateProductionDatabaseConfig(env = process.env) {
+  if (isUsingProcessEnv(env)) {
+    loadEnvironmentOnce();
+  }
+  const missingVars = [];
+  const invalidVars = [];
+  const rawHost = (env.DB_HOST || "").trim();
+  const rawPort = (env.DB_PORT || "").trim();
+  const rawName = (env.DB_NAME || "").trim();
+  const rawUser = (env.DB_USER || "").trim();
+  const rawPass = env.DB_PASSWORD || "";
+  const rawConnLimit = (env.DB_CONNECTION_LIMIT || "").trim();
+  if (rawPort) {
+    const portNum = Number(rawPort);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      invalidVars.push("DB_PORT (\u0639\u062F\u062F \u067E\u0648\u0631\u062A \u0646\u0627\u0645\u0639\u062A\u0628\u0631\u061B \u0628\u0627\u06CC\u062F \u0628\u06CC\u0646 \u06F1 \u062A\u0627 \u06F6\u06F5\u06F5\u06F3\u06F5 \u0628\u0627\u0634\u062F)");
+    }
+  }
+  if (rawConnLimit) {
+    const limitNum = Number(rawConnLimit);
+    if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > 100) {
+      invalidVars.push("DB_CONNECTION_LIMIT (\u0628\u0627\u06CC\u062F \u0639\u062F\u062F \u0635\u062D\u06CC\u062D \u0628\u06CC\u0646 \u06F1 \u062A\u0627 \u06F1\u06F0\u06F0 \u0628\u0627\u0634\u062F)");
+    }
+  }
+  const nameInspect = analyzeEnvValue(rawName);
+  const userInspect = analyzeEnvValue(rawUser);
+  const hostInspect = analyzeEnvValue(rawHost);
+  if (hostInspect.hasNewlines || hostInspect.hasControlChars || hostInspect.hasBomOrZeroWidth) {
+    invalidVars.push("DB_HOST (\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0646\u062A\u0631\u0644\u06CC \u06CC\u0627 \u062E\u0637 \u062C\u062F\u06CC\u062F)");
+  }
+  if (nameInspect.hasNewlines || nameInspect.hasControlChars || nameInspect.hasBomOrZeroWidth) {
+    invalidVars.push("DB_NAME (\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0646\u062A\u0631\u0644\u06CC \u06CC\u0627 \u062E\u0637 \u062C\u062F\u06CC\u062F)");
+  }
+  if (userInspect.hasNewlines || userInspect.hasControlChars || userInspect.hasBomOrZeroWidth) {
+    invalidVars.push("DB_USER (\u062F\u0627\u0631\u0627\u06CC \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0646\u062A\u0631\u0644\u06CC \u06CC\u0627 \u062E\u0637 \u062C\u062F\u06CC\u062F)");
+  }
+  if (isProductionMode(env) && env.VITEST !== "true") {
+    if (!rawHost) missingVars.push("DB_HOST");
+    if (!rawName || PLACEHOLDER_DB_NAMES.has(rawName)) missingVars.push("DB_NAME");
+    if (!rawUser || PLACEHOLDER_DB_USERS.has(rawUser)) missingVars.push("DB_USER");
+    if (!rawPass.trim() || PLACEHOLDER_DB_PASSWORDS.has(rawPass.trim())) {
+      missingVars.push("DB_PASSWORD");
+    }
+  }
+  const valid = missingVars.length === 0 && invalidVars.length === 0;
+  const parts = [];
+  if (missingVars.length > 0) {
+    parts.push(`\u0645\u062A\u063A\u06CC\u0631(\u0647\u0627\u06CC) \u0645\u0641\u0642\u0648\u062F \u06CC\u0627 \u062F\u0627\u0631\u0627\u06CC \u0645\u0642\u062F\u0627\u0631 \u0646\u0645\u0648\u0646\u0647: ${missingVars.join("\u060C ")}`);
+  }
+  if (invalidVars.length > 0) {
+    parts.push(`\u0645\u062A\u063A\u06CC\u0631(\u0647\u0627\u06CC) \u0646\u0627\u0645\u0639\u062A\u0628\u0631: ${invalidVars.join("\u060C ")}`);
+  }
+  return {
+    valid,
+    missingVars,
+    invalidVars,
+    message: valid ? "\u062A\u0646\u0638\u06CC\u0645\u0627\u062A \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 \u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A." : parts.join(" | ")
+  };
+}
+function getDbConfig(env = process.env) {
+  if (isUsingProcessEnv(env)) {
+    loadEnvironmentOnce();
+  }
+  const rawUser = (env.DB_USER || "").trim();
+  const rawPassword = env.DB_PASSWORD || "";
+  const rawDbName = (env.DB_NAME || "").trim();
+  const rawHost = (env.DB_HOST || "").trim();
+  const rawPort = (env.DB_PORT || "").trim();
+  const rawLimit = (env.DB_CONNECTION_LIMIT || "").trim();
+  const parsedPort = rawPort ? Number(rawPort) : 3306;
+  const port = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? parsedPort : 3306;
+  const parsedLimit = rawLimit ? Number(rawLimit) : 10;
+  const connectionLimit = Number.isInteger(parsedLimit) && parsedLimit >= 2 && parsedLimit <= 50 ? parsedLimit : 10;
+  const allowDevPlaceholderFallback = !isProductionMode(env) || env.VITEST === "true";
+  const resolvedUser = PLACEHOLDER_DB_USERS.has(rawUser) ? allowDevPlaceholderFallback ? "root" : "" : rawUser;
+  const resolvedPassword = PLACEHOLDER_DB_PASSWORDS.has(rawPassword) ? "" : rawPassword;
+  const resolvedDatabase = PLACEHOLDER_DB_NAMES.has(rawDbName) ? allowDevPlaceholderFallback ? "mgammon_duo" : "" : rawDbName;
+  return {
+    host: rawHost || "127.0.0.1",
+    port,
+    user: resolvedUser,
+    password: resolvedPassword,
+    database: resolvedDatabase,
+    waitForConnections: true,
+    connectionLimit,
+    connectTimeout: 5e3,
+    queueLimit: 0,
+    charset: "utf8mb4",
+    timezone: "+03:30",
+    dateStrings: ["DATE"]
+  };
+}
+function getSessionSecret(env = process.env) {
+  if (isUsingProcessEnv(env)) {
+    loadEnvironmentOnce();
+  }
+  validateProductionSecurityConfig(env);
+  const check = validateSessionSecret(env);
+  if (check.valid && env.SESSION_SECRET && env.SESSION_SECRET.trim().length >= 32) {
+    return env.SESSION_SECRET.trim();
+  }
+  if (isProductionMode(env)) {
+    throw new Error(`SECURITY_CONFIG_ERROR: ${check.reason}`);
+  }
+  if (!devOnlyEphemeralSecret) {
+    devOnlyEphemeralSecret = import_crypto.default.randomBytes(32).toString("hex");
+  }
+  return devOnlyEphemeralSecret;
+}
+function getAppConfig(env = process.env) {
+  if (isUsingProcessEnv(env)) {
+    loadEnvironmentOnce();
+  }
+  const rawPort = (env.PORT || "").trim();
+  let listenTarget = 3e3;
+  let isSocketOrPipe = false;
+  if (rawPort) {
+    if (/^\d+$/.test(rawPort)) {
+      const n = Number(rawPort);
+      if (n >= 1 && n <= 65535) {
+        listenTarget = n;
+      }
+    } else if (rawPort.startsWith("/") || rawPort.startsWith("\\\\.\\pipe\\")) {
+      listenTarget = rawPort;
+      isSocketOrPipe = true;
+    }
+  }
+  const privateMediaDir = (env.PRIVATE_MEDIA_DIR || "").trim() ? import_path.default.resolve(process.cwd(), (env.PRIVATE_MEDIA_DIR || "").trim()) : import_path.default.resolve(process.cwd(), ".data/private_media");
+  const backupDir = (env.BACKUP_DIR || "").trim() ? import_path.default.resolve(process.cwd(), (env.BACKUP_DIR || "").trim()) : import_path.default.resolve(process.cwd(), ".data/backups");
+  return {
+    nodeEnv: (env.NODE_ENV || "").trim() || "development",
+    isProduction: isProductionMode(env),
+    isBundled: isBundledAppCjs(),
+    isPassenger: isPassengerEnvironment(env),
+    isVitest: env.VITEST === "true",
+    listenTarget,
+    isSocketOrPipe,
+    appUrl: (env.APP_URL || "").trim() || null,
+    appTimezone: (env.APP_TIMEZONE || "").trim() || "Asia/Tehran",
+    enforcePasswordChange: env.ENFORCE_PASSWORD_CHANGE === "true" || isProductionMode(env),
+    privateMediaDir,
+    backupDir,
+    initialManagerUsername: (env.INITIAL_MANAGER_USERNAME || "manager").trim() || "manager",
+    initialManagerPassword: (env.INITIAL_MANAGER_PASSWORD || "").trim(),
+    initialWorkerUsername: (env.INITIAL_WORKER_USERNAME || "worker").trim() || "worker",
+    initialWorkerPassword: (env.INITIAL_WORKER_PASSWORD || "").trim(),
+    localMariaDbDataDir: (env.LOCAL_MARIADB_DATADIR || "/var/lib/mysql").trim(),
+    localDebCacheDir: (env.LOCAL_DEB_CACHE_DIR || "/var/cache/apt/archives").trim(),
+    simulateDbDown: env.SIMULATE_DB_DOWN === "true"
+  };
+}
+function sanitizeSecretErrorText(err) {
+  const raw = err instanceof Error ? err.message : String(err || "Unknown error");
+  let sanitized = raw.replace(
+    /(password|passwd|pwd|token|secret|authorization|session_secret|db_password|api[_-]?key)\s*[:=]\s*[^\s,;'"&]+/gi,
+    "$1=[REDACTED]"
+  ).replace(/using password:\s*(YES|NO)/gi, "using password: [REDACTED]").replace(/'[^']*'@'[^']*'/g, "'[USER]'@'[HOST]'");
+  for (const secretKey of [
+    "SESSION_SECRET",
+    "DB_PASSWORD",
+    "INITIAL_MANAGER_PASSWORD",
+    "INITIAL_WORKER_PASSWORD"
+  ]) {
+    const val = (process.env[secretKey] || "").trim();
+    if (val && val.length >= 6 && sanitized.includes(val)) {
+      sanitized = sanitized.split(val).join("[REDACTED]");
+    }
+  }
+  return sanitized;
+}
+
+// src/server/db.ts
 var execAsync = (0, import_util.promisify)(import_child_process.exec);
 var pool = null;
 var currentPoolDbName = "";
@@ -56,40 +604,8 @@ var lastDbError = null;
 var localMariaDbBootstrapPromise = null;
 var simulatedDisconnect = false;
 var simulatedMidTxFailureTag = null;
-var PLACEHOLDER_DB_USERS = /* @__PURE__ */ new Set(["", "cpanel_username_mgammon", "your_db_user"]);
-var PLACEHOLDER_DB_PASSWORDS = /* @__PURE__ */ new Set(["", "YOUR_STRONG_MYSQL_PASSWORD", "your_db_password"]);
-var PLACEHOLDER_DB_NAMES = /* @__PURE__ */ new Set(["", "cpanel_username_mgammon_duo", "your_db_name"]);
 function sanitizeDbErrorMessage(err) {
-  const raw = err instanceof Error ? err.message : String(err || "Unknown database error");
-  return raw.replace(/(password|passwd|pwd|token|secret|authorization|key)\s*[:=]\s*[^\s,;'"&]+/gi, "$1=[REDACTED]").replace(/using password:\s*(YES|NO)/gi, "using password: [REDACTED]").replace(/'[^']*'@'[^']*'/g, "'[USER]'@'[HOST]'");
-}
-function isCpanelOrProductionEnvironment(env = process.env) {
-  if (env.NODE_ENV === "production") return true;
-  if (env.CPANEL_ENV === "true" || env.CPANEL === "1") return true;
-  const rawUser = (env.DB_USER || "").trim();
-  if (rawUser && !PLACEHOLDER_DB_USERS.has(rawUser) && rawUser !== "root") {
-    return true;
-  }
-  return false;
-}
-function getDbConfig(env = process.env) {
-  const rawUser = (env.DB_USER || "").trim();
-  const rawPassword = env.DB_PASSWORD || "";
-  const rawDbName = (env.DB_NAME || "").trim();
-  return {
-    host: env.DB_HOST || "127.0.0.1",
-    port: Number(env.DB_PORT || 3306),
-    user: PLACEHOLDER_DB_USERS.has(rawUser) ? "root" : rawUser,
-    password: PLACEHOLDER_DB_PASSWORDS.has(rawPassword) ? "" : rawPassword,
-    database: PLACEHOLDER_DB_NAMES.has(rawDbName) ? "mgammon_duo" : rawDbName,
-    waitForConnections: true,
-    connectionLimit: 10,
-    connectTimeout: 5e3,
-    queueLimit: 0,
-    charset: "utf8mb4",
-    timezone: "+03:30",
-    dateStrings: ["DATE"]
-  };
+  return sanitizeSecretErrorText(err);
 }
 async function hasMariadbdBinary() {
   try {
@@ -129,13 +645,14 @@ async function ensureLocalMariaDbRunningIfNeeded() {
   }
   localMariaDbBootstrapPromise = (async () => {
     try {
-      const persistentDataDir = process.env.LOCAL_MARIADB_DATADIR || "/var/lib/mysql";
-      const debCacheDir = process.env.LOCAL_DEB_CACHE_DIR || "/var/cache/apt/archives";
-      import_fs.default.mkdirSync(debCacheDir, { recursive: true });
+      const appCfg = getAppConfig();
+      const persistentDataDir = appCfg.localMariaDbDataDir;
+      const debCacheDir = appCfg.localDebCacheDir;
+      import_fs2.default.mkdirSync(debCacheDir, { recursive: true });
       let hasMariadbd = await hasMariadbdBinary();
-      if (!hasMariadbd && import_fs.default.existsSync("/etc/debian_version")) {
+      if (!hasMariadbd && import_fs2.default.existsSync("/etc/debian_version")) {
         try {
-          const cachedDebs = import_fs.default.readdirSync(debCacheDir).filter((f) => f.endsWith(".deb"));
+          const cachedDebs = import_fs2.default.readdirSync(debCacheDir).filter((f) => f.endsWith(".deb"));
           if (cachedDebs.some((f) => f.startsWith("mariadb-server_"))) {
             await execAsync(
               `DEBIAN_FRONTEND=noninteractive dpkg -i --force-confdef --force-confold "${debCacheDir}"/*.deb || DEBIAN_FRONTEND=noninteractive dpkg --configure -a`
@@ -145,13 +662,13 @@ async function ensureLocalMariaDbRunningIfNeeded() {
         }
         hasMariadbd = await hasMariadbdBinary();
       }
-      if (!hasMariadbd && import_fs.default.existsSync("/etc/debian_version")) {
+      if (!hasMariadbd && import_fs2.default.existsSync("/etc/debian_version")) {
         try {
-          if (import_fs.default.existsSync("/etc/apt/sources.list.d/debian.sources") && import_fs.default.existsSync("/etc/apt/sources.list")) {
-            import_fs.default.unlinkSync("/etc/apt/sources.list");
+          if (import_fs2.default.existsSync("/etc/apt/sources.list.d/debian.sources") && import_fs2.default.existsSync("/etc/apt/sources.list")) {
+            import_fs2.default.unlinkSync("/etc/apt/sources.list");
           }
-          if (import_fs.default.existsSync("/etc/apt/apt.conf.d/docker-clean")) {
-            import_fs.default.unlinkSync("/etc/apt/apt.conf.d/docker-clean");
+          if (import_fs2.default.existsSync("/etc/apt/apt.conf.d/docker-clean")) {
+            import_fs2.default.unlinkSync("/etc/apt/apt.conf.d/docker-clean");
           }
         } catch {
         }
@@ -159,9 +676,9 @@ async function ensureLocalMariaDbRunningIfNeeded() {
           await execAsync(
             `DEBIAN_FRONTEND=noninteractive dpkg --configure -a && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y -o APT::Keep-Downloaded-Packages="true" -o Dir::Cache::archives="${debCacheDir}" && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o APT::Keep-Downloaded-Packages="true" -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -o Dir::Cache::archives="${debCacheDir}" mariadb-server`
           );
-          const lockFile = import_path.default.join(debCacheDir, "lock");
-          if (import_fs.default.existsSync(lockFile)) {
-            import_fs.default.unlinkSync(lockFile);
+          const lockFile = import_path2.default.join(debCacheDir, "lock");
+          if (import_fs2.default.existsSync(lockFile)) {
+            import_fs2.default.unlinkSync(lockFile);
           }
         } catch {
         }
@@ -170,10 +687,10 @@ async function ensureLocalMariaDbRunningIfNeeded() {
       if (!hasMariadbd) {
         return;
       }
-      const isSocketReady = () => import_fs.default.existsSync("/run/mysqld/mysqld.sock") || import_fs.default.existsSync("/var/run/mysqld/mysqld.sock");
+      const isSocketReady = () => import_fs2.default.existsSync("/run/mysqld/mysqld.sock") || import_fs2.default.existsSync("/var/run/mysqld/mysqld.sock");
       const initFreshDataDir = async () => {
-        import_fs.default.rmSync(persistentDataDir, { recursive: true, force: true });
-        import_fs.default.mkdirSync(persistentDataDir, { recursive: true });
+        import_fs2.default.rmSync(persistentDataDir, { recursive: true, force: true });
+        import_fs2.default.mkdirSync(persistentDataDir, { recursive: true });
         await execAsync(`chown -R mysql:mysql /run/mysqld "${persistentDataDir}"`);
         await execAsync(
           `mariadb-install-db --user=mysql --datadir="${persistentDataDir}" --innodb-log-file-size=8M --auth-root-authentication-method=normal`
@@ -212,9 +729,9 @@ async function ensureLocalMariaDbRunningIfNeeded() {
         return isSocketReady();
       };
       if (!isSocketReady()) {
-        import_fs.default.mkdirSync("/run/mysqld", { recursive: true });
-        import_fs.default.mkdirSync(persistentDataDir, { recursive: true });
-        if (!import_fs.default.existsSync(import_path.default.join(persistentDataDir, "mysql")) || !import_fs.default.existsSync(import_path.default.join(persistentDataDir, "ibdata1"))) {
+        import_fs2.default.mkdirSync("/run/mysqld", { recursive: true });
+        import_fs2.default.mkdirSync(persistentDataDir, { recursive: true });
+        if (!import_fs2.default.existsSync(import_path2.default.join(persistentDataDir, "mysql")) || !import_fs2.default.existsSync(import_path2.default.join(persistentDataDir, "ibdata1"))) {
           try {
             await initFreshDataDir();
           } catch {
@@ -316,7 +833,7 @@ async function checkDatabaseConnection() {
       message: "\u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 MySQL \u0645\u0648\u0642\u062A\u0627\u064B \u062F\u0631 \u062F\u0633\u062A\u0631\u0633 \u0646\u06CC\u0633\u062A."
     };
   }
-  if (process.env.SIMULATE_DB_DOWN === "true") {
+  if (getAppConfig().simulateDbDown) {
     return {
       connected: false,
       initialized: false,
@@ -326,7 +843,7 @@ async function checkDatabaseConnection() {
   if (!isDatabaseInitialized()) {
     await waitForPendingDatabaseInit();
   }
-  if (!isDatabaseInitialized() && process.env.VITEST !== "true") {
+  if (!isDatabaseInitialized() && !getAppConfig().isVitest) {
     try {
       await initializeDatabase();
     } catch {
@@ -350,43 +867,6 @@ async function checkDatabaseConnection() {
       initialized: false,
       message: "\u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631 \u0628\u0631\u0642\u0631\u0627\u0631 \u0646\u06CC\u0633\u062A. \u0644\u0637\u0641\u0627\u064B \u0627\u062A\u0635\u0627\u0644 \u0631\u0627 \u0628\u0631\u0631\u0633\u06CC \u06A9\u0646\u06CC\u062F."
     };
-  }
-}
-var FORBIDDEN_DEFAULT_SECRETS = /* @__PURE__ */ new Set([
-  "",
-  "mgammon-duo-default-server-secret-2026",
-  "mgammon-duo-enterprise-secret-2026",
-  "CHANGE_THIS_TO_A_STRONG_64_CHAR_RANDOM_SECRET_KEY",
-  "replace_with_a_long_random_64_char_secret_string",
-  "secret",
-  "changeme"
-]);
-var FORBIDDEN_DEFAULT_PASSWORDS = /* @__PURE__ */ new Set([
-  "Mgammon@1405",
-  "Worker@1405",
-  "CHANGE_ME_MANAGER_PASSWORD",
-  "CHANGE_ME_WORKER_PASSWORD",
-  "123456",
-  "12345678",
-  "password",
-  "admin"
-]);
-function validateProductionSecurityConfig(env = process.env) {
-  if (env.NODE_ENV !== "production") {
-    return;
-  }
-  const sessionSecret = (env.SESSION_SECRET || "").trim();
-  if (!sessionSecret || sessionSecret.length < 32 || FORBIDDEN_DEFAULT_SECRETS.has(sessionSecret)) {
-    throw new Error(
-      "SECURITY_CONFIG_ERROR: \u0645\u062A\u063A\u06CC\u0631 \u0645\u062D\u06CC\u0637\u06CC SESSION_SECRET \u062F\u0631 \u0645\u062D\u06CC\u0637 \u0639\u0645\u0644\u06CC\u0627\u062A\u06CC (Production) \u062E\u0627\u0644\u06CC\u060C \u06A9\u0648\u062A\u0627\u0647\u200C\u062A\u0631 \u0627\u0632 \u06F3\u06F2 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06CC\u0627 \u062F\u0627\u0631\u0627\u06CC \u0645\u0642\u062F\u0627\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u0627\u0633\u062A. \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC \u0633\u0631\u0648\u0631 \u0645\u062A\u0648\u0642\u0641 \u0634\u062F."
-    );
-  }
-  const mgrPass = (env.INITIAL_MANAGER_PASSWORD || "").trim();
-  const wrkPass = (env.INITIAL_WORKER_PASSWORD || "").trim();
-  if (mgrPass && (mgrPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(mgrPass)) || wrkPass && (wrkPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(wrkPass))) {
-    throw new Error(
-      "SECURITY_CONFIG_ERROR: \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0627\u0632 \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u06CC\u0627 \u0636\u0639\u06CC\u0641 \u0628\u0631\u0627\u06CC \u062D\u0633\u0627\u0628\u200C\u0647\u0627\u06CC \u0627\u0648\u0644\u06CC\u0647 \u062F\u0631 \u0645\u062D\u06CC\u0637 \u0639\u0645\u0644\u06CC\u0627\u062A\u06CC (Production) \u0645\u062C\u0627\u0632 \u0646\u06CC\u0633\u062A."
-    );
   }
 }
 async function columnExists(p, tableName, columnName) {
@@ -895,8 +1375,8 @@ async function createPreMigrationSafetySnapshot(p, targetVersion) {
     if (userCount === 0) {
       return null;
     }
-    const backupDir = import_path.default.resolve(process.cwd(), ".data/backups");
-    import_fs.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
+    const backupDir = import_path2.default.resolve(process.cwd(), ".data/backups");
+    import_fs2.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
     const tablesToSnap = [
       "users",
       "system_settings",
@@ -917,7 +1397,7 @@ async function createPreMigrationSafetySnapshot(p, targetVersion) {
     }
     const cfg = getDbConfig();
     const fileName = `pre_migration_${cfg.database}_v${targetVersion}_${Date.now()}.json`;
-    const fullPath = import_path.default.join(backupDir, fileName);
+    const fullPath = import_path2.default.join(backupDir, fileName);
     const content = JSON.stringify(
       {
         createdAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -928,7 +1408,7 @@ async function createPreMigrationSafetySnapshot(p, targetVersion) {
       null,
       2
     );
-    import_fs.default.writeFileSync(fullPath, content, { mode: 384 });
+    import_fs2.default.writeFileSync(fullPath, content, { mode: 384 });
     return fullPath;
   } catch {
     return null;
@@ -967,7 +1447,7 @@ async function runVersionedMigrations(p) {
   const appliedVersions = [];
   for (const mig of SCHEMA_MIGRATIONS) {
     const startMs = Date.now();
-    const checksum = import_crypto.default.createHash("sha256").update(`${mig.version}:${mig.name}`).digest("hex");
+    const checksum = import_crypto2.default.createHash("sha256").update(`${mig.version}:${mig.name}`).digest("hex");
     await mig.up(p);
     if (!appliedMap.has(mig.version)) {
       const execMs = Math.max(0, Date.now() - startMs);
@@ -988,24 +1468,24 @@ async function runVersionedMigrations(p) {
 }
 function migrateLegacyPublicMediaToPrivate() {
   const folders = ["avatars", "attachments", "excel", "audio", "receipts", "reports"];
-  const privateBaseDir = import_path.default.resolve(process.cwd(), ".data/private_media");
-  const legacyPublicMediaDir = import_path.default.resolve(process.cwd(), "public/assets/media");
+  const privateBaseDir = import_path2.default.resolve(process.cwd(), ".data/private_media");
+  const legacyPublicMediaDir = import_path2.default.resolve(process.cwd(), "public/assets/media");
   for (const folder of folders) {
     try {
-      const targetDir = import_path.default.resolve(privateBaseDir, folder);
-      import_fs.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
-      const legacyDir = import_path.default.resolve(legacyPublicMediaDir, folder);
-      if (import_fs.default.existsSync(legacyDir)) {
-        const entries = import_fs.default.readdirSync(legacyDir, { withFileTypes: true });
+      const targetDir = import_path2.default.resolve(privateBaseDir, folder);
+      import_fs2.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
+      const legacyDir = import_path2.default.resolve(legacyPublicMediaDir, folder);
+      if (import_fs2.default.existsSync(legacyDir)) {
+        const entries = import_fs2.default.readdirSync(legacyDir, { withFileTypes: true });
         for (const entry of entries) {
           if (!entry.isFile()) continue;
-          const srcPath = import_path.default.join(legacyDir, entry.name);
-          const dstPath = import_path.default.join(targetDir, entry.name);
-          if (!import_fs.default.existsSync(dstPath)) {
-            import_fs.default.copyFileSync(srcPath, dstPath);
+          const srcPath = import_path2.default.join(legacyDir, entry.name);
+          const dstPath = import_path2.default.join(targetDir, entry.name);
+          if (!import_fs2.default.existsSync(dstPath)) {
+            import_fs2.default.copyFileSync(srcPath, dstPath);
           }
           try {
-            import_fs.default.unlinkSync(srcPath);
+            import_fs2.default.unlinkSync(srcPath);
           } catch {
           }
         }
@@ -1021,6 +1501,10 @@ async function initializeDatabase() {
   dbInitializingPromise = (async () => {
     try {
       validateProductionSecurityConfig(process.env);
+      const dbValidation = validateProductionDatabaseConfig(process.env);
+      if (!dbValidation.valid && isProductionMode(process.env) && process.env.VITEST !== "true") {
+        throw new Error(`DB_CONFIG_ERROR: ${dbValidation.message}`);
+      }
       await ensureLocalMariaDbRunningIfNeeded();
       migrateLegacyPublicMediaToPrivate();
       const cfg = getDbConfig();
@@ -1042,8 +1526,8 @@ async function initializeDatabase() {
         }
       }
       const p = getPool();
-      const schemaPath = import_path.default.resolve(process.cwd(), "database/schema.sql");
-      const schemaSql = import_fs.default.readFileSync(schemaPath, "utf8");
+      const schemaPath = import_path2.default.resolve(process.cwd(), "database/schema.sql");
+      const schemaSql = import_fs2.default.readFileSync(schemaPath, "utf8");
       const cleanedSql = schemaSql.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n");
       const statements = cleanedSql.split(/;\s*(?:\n|$)/).map((s) => s.trim()).filter((s) => s.length > 0);
       for (const stmt of statements) {
@@ -1055,9 +1539,10 @@ async function initializeDatabase() {
       );
       const hasManager = existingUsers.some((u) => u.role === "manager");
       const hasWorker = existingUsers.some((u) => u.role === "worker");
-      const isProd = process.env.NODE_ENV === "production";
-      const rawMgrPass = (process.env.INITIAL_MANAGER_PASSWORD || "").trim();
-      const managerUsername = (process.env.INITIAL_MANAGER_USERNAME || "manager").trim();
+      const appCfg = getAppConfig();
+      const isProd = appCfg.isProduction;
+      const rawMgrPass = appCfg.initialManagerPassword;
+      const managerUsername = appCfg.initialManagerUsername;
       const managerPassword = !rawMgrPass || !isProd && rawMgrPass === "CHANGE_ME_MANAGER_PASSWORD" ? isProd ? "" : "Mgammon@1405" : rawMgrPass;
       if (!hasManager) {
         if (isProd && (!managerPassword || FORBIDDEN_DEFAULT_PASSWORDS.has(managerPassword) || managerPassword.length < 8)) {
@@ -1075,8 +1560,8 @@ async function initializeDatabase() {
           "UPDATE users SET full_name = '\u0645\u062C\u06CC\u062F \u0646\u0648\u0631\u0627\u06CC\u06CC' WHERE role = 'manager' AND (full_name IS NULL OR full_name = '')"
         );
       }
-      const rawWrkPass = (process.env.INITIAL_WORKER_PASSWORD || "").trim();
-      const workerUsername = (process.env.INITIAL_WORKER_USERNAME || "worker").trim();
+      const rawWrkPass = appCfg.initialWorkerPassword;
+      const workerUsername = appCfg.initialWorkerUsername;
       const workerPassword = !rawWrkPass || !isProd && rawWrkPass === "CHANGE_ME_WORKER_PASSWORD" ? isProd ? "" : "Worker@1405" : rawWrkPass;
       if (!hasWorker) {
         if (isProd && (!workerPassword || FORBIDDEN_DEFAULT_PASSWORDS.has(workerPassword) || workerPassword.length < 8)) {
@@ -1139,7 +1624,7 @@ async function initializeDatabase() {
             "PAID_AS_WORK",
             "ALL_OVERTIME",
             JSON.stringify([]),
-            process.env.APP_TIMEZONE || "Asia/Tehran",
+            appCfg.appTimezone,
             "1405/06/15"
           ]
         );
@@ -1207,7 +1692,7 @@ async function getSystemSettingsSnapshotsFromDb() {
   const current = await getSystemSettingsFromDb();
   try {
     const [rows] = await p.execute(
-      `SELECT id, effective_from_shamsi, settings_json, changed_by_user_id, change_reason, created_at
+      `SELECT id, effective_from_shamsi, settings_json, created_by_user_id, created_at
        FROM system_settings_snapshots
        ORDER BY effective_from_shamsi ASC, id ASC`
     );
@@ -1226,8 +1711,8 @@ async function getSystemSettingsSnapshotsFromDb() {
           ...parsed,
           banner_bg_url: current.banner_bg_url
         },
-        changed_by_user_id: r.changed_by_user_id != null ? Number(r.changed_by_user_id) : null,
-        change_reason: r.change_reason ? String(r.change_reason) : null,
+        changed_by_user_id: r.created_by_user_id != null ? Number(r.created_by_user_id) : null,
+        change_reason: null,
         created_at: r.created_at ? new Date(r.created_at).toISOString() : void 0
       };
     });
@@ -1290,33 +1775,20 @@ function mapRowToSystemSettings(row) {
 }
 
 // src/server/auth.ts
-var import_crypto2 = __toESM(require("crypto"), 1);
+var import_crypto3 = __toESM(require("crypto"), 1);
 var SESSION_COOKIE_NAME = "mgammon_duo_sid";
 var CSRF_COOKIE_NAME = "mgammon_csrf_token";
 var SESSION_DURATION_MS = 1e3 * 60 * 60 * 24 * 7;
-function getSessionSecret(env = process.env) {
-  validateProductionSecurityConfig(env);
-  const raw = (env.SESSION_SECRET || "").trim();
-  if (raw && raw !== "undefined" && !FORBIDDEN_DEFAULT_SECRETS.has(raw) && raw.length >= 32) {
-    return raw;
-  }
-  if (env.NODE_ENV === "production") {
-    throw new Error(
-      "SECURITY_CONFIG_ERROR: SESSION_SECRET \u062F\u0631 \u0645\u062D\u06CC\u0637 \u0639\u0645\u0644\u06CC\u0627\u062A\u06CC \u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647 \u06CC\u0627 \u0646\u0627\u0627\u0645\u0646 \u0627\u0633\u062A."
-    );
-  }
-  return "mgammon-duo-dev-only-ephemeral-secret-key-2026-local";
-}
 function hashSessionToken(rawToken) {
   const secret = getSessionSecret();
-  return import_crypto2.default.createHmac("sha256", secret).update(rawToken).digest("hex");
+  return import_crypto3.default.createHmac("sha256", secret).update(rawToken).digest("hex");
 }
 function generateCsrfToken(rawSessionToken) {
   const secret = getSessionSecret();
-  return import_crypto2.default.createHmac("sha256", `${secret}:csrf-protection`).update(rawSessionToken).digest("hex");
+  return import_crypto3.default.createHmac("sha256", `${secret}:csrf-protection`).update(rawSessionToken).digest("hex");
 }
 async function createServerSession(userId, ipAddress, userAgent) {
-  const rawToken = import_crypto2.default.randomBytes(32).toString("hex");
+  const rawToken = import_crypto3.default.randomBytes(32).toString("hex");
   const tokenHash = hashSessionToken(rawToken);
   const csrfToken = generateCsrfToken(rawToken);
   const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
@@ -1333,8 +1805,22 @@ async function createServerSession(userId, ipAddress, userAgent) {
   );
   return { rawToken, csrfToken, expiresAt };
 }
+function safeEqualStrings(a, b) {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return import_crypto3.default.timingSafeEqual(bufA, bufB);
+}
+function isRequestHttps(res) {
+  const cfg = getAppConfig();
+  const req = res.req;
+  const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  return Boolean(
+    cfg.isProduction || cfg.appUrl?.startsWith("https://") || req?.secure || forwardedProto === "https"
+  );
+}
 function setSessionCookie(res, rawToken, expiresAt) {
-  const isSecure = process.env.NODE_ENV === "production" || Boolean(process.env.APP_URL?.startsWith("https://"));
+  const isSecure = isRequestHttps(res);
   const csrfToken = generateCsrfToken(rawToken);
   res.cookie(SESSION_COOKIE_NAME, rawToken, {
     httpOnly: true,
@@ -1354,7 +1840,7 @@ function setSessionCookie(res, rawToken, expiresAt) {
   return csrfToken;
 }
 function clearSessionCookie(res) {
-  const isSecure = process.env.NODE_ENV === "production" || Boolean(process.env.APP_URL?.startsWith("https://"));
+  const isSecure = isRequestHttps(res);
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     secure: isSecure,
@@ -1367,6 +1853,38 @@ function clearSessionCookie(res) {
     sameSite: "lax",
     path: "/"
   });
+}
+function createApiRateLimiter(options) {
+  const hits = /* @__PURE__ */ new Map();
+  const windowMs = Math.max(1e3, options.windowMs);
+  const maxRequests = Math.max(1, options.maxRequests);
+  return (req, res, next) => {
+    const now = Date.now();
+    const ip = String(req.ip || req.socket?.remoteAddress || "unknown");
+    const existing = hits.get(ip);
+    if (!existing || now > existing.resetAt) {
+      if (hits.size > 5e3) {
+        for (const [k, v] of hits.entries()) {
+          if (now > v.resetAt) hits.delete(k);
+        }
+      }
+      hits.set(ip, { count: 1, resetAt: now + windowMs });
+      next();
+      return;
+    }
+    existing.count += 1;
+    if (existing.count > maxRequests) {
+      const retryAfterSec = Math.max(1, Math.ceil((existing.resetAt - now) / 1e3));
+      res.setHeader("Retry-After", String(retryAfterSec));
+      res.status(429).json({
+        ok: false,
+        code: "RATE_LIMITED",
+        message: options.message || "\u062A\u0639\u062F\u0627\u062F \u062F\u0631\u062E\u0648\u0627\u0633\u062A\u200C\u0647\u0627\u06CC \u0634\u0645\u0627 \u0628\u06CC\u0634 \u0627\u0632 \u062D\u062F \u0645\u062C\u0627\u0632 \u0627\u0633\u062A. \u0644\u0637\u0641\u0627\u064B \u0686\u0646\u062F \u0644\u062D\u0638\u0647 \u0628\u0639\u062F \u0645\u062C\u062F\u062F\u0627\u064B \u062A\u0644\u0627\u0634 \u06A9\u0646\u06CC\u062F."
+      });
+      return;
+    }
+    next();
+  };
 }
 var loginAttemptsMap = /* @__PURE__ */ new Map();
 var MAX_FAILED_LOGIN_ATTEMPTS = 5;
@@ -1437,9 +1955,10 @@ function requireCsrfProtection(req, res, next) {
       const originUrl = new URL(String(originHeader));
       const allowedHost = String(hostHeader).split(",")[0].trim();
       let appUrlHost = "";
-      if (process.env.APP_URL) {
+      const cfgUrl = getAppConfig().appUrl;
+      if (cfgUrl) {
         try {
-          appUrlHost = new URL(process.env.APP_URL).host;
+          appUrlHost = new URL(cfgUrl).host;
         } catch {
           appUrlHost = "";
         }
@@ -1467,7 +1986,7 @@ function requireCsrfProtection(req, res, next) {
   if (cookieToken && !hasBearerHeader && !publicAuthPaths.includes(req.path)) {
     const clientCsrf = String(req.headers["x-csrf-token"] || "").trim();
     const expectedCsrf = generateCsrfToken(String(cookieToken));
-    if (!clientCsrf || clientCsrf.length !== expectedCsrf.length || !import_crypto2.default.timingSafeEqual(Buffer.from(clientCsrf), Buffer.from(expectedCsrf))) {
+    if (!clientCsrf || clientCsrf.length !== expectedCsrf.length || !import_crypto3.default.timingSafeEqual(Buffer.from(clientCsrf), Buffer.from(expectedCsrf))) {
       res.status(403).json({
         ok: false,
         code: "CSRF_TOKEN_INVALID",
@@ -1481,10 +2000,9 @@ function requireCsrfProtection(req, res, next) {
 async function getSessionUser(req) {
   const bearerToken = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7).trim() : null;
   const cookieToken = req.cookies?.[SESSION_COOKIE_NAME] ? String(req.cookies[SESSION_COOKIE_NAME]).trim() : null;
-  const queryToken = req.method === "GET" && typeof req.query?.token === "string" ? req.query.token.trim() : null;
   const candidateTokens = Array.from(
     new Set(
-      [bearerToken, cookieToken, queryToken].filter(
+      [bearerToken, cookieToken].filter(
         (t) => Boolean(t && typeof t === "string" && t.length >= 32)
       )
     )
@@ -1546,7 +2064,7 @@ async function requireAuth(req, res, next) {
       });
       return;
     }
-    const enforceInitialPassChange = process.env.ENFORCE_PASSWORD_CHANGE === "true" || req.headers["x-enforce-password-change"] === "1";
+    const enforceInitialPassChange = getAppConfig().enforcePasswordChange || req.headers["x-enforce-password-change"] === "1";
     const allowedDuringPassChange = ["/auth/change-password", "/auth/logout", "/auth/me"];
     if (enforceInitialPassChange && session.user.must_change_password && !allowedDuringPassChange.includes(req.path)) {
       res.status(403).json({
@@ -1654,15 +2172,15 @@ function handleServerError(res, err) {
 // src/server/routes.ts
 var import_express = require("express");
 var import_bcryptjs2 = __toESM(require("bcryptjs"), 1);
-var import_crypto4 = __toESM(require("crypto"), 1);
-var import_fs3 = __toESM(require("fs"), 1);
-var import_path3 = __toESM(require("path"), 1);
+var import_crypto5 = __toESM(require("crypto"), 1);
+var import_fs4 = __toESM(require("fs"), 1);
+var import_path4 = __toESM(require("path"), 1);
 var XLSX = __toESM(require("xlsx"), 1);
 
 // src/server/backup.ts
-var import_crypto3 = __toESM(require("crypto"), 1);
-var import_fs2 = __toESM(require("fs"), 1);
-var import_path2 = __toESM(require("path"), 1);
+var import_crypto4 = __toESM(require("crypto"), 1);
+var import_fs3 = __toESM(require("fs"), 1);
+var import_path3 = __toESM(require("path"), 1);
 var BACKUP_TABLES_ORDERED = [
   "schema_migrations",
   "users",
@@ -1676,8 +2194,10 @@ var BACKUP_TABLES_ORDERED = [
   "work_correspondences",
   "leave_requests",
   "work_tasks",
+  "user_reminders",
   "audit_logs"
 ];
+var OPTIONAL_LEGACY_BACKUP_TABLES = /* @__PURE__ */ new Set(["user_reminders"]);
 var PRIVATE_MEDIA_SUBFOLDERS = [
   "avatars",
   "attachments",
@@ -1687,7 +2207,7 @@ var PRIVATE_MEDIA_SUBFOLDERS = [
   "reports"
 ];
 function computeSha256(content) {
-  return import_crypto3.default.createHash("sha256").update(content).digest("hex");
+  return import_crypto4.default.createHash("sha256").update(content).digest("hex");
 }
 function escapeSqlValue(val) {
   if (val === null || val === void 0) return "NULL";
@@ -1751,9 +2271,10 @@ async function collectDatabaseMetrics(customPool) {
 async function createFullBackup(options) {
   const p = options?.customPool || getPool();
   const cfg = getDbConfig();
-  const backupDir = options?.backupDir || process.env.BACKUP_DIR || import_path2.default.resolve(process.cwd(), ".data/backups");
-  const privateMediaDir = options?.privateMediaDir || import_path2.default.resolve(process.cwd(), ".data/private_media");
-  import_fs2.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
+  const appCfg = getAppConfig();
+  const backupDir = options?.backupDir || appCfg.backupDir;
+  const privateMediaDir = options?.privateMediaDir || appCfg.privateMediaDir;
+  import_fs3.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
   const metrics = await collectDatabaseMetrics(p);
   if ((metrics.tableCounts.users || 0) === 0 || (metrics.tableCounts.system_settings || 0) === 0) {
     throw new Error(
@@ -1791,15 +2312,15 @@ async function createFullBackup(options) {
   const sqlDump = sqlLines.join("\n");
   const mediaFiles = [];
   let mediaTotalBytes = 0;
-  if (import_fs2.default.existsSync(privateMediaDir)) {
+  if (import_fs3.default.existsSync(privateMediaDir)) {
     for (const folder of PRIVATE_MEDIA_SUBFOLDERS) {
-      const folderPath = import_path2.default.join(privateMediaDir, folder);
-      if (!import_fs2.default.existsSync(folderPath)) continue;
-      const entries = import_fs2.default.readdirSync(folderPath, { withFileTypes: true });
+      const folderPath = import_path3.default.join(privateMediaDir, folder);
+      if (!import_fs3.default.existsSync(folderPath)) continue;
+      const entries = import_fs3.default.readdirSync(folderPath, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isFile()) continue;
-        const fullPath = import_path2.default.join(folderPath, entry.name);
-        const buf = import_fs2.default.readFileSync(fullPath);
+        const fullPath = import_path3.default.join(folderPath, entry.name);
+        const buf = import_fs3.default.readFileSync(fullPath);
         if (buf.length === 0) continue;
         const sha256 = computeSha256(buf);
         mediaFiles.push({
@@ -1818,7 +2339,7 @@ async function createFullBackup(options) {
   const payloadChecksum = computeSha256(payloadString);
   const now = /* @__PURE__ */ new Date();
   const timestamp = now.toISOString().replace(/[:.]/g, "-");
-  const backupId = `mgbackup_${cfg.database}_${timestamp}_${import_crypto3.default.randomBytes(3).toString("hex")}`;
+  const backupId = `mgbackup_${cfg.database}_${timestamp}_${import_crypto4.default.randomBytes(3).toString("hex")}`;
   const manifest = {
     backupId,
     formatVersion: 1,
@@ -1836,28 +2357,28 @@ async function createFullBackup(options) {
     mediaFiles,
     sqlDump
   };
-  const backupFilePath = import_path2.default.join(backupDir, `${backupId}.mgbackup.json`);
+  const backupFilePath = import_path3.default.join(backupDir, `${backupId}.mgbackup.json`);
   const tmpFilePath = `${backupFilePath}.tmp`;
-  const sqlDumpFilePath = import_path2.default.join(backupDir, `${backupId}.sql`);
+  const sqlDumpFilePath = import_path3.default.join(backupDir, `${backupId}.sql`);
   const serializedArchive = JSON.stringify(archiveBundle, null, 2);
-  import_fs2.default.writeFileSync(tmpFilePath, serializedArchive, { mode: 384 });
+  import_fs3.default.writeFileSync(tmpFilePath, serializedArchive, { mode: 384 });
   const verification = verifyBackupArchive(tmpFilePath);
   if (!verification.valid) {
     try {
-      import_fs2.default.unlinkSync(tmpFilePath);
+      import_fs3.default.unlinkSync(tmpFilePath);
     } catch {
     }
     throw new Error(
       `BACKUP_VERIFICATION_FAILED: \u067E\u0634\u062A\u06CC\u0628\u0627\u0646\u200C\u06AF\u06CC\u0631\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062F (${verification.reason})`
     );
   }
-  import_fs2.default.renameSync(tmpFilePath, backupFilePath);
-  import_fs2.default.writeFileSync(sqlDumpFilePath, sqlDump, { mode: 384 });
+  import_fs3.default.renameSync(tmpFilePath, backupFilePath);
+  import_fs3.default.writeFileSync(sqlDumpFilePath, sqlDump, { mode: 384 });
   const maxRetained = options?.maxRetainedBackups ?? 30;
   if (maxRetained > 0) {
     pruneOldBackups(backupDir, maxRetained);
   }
-  const stat = import_fs2.default.statSync(backupFilePath);
+  const stat = import_fs3.default.statSync(backupFilePath);
   return {
     backupFilePath,
     sqlDumpFilePath,
@@ -1867,14 +2388,14 @@ async function createFullBackup(options) {
 }
 function verifyBackupArchive(backupFilePath) {
   try {
-    if (!import_fs2.default.existsSync(backupFilePath)) {
+    if (!import_fs3.default.existsSync(backupFilePath)) {
       return { valid: false, reason: "\u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." };
     }
-    const stat = import_fs2.default.statSync(backupFilePath);
+    const stat = import_fs3.default.statSync(backupFilePath);
     if (!stat.isFile() || stat.size < 128) {
       return { valid: false, reason: "\u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u062E\u0627\u0644\u06CC \u06CC\u0627 \u0646\u0627\u0642\u0635 \u0627\u0633\u062A." };
     }
-    const rawText = import_fs2.default.readFileSync(backupFilePath, "utf8");
+    const rawText = import_fs3.default.readFileSync(backupFilePath, "utf8");
     if (!rawText || !rawText.trim().startsWith("{") || !rawText.trim().endsWith("}")) {
       return { valid: false, reason: "\u0645\u062D\u062A\u0648\u0627\u06CC \u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u0646\u0627\u0642\u0635 \u06CC\u0627 \u0628\u0631\u06CC\u062F\u0647\u200C\u0634\u062F\u0647 (Truncated) \u0627\u0633\u062A." };
     }
@@ -1888,6 +2409,9 @@ function verifyBackupArchive(backupFilePath) {
     }
     for (const tbl of BACKUP_TABLES_ORDERED) {
       if (!Array.isArray(tables[tbl])) {
+        if (OPTIONAL_LEGACY_BACKUP_TABLES.has(tbl) && manifest.tableCounts[tbl] === void 0) {
+          continue;
+        }
         return { valid: false, reason: `\u062C\u062F\u0648\u0644 \u0627\u062C\u0628\u0627\u0631\u06CC ${tbl} \u062F\u0631 \u0646\u0633\u062E\u0647 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u0648\u062C\u0648\u062F \u0646\u062F\u0627\u0631\u062F.` };
       }
       if (tables[tbl].length !== manifest.tableCounts[tbl]) {
@@ -1944,14 +2468,14 @@ function verifyBackupArchive(backupFilePath) {
   }
 }
 function listAvailableBackups(customBackupDir) {
-  const backupDir = customBackupDir || process.env.BACKUP_DIR || import_path2.default.resolve(process.cwd(), ".data/backups");
-  if (!import_fs2.default.existsSync(backupDir)) {
+  const backupDir = customBackupDir || getAppConfig().backupDir;
+  if (!import_fs3.default.existsSync(backupDir)) {
     return [];
   }
-  const entries = import_fs2.default.readdirSync(backupDir, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith(".mgbackup.json")).sort((a, b) => b.name.localeCompare(a.name));
+  const entries = import_fs3.default.readdirSync(backupDir, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith(".mgbackup.json")).sort((a, b) => b.name.localeCompare(a.name));
   return entries.map((e) => {
-    const fullPath = import_path2.default.join(backupDir, e.name);
-    const stat = import_fs2.default.statSync(fullPath);
+    const fullPath = import_path3.default.join(backupDir, e.name);
+    const stat = import_fs3.default.statSync(fullPath);
     const check = verifyBackupArchive(fullPath);
     return {
       fileName: e.name,
@@ -1965,15 +2489,15 @@ function listAvailableBackups(customBackupDir) {
 }
 function pruneOldBackups(backupDir, maxRetained) {
   try {
-    const files = import_fs2.default.readdirSync(backupDir).filter((f) => f.endsWith(".mgbackup.json")).sort((a, b) => b.localeCompare(a));
+    const files = import_fs3.default.readdirSync(backupDir).filter((f) => f.endsWith(".mgbackup.json")).sort((a, b) => b.localeCompare(a));
     if (files.length <= maxRetained) return;
     const toRemove = files.slice(maxRetained);
     for (const f of toRemove) {
-      const fullJson = import_path2.default.join(backupDir, f);
+      const fullJson = import_path3.default.join(backupDir, f);
       const fullSql = fullJson.replace(/\.mgbackup\.json$/, ".sql");
       try {
-        if (import_fs2.default.existsSync(fullJson)) import_fs2.default.unlinkSync(fullJson);
-        if (import_fs2.default.existsSync(fullSql)) import_fs2.default.unlinkSync(fullSql);
+        if (import_fs3.default.existsSync(fullJson)) import_fs3.default.unlinkSync(fullJson);
+        if (import_fs3.default.existsSync(fullSql)) import_fs3.default.unlinkSync(fullSql);
       } catch {
       }
     }
@@ -3252,7 +3776,7 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
     xls: ".xls",
     audio: ".webm"
   };
-  let ext = import_path3.default.extname(rawName).toLowerCase();
+  let ext = import_path4.default.extname(rawName).toLowerCase();
   if (!ext || !sigToExts[detectedSig]?.includes(ext)) {
     if (defaultExtForSig[detectedSig]) {
       ext = defaultExtForSig[detectedSig];
@@ -3272,20 +3796,20 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
   if (!sigToExts[detectedSig]?.includes(ext)) {
     throw new ValidationError(400, "\u0645\u062D\u062A\u0648\u0627\u06CC \u0628\u0627\u06CC\u0646\u0631\u06CC \u0648\u0627\u0642\u0639\u06CC \u0641\u0627\u06CC\u0644 \u0628\u0627 \u067E\u0633\u0648\u0646\u062F \u0627\u0639\u0644\u0627\u0645\u200C\u0634\u062F\u0647 \u0645\u0637\u0627\u0628\u0642\u062A \u0646\u062F\u0627\u0631\u062F.");
   }
-  const safeBase = import_path3.default.basename(rawName, import_path3.default.extname(rawName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, "_").slice(0, 40) || "file";
-  const fileName = `${Date.now()}_${import_crypto4.default.randomBytes(4).toString("hex")}_${safeBase}${ext}`;
-  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR ? import_path3.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path3.default.resolve(process.cwd(), ".data/private_media");
-  const targetDir = import_path3.default.resolve(baseMediaDir, subFolder);
-  import_fs3.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
-  const fullPath = import_path3.default.join(targetDir, fileName);
-  import_fs3.default.writeFileSync(fullPath, buffer, { mode: 384 });
+  const safeBase = import_path4.default.basename(rawName, import_path4.default.extname(rawName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, "_").slice(0, 40) || "file";
+  const fileName = `${Date.now()}_${import_crypto5.default.randomBytes(4).toString("hex")}_${safeBase}${ext}`;
+  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(process.cwd(), ".data/private_media");
+  const targetDir = import_path4.default.resolve(baseMediaDir, subFolder);
+  import_fs4.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
+  const fullPath = import_path4.default.join(targetDir, fileName);
+  import_fs4.default.writeFileSync(fullPath, buffer, { mode: 384 });
   return {
     publicUrl: `/assets/media/${subFolder}/${fileName}`,
     sizeBytes: buffer.length
   };
 }
 function getBaseMediaDirPath() {
-  return process.env.PRIVATE_MEDIA_DIR ? import_path3.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path3.default.resolve(process.cwd(), ".data/private_media");
+  return process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(process.cwd(), ".data/private_media");
 }
 function resolveMediaDiskPath(fileUrl) {
   if (typeof fileUrl !== "string") return null;
@@ -3297,19 +3821,19 @@ function resolveMediaDiskPath(fileUrl) {
   const [subFolder, fileName] = parts;
   const allowedFolders = ["avatars", "attachments", "excel", "audio", "receipts", "reports"];
   if (!allowedFolders.includes(subFolder)) return null;
-  const safeFileName = import_path3.default.basename(fileName);
+  const safeFileName = import_path4.default.basename(fileName);
   if (!safeFileName || safeFileName !== fileName || safeFileName.includes("..")) return null;
   const baseDir = getBaseMediaDirPath();
-  const fullPath = import_path3.default.resolve(baseDir, subFolder, safeFileName);
-  if (!fullPath.startsWith(baseDir + import_path3.default.sep)) return null;
+  const fullPath = import_path4.default.resolve(baseDir, subFolder, safeFileName);
+  if (!fullPath.startsWith(baseDir + import_path4.default.sep)) return null;
   return fullPath;
 }
 function getMediaFileInfoOnDisk(fileUrl) {
   const fullPath = resolveMediaDiskPath(fileUrl);
   if (!fullPath) return { exists: false, sizeBytes: 0, mtimeIso: null };
   try {
-    if (!import_fs3.default.existsSync(fullPath)) return { exists: false, sizeBytes: 0, mtimeIso: null };
-    const stat = import_fs3.default.statSync(fullPath);
+    if (!import_fs4.default.existsSync(fullPath)) return { exists: false, sizeBytes: 0, mtimeIso: null };
+    const stat = import_fs4.default.statSync(fullPath);
     if (!stat.isFile()) return { exists: false, sizeBytes: 0, mtimeIso: null };
     return {
       exists: true,
@@ -3324,11 +3848,11 @@ function unlinkMediaUrlFromDisk(fileUrl) {
   const fullPath = resolveMediaDiskPath(fileUrl);
   if (!fullPath) return 0;
   try {
-    if (!import_fs3.default.existsSync(fullPath)) return 0;
-    const stat = import_fs3.default.statSync(fullPath);
+    if (!import_fs4.default.existsSync(fullPath)) return 0;
+    const stat = import_fs4.default.statSync(fullPath);
     if (!stat.isFile()) return 0;
     const size = stat.size;
-    import_fs3.default.unlinkSync(fullPath);
+    import_fs4.default.unlinkSync(fullPath);
     return size;
   } catch {
     return 0;
@@ -3684,7 +4208,7 @@ apiRouter.post("/auth/login", async (req, res) => {
       });
       return;
     }
-    if (process.env.NODE_ENV === "production" && FORBIDDEN_DEFAULT_PASSWORDS.has(password)) {
+    if (getAppConfig().isProduction && FORBIDDEN_DEFAULT_PASSWORDS.has(password)) {
       await recordFailedLoginAttempt(clientIp, username);
       res.status(403).json({
         ok: false,
@@ -3761,11 +4285,15 @@ apiRouter.post("/auth/login", async (req, res) => {
       ipAddress: req.ip || null
     });
     const mustChangePassword = Boolean(userRow.must_change_password) || FORBIDDEN_DEFAULT_PASSWORDS.has(password);
+    const passwordChangeRequired = Boolean(
+      (getAppConfig().enforcePasswordChange || req.headers["x-enforce-password-change"] === "1") && mustChangePassword
+    );
     res.json({
       ok: true,
       token: rawToken,
       csrfToken,
       requirePasswordChange: mustChangePassword,
+      passwordChangeRequired,
       user: {
         id: Number(userRow.id),
         username: String(userRow.username),
@@ -3790,7 +4318,7 @@ apiRouter.post("/auth/biometric/register", requireAuth, async (req, res) => {
       res.status(400).json({ ok: false, message: "\u0634\u0646\u0627\u0633\u0647 \u0628\u06CC\u0648\u0645\u062A\u0631\u06CC\u06A9 \u062F\u0633\u062A\u06AF\u0627\u0647 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
       return;
     }
-    const rawBioToken = import_crypto4.default.randomBytes(32).toString("hex");
+    const rawBioToken = import_crypto5.default.randomBytes(32).toString("hex");
     const bioTokenHash = hashSessionToken(rawBioToken);
     const pool2 = getPool();
     await pool2.execute(
@@ -3856,7 +4384,7 @@ apiRouter.post("/auth/biometric/login", async (req, res) => {
     }
     const userRow = rows[0];
     const expectedHash = hashSessionToken(biometricToken);
-    if (!userRow.biometric_token_hash || String(userRow.biometric_credential_id) !== credentialId || String(userRow.biometric_token_hash) !== expectedHash) {
+    if (!userRow.biometric_token_hash || !safeEqualStrings(String(userRow.biometric_credential_id || ""), credentialId) || !safeEqualStrings(String(userRow.biometric_token_hash), expectedHash)) {
       await recordFailedLoginAttempt(clientIp, username);
       res.status(401).json({
         ok: false,
@@ -3872,10 +4400,15 @@ apiRouter.post("/auth/biometric/login", async (req, res) => {
       req.headers["user-agent"] || null
     );
     setSessionCookie(res, rawToken, expiresAt);
+    const mustChangePassword = Boolean(userRow.must_change_password);
+    const passwordChangeRequired = Boolean(
+      (getAppConfig().enforcePasswordChange || req.headers["x-enforce-password-change"] === "1") && mustChangePassword
+    );
     res.json({
       ok: true,
       token: rawToken,
       csrfToken,
+      passwordChangeRequired,
       user: {
         id: Number(userRow.id),
         username: String(userRow.username),
@@ -3885,7 +4418,7 @@ apiRouter.post("/auth/biometric/login", async (req, res) => {
         collaboration_start_shamsi: userRow.collaboration_start_shamsi ? String(userRow.collaboration_start_shamsi) : "1405/06/15",
         phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
         biometric_enabled: true,
-        must_change_password: Boolean(userRow.must_change_password),
+        must_change_password: mustChangePassword,
         last_login_at: (/* @__PURE__ */ new Date()).toISOString()
       }
     });
@@ -3911,10 +4444,14 @@ apiRouter.get("/auth/me", requireAuth, async (req, res) => {
     const settings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(settings.timezone);
     const csrfToken = req.rawSessionToken ? generateCsrfToken(req.rawSessionToken) : void 0;
+    const passwordChangeRequired = Boolean(
+      (getAppConfig().enforcePasswordChange || req.headers["x-enforce-password-change"] === "1") && req.user?.must_change_password
+    );
     res.json({
       ok: true,
       user: req.user,
       csrfToken,
+      passwordChangeRequired,
       serverTime: nowInfo,
       settings: sanitizeSettingsForRole(settings, req.user.role)
     });
@@ -3927,6 +4464,17 @@ apiRouter.post("/auth/verify-unlock", requireAuth, async (req, res) => {
     const password = String(req.body?.password || "");
     if (!password) {
       res.status(400).json({ ok: false, message: "\u0644\u0637\u0641\u0627\u064B \u0631\u0645\u0632 \u0631\u0627 \u0648\u0627\u0631\u062F \u0646\u0645\u0627\u06CC\u06CC\u062F." });
+      return;
+    }
+    const clientIp = req.ip || "unknown";
+    const rateKey = `unlock:${req.user.username}`;
+    const rateCheck = checkLoginRateLimit(clientIp, rateKey);
+    if (!rateCheck.allowed) {
+      res.status(429).json({
+        ok: false,
+        code: "TOO_MANY_ATTEMPTS",
+        message: `\u062A\u0639\u062F\u0627\u062F \u062A\u0644\u0627\u0634\u200C\u0647\u0627\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0627\u0632\u06AF\u0634\u0627\u06CC\u06CC \u0642\u0641\u0644 \u0628\u06CC\u0634 \u0627\u0632 \u062D\u062F \u0645\u062C\u0627\u0632 \u0627\u0633\u062A. \u0644\u0637\u0641\u0627\u064B ${rateCheck.retryAfterSeconds} \u062B\u0627\u0646\u06CC\u0647 \u0628\u0639\u062F \u062A\u0644\u0627\u0634 \u06A9\u0646\u06CC\u062F.`
+      });
       return;
     }
     const pool2 = getPool();
@@ -3947,9 +4495,19 @@ apiRouter.post("/auth/verify-unlock", requireAuth, async (req, res) => {
       }
     }
     if (!match) {
+      const attemptInfo = await recordFailedLoginAttempt(clientIp, rateKey);
+      if (attemptInfo.locked) {
+        res.status(429).json({
+          ok: false,
+          code: "TOO_MANY_ATTEMPTS",
+          message: "\u062A\u0639\u062F\u0627\u062F \u062A\u0644\u0627\u0634\u200C\u0647\u0627\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0627\u0632\u06AF\u0634\u0627\u06CC\u06CC \u0642\u0641\u0644 \u0628\u06CC\u0634 \u0627\u0632 \u062D\u062F \u0645\u062C\u0627\u0632 \u0628\u0648\u062F. \u0644\u0637\u0641\u0627\u064B \u0686\u0646\u062F \u062F\u0642\u06CC\u0642\u0647 \u0628\u0639\u062F \u0645\u062C\u062F\u062F\u0627\u064B \u062A\u0644\u0627\u0634 \u06A9\u0646\u06CC\u062F."
+        });
+        return;
+      }
       res.status(401).json({ ok: false, message: "\u0631\u0645\u0632 \u0648\u0627\u0631\u062F\u0634\u062F\u0647 \u0635\u062D\u06CC\u062D \u0646\u06CC\u0633\u062A." });
       return;
     }
+    clearLoginAttempts(clientIp, rateKey);
     res.json({ ok: true, unlocked: true });
   } catch (err) {
     handleServerError(res, err);
@@ -4029,7 +4587,7 @@ apiRouter.post("/auth/change-password", requireAuth, async (req, res) => {
     }
     const newHash = await import_bcryptjs2.default.hash(newPassword, 10);
     await pool2.execute(
-      "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+      "UPDATE users SET password_hash = ?, must_change_password = 0, biometric_credential_id = NULL, biometric_token_hash = NULL WHERE id = ?",
       [newHash, userId]
     );
     await pool2.execute("DELETE FROM user_sessions WHERE user_id = ?", [userId]);
@@ -4099,6 +4657,16 @@ apiRouter.put("/auth/phone", requireAuth, async (req, res) => {
 });
 apiRouter.post("/auth/forgot-password/request-otp", async (req, res) => {
   try {
+    const clientIp = req.ip || "unknown";
+    const ipRateCheck = checkLoginRateLimit(clientIp, "otp_request_ip");
+    if (!ipRateCheck.allowed) {
+      res.status(429).json({
+        ok: false,
+        code: "TOO_MANY_ATTEMPTS",
+        message: `\u062A\u0639\u062F\u0627\u062F \u062F\u0631\u062E\u0648\u0627\u0633\u062A\u200C\u0647\u0627\u06CC \u0627\u0631\u0633\u0627\u0644 \u06A9\u062F \u0628\u0627\u0632\u06CC\u0627\u0628\u06CC \u0628\u06CC\u0634 \u0627\u0632 \u062D\u062F \u0645\u062C\u0627\u0632 \u0627\u0633\u062A. \u0644\u0637\u0641\u0627\u064B ${ipRateCheck.retryAfterSeconds} \u062B\u0627\u0646\u06CC\u0647 \u0628\u0639\u062F \u062A\u0644\u0627\u0634 \u06A9\u0646\u06CC\u062F.`
+      });
+      return;
+    }
     const username = toEnglishDigits(String(req.body?.username || "")).trim().toLowerCase();
     if (!username) {
       res.status(400).json({
@@ -4107,6 +4675,7 @@ apiRouter.post("/auth/forgot-password/request-otp", async (req, res) => {
       });
       return;
     }
+    await recordFailedLoginAttempt(clientIp, "otp_request_ip");
     const pool2 = getPool();
     const [rows] = await pool2.execute(
       "SELECT id, username, full_name, role, phone_number, is_active FROM users WHERE LOWER(username) = ? LIMIT 1",
@@ -4154,7 +4723,7 @@ apiRouter.post("/auth/forgot-password/request-otp", async (req, res) => {
       });
       return;
     }
-    const otpCode = String(import_crypto4.default.randomInt(1e5, 999999));
+    const otpCode = String(import_crypto5.default.randomInt(1e5, 999999));
     const smsText = `\u0633\u0627\u0645\u0627\u0646\u0647 Mgammon
 \u06A9\u062F \u0628\u0627\u0632\u06CC\u0627\u0628\u06CC \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u062D\u0633\u0627\u0628 ${userRow.full_name}: ${otpCode}
 \u0627\u0639\u062A\u0628\u0627\u0631: \u06F2 \u062F\u0642\u06CC\u0642\u0647`;
@@ -4208,6 +4777,13 @@ apiRouter.post("/auth/forgot-password/reset", async (req, res) => {
       });
       return;
     }
+    if (FORBIDDEN_DEFAULT_PASSWORDS.has(newPassword)) {
+      res.status(400).json({
+        ok: false,
+        message: "\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u062C\u062F\u06CC\u062F \u0646\u0628\u0627\u06CC\u062F \u0627\u0632 \u0631\u0645\u0632\u0647\u0627\u06CC \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u0648 \u0646\u0627\u0627\u0645\u0646 \u0628\u0627\u0634\u062F."
+      });
+      return;
+    }
     const pool2 = getPool();
     const [rows] = await pool2.execute(
       "SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, is_active FROM users WHERE LOWER(username) = ? LIMIT 1",
@@ -4236,7 +4812,7 @@ apiRouter.post("/auth/forgot-password/reset", async (req, res) => {
       });
       return;
     }
-    if (hashSessionToken(otpCode) !== otpEntry.codeHash) {
+    if (!safeEqualStrings(hashSessionToken(otpCode), otpEntry.codeHash)) {
       otpEntry.attempts += 1;
       res.status(400).json({
         ok: false,
@@ -4248,11 +4824,12 @@ apiRouter.post("/auth/forgot-password/reset", async (req, res) => {
     const newHash = await import_bcryptjs2.default.hash(newPassword, 10);
     const userId = Number(userRow.id);
     await pool2.execute(
-      "UPDATE users SET password_hash = ?, must_change_password = 0, last_login_at = NOW() WHERE id = ?",
+      "UPDATE users SET password_hash = ?, must_change_password = 0, biometric_credential_id = NULL, biometric_token_hash = NULL, last_login_at = NOW() WHERE id = ?",
       [newHash, userId]
     );
     await pool2.execute("DELETE FROM user_sessions WHERE user_id = ?", [userId]);
     clearLoginAttempts(req.ip || "unknown", userKey);
+    clearLoginAttempts(req.ip || "unknown", "otp_request_ip");
     const { rawToken, csrfToken, expiresAt } = await createServerSession(
       userId,
       req.ip || null,
@@ -4279,7 +4856,7 @@ apiRouter.post("/auth/forgot-password/reset", async (req, res) => {
         avatar_url: userRow.avatar_url ? String(userRow.avatar_url) : null,
         collaboration_start_shamsi: userRow.collaboration_start_shamsi ? String(userRow.collaboration_start_shamsi) : "1405/06/15",
         phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
-        biometric_enabled: Boolean(userRow.biometric_token_hash),
+        biometric_enabled: false,
         must_change_password: false,
         last_login_at: (/* @__PURE__ */ new Date()).toISOString()
       }
@@ -4303,6 +4880,13 @@ apiRouter.post(
         });
         return;
       }
+      if (FORBIDDEN_DEFAULT_PASSWORDS.has(newPassword)) {
+        res.status(400).json({
+          ok: false,
+          message: "\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u062C\u062F\u06CC\u062F \u067E\u0631\u0633\u0646\u0644 \u0646\u0628\u0627\u06CC\u062F \u0627\u0632 \u0631\u0645\u0632\u0647\u0627\u06CC \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u0648 \u0646\u0627\u0627\u0645\u0646 \u0628\u0627\u0634\u062F."
+        });
+        return;
+      }
       const pool2 = getPool();
       const [workerRows] = await pool2.execute(
         "SELECT id, username, full_name, phone_number FROM users WHERE role = 'worker' LIMIT 1"
@@ -4315,7 +4899,7 @@ apiRouter.post(
       const workerId = Number(worker.id);
       const newHash = await import_bcryptjs2.default.hash(newPassword, 10);
       await pool2.execute(
-        "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+        "UPDATE users SET password_hash = ?, must_change_password = 1, biometric_credential_id = NULL, biometric_token_hash = NULL WHERE id = ?",
         [newHash, workerId]
       );
       await pool2.execute("DELETE FROM user_sessions WHERE user_id = ?", [workerId]);
@@ -4526,6 +5110,13 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
           totalConfirmedOvertimeMinutes += rowOtMins;
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+          if (row.late_status !== "ABSENCE") {
+            if (row.late_deduction_toman && row.late_deduction_toman > 0) {
+              totalLateAndAbsenceDeductionToman += Math.round(row.late_deduction_toman);
+            } else if (row.late_status === "CUSTOM") {
+              totalLateAndAbsenceDeductionToman += row.custom_deduction_toman && row.custom_deduction_toman > 0 ? Math.round(row.custom_deduction_toman) : 0;
+            }
+          }
           const isRowBulk = rowDaysCount !== 1 || rowNetMins > 600;
           const rowDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normShamsi));
           hourlyEarnedRegularWorkToman += row.late_status === "ABSENCE" ? 0 : rowNetMins > 0 ? calculateDayRegularPayToman({
@@ -4655,7 +5246,7 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
         totalEntitlementToman,
         accountBalanceToman
       },
-      bannerBgUrl: settings.banner_bg_url || "/assets/media/banner-bg.svg"
+      bannerBgUrl: settings.banner_bg_url || "/assets/media/banner-bg.webp"
     });
   } catch (err) {
     handleServerError(res, err);
@@ -4897,9 +5488,13 @@ apiRouter.post(
           return;
         }
         const isFirstWorkStart2 = startEventType2 === "WORK_START" && !existingLogs.some((l) => l.event_type === "WORK_START");
-        const isThursday2 = getDayOfWeekFromGregorian(workDate) === 5;
-        const isHoliday2 = getDayOfWeekFromGregorian(workDate) === 6 || effectiveSettings.official_holidays.includes(shamsiDate);
-        const isWorkingDay2 = !isHoliday2 && effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+        const dayOfWeek2 = getDayOfWeekFromGregorian(workDate);
+        const normShamsi2 = normalizeShamsiDate(shamsiDate);
+        const isThursday2 = dayOfWeek2 === 4;
+        const isHoliday2 = dayOfWeek2 === 5 || effectiveSettings.official_holidays.some(
+          (h) => (isValidShamsiDate(h) ? normalizeShamsiDate(h) : h) === normShamsi2
+        );
+        const isWorkingDay2 = !isHoliday2 && effectiveSettings.working_days.includes(dayOfWeek2);
         const shiftStartMin2 = parseTimeToMinutes(
           isThursday2 ? effectiveSettings.thursday_shift_start_time || effectiveSettings.shift_start_time || "07:00" : effectiveSettings.shift_start_time || "07:00"
         );
@@ -5095,9 +5690,13 @@ apiRouter.post(
         return;
       }
       const isFirstWorkStart = startEventType === "WORK_START" && !existingLogs.some((l) => l.event_type === "WORK_START");
-      const isThursday = getDayOfWeekFromGregorian(workDate) === 5;
-      const isHoliday = getDayOfWeekFromGregorian(workDate) === 6 || effectiveSettings.official_holidays.includes(shamsiDate);
-      const isWorkingDay = !isHoliday && effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+      const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+      const normShamsi = normalizeShamsiDate(shamsiDate);
+      const isThursday = dayOfWeek === 4;
+      const isHoliday = dayOfWeek === 5 || effectiveSettings.official_holidays.some(
+        (h) => (isValidShamsiDate(h) ? normalizeShamsiDate(h) : h) === normShamsi
+      );
+      const isWorkingDay = !isHoliday && effectiveSettings.working_days.includes(dayOfWeek);
       const shiftStartMin = parseTimeToMinutes(
         isThursday ? effectiveSettings.thursday_shift_start_time || effectiveSettings.shift_start_time || "07:00" : effectiveSettings.shift_start_time || "07:00"
       );
@@ -5513,7 +6112,8 @@ apiRouter.post("/historical-work/upload-excel", requireAuth, async (req, res) =>
       workbook = XLSX.read(buffer, {
         type: "buffer",
         cellFormula: false,
-        cellHTML: false
+        cellHTML: false,
+        sheetRows: 550
       });
     } catch {
       res.status(400).json({ ok: false, message: "\u0641\u0627\u06CC\u0644 \u0627\u06A9\u0633\u0644 \u062E\u0631\u0627\u0628 \u06CC\u0627 \u063A\u06CC\u0631\u0642\u0627\u0628\u0644 \u062E\u0648\u0627\u0646\u062F\u0646 \u0627\u0633\u062A." });
@@ -5525,7 +6125,14 @@ apiRouter.post("/historical-work/upload-excel", requireAuth, async (req, res) =>
       return;
     }
     const sheet = workbook.Sheets[firstSheetName];
-    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "" }).map((row) => {
+      const cleanRow = /* @__PURE__ */ Object.create(null);
+      for (const [k, v] of Object.entries(row)) {
+        if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+        cleanRow[k] = v;
+      }
+      return cleanRow;
+    });
     if (rawRows.length === 0) {
       res.status(400).json({ ok: false, message: "\u0641\u0627\u06CC\u0644 \u0627\u06A9\u0633\u0644 \u062E\u0627\u0644\u06CC \u0627\u0633\u062A \u0648 \u0647\u06CC\u0686 \u0631\u062F\u06CC\u0641 \u062F\u0627\u062F\u0647\u200C\u0627\u06CC \u0646\u062F\u0627\u0631\u062F." });
       return;
@@ -5640,10 +6247,11 @@ apiRouter.post("/historical-work/upload-excel", requireAuth, async (req, res) =>
       });
       return;
     }
+    const workerId = await resolveTargetWorkerId(pool2, req, res);
+    if (workerId === null) return;
     const savedFile = saveBase64MediaFile("excel", fileName, fileBase64);
     const shamsiDate = parsedRows[0]?.shamsi_date || nowInfo.shamsiDate;
     const workDate = shamsiToGregorian(shamsiDate);
-    const workerId = await getWorkerUserId(pool2);
     const isManager = req.user.role === "manager";
     const initialStatus = isManager ? "APPROVED" : "PENDING";
     const seenByManager = isManager ? 1 : 0;
@@ -5652,13 +6260,23 @@ apiRouter.post("/historical-work/upload-excel", requireAuth, async (req, res) =>
     const [existingDup] = await conn.execute(
       `SELECT id, status FROM historical_work_records
        WHERE user_id = ? AND shamsi_date = ? AND work_days_count = ? AND parsed_rows_json IS NOT NULL
-       ORDER BY id DESC LIMIT 1`,
+       ORDER BY id DESC LIMIT 1 FOR UPDATE`,
       [workerId, shamsiDate, totalDays]
     );
     let recordId = 0;
     if (existingDup.length > 0) {
+      if (!isManager && existingDup[0].status === "APPROVED") {
+        await conn.rollback();
+        unlinkMediaUrlFromDisk(savedFile.publicUrl);
+        res.status(409).json({
+          ok: false,
+          code: "APPROVED_RECORD_LOCKED",
+          message: "\u0627\u06CC\u0646 \u0628\u0627\u0632\u0647 \u06A9\u0627\u0631\u06A9\u0631\u062F \u0642\u0628\u0644\u0627\u064B \u062A\u0648\u0633\u0637 \u0645\u062F\u06CC\u0631\u06CC\u062A \u062A\u0623\u06CC\u06CC\u062F \u0634\u062F\u0647 \u0627\u0633\u062A \u0648 \u0627\u0645\u06A9\u0627\u0646 \u0628\u0627\u0632\u0646\u0648\u06CC\u0633\u06CC \u0645\u0633\u062A\u0642\u06CC\u0645 \u0622\u0646 \u062A\u0648\u0633\u0637 \u067E\u0631\u0633\u0646\u0644 \u0648\u062C\u0648\u062F \u0646\u062F\u0627\u0631\u062F."
+        });
+        return;
+      }
       recordId = Number(existingDup[0].id);
-      const effectiveStatus = isManager || existingDup[0].status === "APPROVED" ? "APPROVED" : initialStatus;
+      const effectiveStatus = isManager ? "APPROVED" : "PENDING";
       await conn.execute(
         `UPDATE historical_work_records
          SET title = ?, net_work_minutes = ?, overtime_minutes = ?, note = ?, status = ?,
@@ -5812,7 +6430,8 @@ apiRouter.post("/historical-work", requireAuth, async (req, res) => {
         note: note || void 0
       }
     ]) : null;
-    const workerId = await getWorkerUserId(pool2);
+    const workerId = await resolveTargetWorkerId(pool2, req, res);
+    if (workerId === null) return;
     const isManager = req.user.role === "manager";
     const initialStatus = isManager ? "APPROVED" : "PENDING";
     const seenByManager = isManager ? 1 : 0;
@@ -7107,6 +7726,15 @@ apiRouter.post(
         return;
       }
       const row = rows[0];
+      const isAuthorizedReminder = req.user.role === "manager" || Number(row.user_id) === req.user.id || Number(row.created_by_user_id) === req.user.id || row.target_scope === "WORKER" || row.target_scope === "BOTH";
+      if (!isAuthorizedReminder) {
+        res.status(403).json({
+          ok: false,
+          code: "FORBIDDEN",
+          message: "\u0645\u062C\u0648\u0632 \u062F\u0633\u062A\u0631\u0633\u06CC \u06CC\u0627 \u062A\u063A\u06CC\u06CC\u0631 \u0648\u0636\u0639\u06CC\u062A \u0627\u06CC\u0646 \u06CC\u0627\u062F\u0622\u0648\u0631\u06CC \u0631\u0627 \u0646\u062F\u0627\u0631\u06CC\u062F."
+        });
+        return;
+      }
       const reminder = mapRowToUserReminder(row);
       if (action === "SNOOZE_10M") {
         const settings = await getSystemSettingsFromDb();
@@ -8050,6 +8678,19 @@ apiRouter.post("/correspondences", requireAuth, async (req, res) => {
       }
     }
     const pool2 = getPool();
+    if (parentId !== null) {
+      if (!Number.isInteger(parentId) || parentId <= 0) {
+        res.status(400).json({ ok: false, message: "\u0634\u0646\u0627\u0633\u0647 \u067E\u06CC\u0627\u0645 \u0645\u0631\u062C\u0639 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
+        return;
+      }
+      const parentQuery = req.user.role === "manager" ? "SELECT id FROM work_correspondences WHERE id = ? LIMIT 1" : "SELECT id FROM work_correspondences WHERE id = ? AND (sender_user_id = ? OR receiver_user_id = ?) LIMIT 1";
+      const parentParams = req.user.role === "manager" ? [parentId] : [parentId, req.user.id, req.user.id];
+      const [parentRows] = await pool2.execute(parentQuery, parentParams);
+      if (parentRows.length === 0) {
+        res.status(404).json({ ok: false, message: "\u067E\u06CC\u0627\u0645 \u0645\u0631\u062C\u0639 \u0628\u0631\u0627\u06CC \u067E\u0627\u0633\u062E \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
+        return;
+      }
+    }
     const settings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(settings.timezone);
     const targetRole = req.user.role === "manager" ? "worker" : "manager";
@@ -8539,7 +9180,7 @@ var handleManagerExcelExport = async (req, res) => {
     );
     const leaveRows = leaveAllRows.filter((r) => inDateRange(String(r.shamsi_date || "")));
     const [repAllRows] = await pool2.execute(
-      "SELECT shamsi_date, recorded_time, duration_minutes, activity_description, materials_used, report_image_url FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC, id DESC",
+      "SELECT shamsi_date, recorded_time, duration_minutes, activity_description, photo_url, photo_name FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC, id DESC",
       [workerId]
     );
     const repRows = repAllRows.filter((r) => inDateRange(String(r.shamsi_date || "")));
@@ -8649,8 +9290,8 @@ var handleManagerExcelExport = async (req, res) => {
         "\u0633\u0627\u0639\u062A \u062B\u0628\u062A": r.recorded_time,
         "\u0645\u062F\u062A (\u062F\u0642\u06CC\u0642\u0647)": r.duration_minutes || "",
         "\u0634\u0631\u062D \u06A9\u0627\u0645\u0644 \u06AF\u0632\u0627\u0631\u0634 \u06A9\u0627\u0631": r.activity_description || "",
-        "\u0645\u0635\u0627\u0631\u0641 \u06A9\u0627\u0631\u06AF\u0627\u0647 / \u0645\u062A\u0631\u06CC\u0627\u0644 \u0645\u0635\u0631\u0641\u06CC": r.materials_used || "-",
-        "\u062A\u0635\u0648\u06CC\u0631 \u067E\u06CC\u0648\u0633\u062A": r.report_image_url ? "\u062F\u0627\u0631\u062F" : "\u0646\u062F\u0627\u0631\u062F"
+        "\u0646\u0627\u0645 \u0641\u0627\u06CC\u0644 \u067E\u06CC\u0648\u0633\u062A": r.photo_name || "-",
+        "\u062A\u0635\u0648\u06CC\u0631 \u067E\u06CC\u0648\u0633\u062A": r.photo_url ? "\u062F\u0627\u0631\u062F" : "\u0646\u062F\u0627\u0631\u062F"
       }));
       XLSX.utils.book_append_sheet(
         workbook,
@@ -8819,8 +9460,8 @@ apiRouter.get(
   requireRole("manager"),
   (_req, res) => {
     try {
-      const zipPath = import_path3.default.resolve(process.cwd(), "mgammon-duo-cpanel-deploy.zip");
-      if (!import_fs3.default.existsSync(zipPath)) {
+      const zipPath = import_path4.default.resolve(process.cwd(), "mgammon-duo-cpanel-deploy.zip");
+      if (!import_fs4.default.existsSync(zipPath)) {
         res.status(404).json({
           ok: false,
           message: "\u0641\u0627\u06CC\u0644 \u0628\u0633\u062A\u0647 \u0646\u0635\u0628\u06CC cPanel \u06CC\u0627\u0641\u062A \u0646\u0634\u062F."
@@ -8894,13 +9535,13 @@ apiRouter.post(
   requireRole("manager"),
   async (req, res) => {
     try {
-      const fileName = import_path3.default.basename(String(req.body?.fileName || "").trim());
+      const fileName = import_path4.default.basename(String(req.body?.fileName || "").trim());
       if (!fileName || !fileName.endsWith(".mgbackup.json")) {
         res.status(400).json({ ok: false, message: "\u0646\u0627\u0645 \u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
         return;
       }
-      const backupDir = process.env.BACKUP_DIR || import_path3.default.resolve(process.cwd(), ".data/backups");
-      const fullPath = import_path3.default.join(backupDir, fileName);
+      const backupDir = process.env.BACKUP_DIR || import_path4.default.resolve(process.cwd(), ".data/backups");
+      const fullPath = import_path4.default.join(backupDir, fileName);
       const verification = verifyBackupArchive(fullPath);
       if (!verification.valid) {
         res.status(422).json({
@@ -9260,16 +9901,76 @@ apiRouter.get(
     }
   }
 );
-apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
+var ALLOWED_ORPHAN_CLEANUP_FOLDERS = /* @__PURE__ */ new Set([
+  "audio",
+  "reports",
+  "receipts",
+  "attachments",
+  "excel"
+]);
+async function isMediaUrlReferencedInDb(conn, fileUrl) {
+  const [uRows] = await conn.execute(
+    "SELECT id FROM users WHERE avatar_url = ? LIMIT 1",
+    [fileUrl]
+  );
+  if (uRows.length > 0) return true;
+  const [sRows] = await conn.execute(
+    "SELECT id FROM system_settings WHERE banner_bg_url = ? LIMIT 1",
+    [fileUrl]
+  );
+  if (sRows.length > 0) return true;
+  const [fRows] = await conn.execute(
+    "SELECT id FROM financial_transactions WHERE receipt_file_url = ? LIMIT 1",
+    [fileUrl]
+  );
+  if (fRows.length > 0) return true;
+  const [rRows] = await conn.execute(
+    "SELECT id FROM daily_work_reports WHERE photo_url = ? LIMIT 1",
+    [fileUrl]
+  );
+  if (rRows.length > 0) return true;
+  const [hRows] = await conn.execute(
+    "SELECT id FROM historical_work_records WHERE excel_file_url = ? LIMIT 1",
+    [fileUrl]
+  );
+  if (hRows.length > 0) return true;
+  const [cAudioRows] = await conn.execute(
+    "SELECT id FROM work_correspondences WHERE audio_url = ? LIMIT 1",
+    [fileUrl]
+  );
+  if (cAudioRows.length > 0) return true;
+  const [cAttRows] = await conn.execute(
+    "SELECT attachments_json FROM work_correspondences WHERE attachments_json IS NOT NULL"
+  );
+  for (const row of cAttRows) {
+    try {
+      const parsed = typeof row.attachments_json === "string" ? JSON.parse(row.attachments_json) : row.attachments_json;
+      if (Array.isArray(parsed) && parsed.some((att) => String(att?.file_url || "").trim() === fileUrl)) {
+        return true;
+      }
+    } catch {
+    }
+  }
+  return false;
+}
+apiRouter.get("/media/storage", requireAuth, async (req, res) => {
   try {
     const pool2 = getPool();
+    const isManager = req.user.role === "manager";
+    const actorId = req.user.id;
     const items = [];
     const referencedUrls = /* @__PURE__ */ new Set();
+    const corrQuery = isManager ? `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
+         FROM work_correspondences c
+         LEFT JOIN users u ON u.id = c.sender_user_id
+         ORDER BY c.id DESC` : `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
+         FROM work_correspondences c
+         LEFT JOIN users u ON u.id = c.sender_user_id
+         WHERE c.sender_user_id = ? OR c.receiver_user_id = ?
+         ORDER BY c.id DESC`;
     const [corrRows] = await pool2.execute(
-      `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
-       FROM work_correspondences c
-       LEFT JOIN users u ON u.id = c.sender_user_id
-       ORDER BY c.id DESC`
+      corrQuery,
+      isManager ? [] : [actorId, actorId]
     );
     for (const r of corrRows) {
       const recordId = Number(r.id);
@@ -9288,7 +9989,7 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
           category: "AUDIO",
           record_id: recordId,
           file_url: audioUrl,
-          file_name: import_path3.default.basename(audioUrl),
+          file_name: import_path4.default.basename(audioUrl),
           size_bytes: info.sizeBytes,
           shamsi_date: shamsiDate,
           recorded_time: recordedTime,
@@ -9311,7 +10012,7 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
             const fileUrl = String(att.file_url).trim();
             referencedUrls.add(fileUrl);
             const info = getMediaFileInfoOnDisk(fileUrl);
-            const ext = import_path3.default.extname(fileUrl).toLowerCase();
+            const ext = import_path4.default.extname(fileUrl).toLowerCase();
             const isImg = [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
             const isAud = [".webm", ".ogg", ".mp3", ".m4a", ".wav"].includes(ext);
             items.push({
@@ -9320,7 +10021,7 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
               category: isAud ? "AUDIO" : isImg ? "IMAGE" : "DOCUMENT",
               record_id: recordId,
               file_url: fileUrl,
-              file_name: att.file_name || import_path3.default.basename(fileUrl),
+              file_name: att.file_name || import_path4.default.basename(fileUrl),
               size_bytes: info.exists ? info.sizeBytes : Number(att.file_size || 0),
               shamsi_date: shamsiDate,
               recorded_time: recordedTime,
@@ -9333,15 +10034,20 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
         }
       }
     }
+    const repQuery = isManager ? `SELECT id, user_id, shamsi_date, recorded_time, activity_description, photo_url, photo_name, created_at
+         FROM daily_work_reports
+         WHERE photo_url IS NOT NULL AND photo_url != ''
+         ORDER BY id DESC` : `SELECT id, user_id, shamsi_date, recorded_time, activity_description, photo_url, photo_name, created_at
+         FROM daily_work_reports
+         WHERE user_id = ? AND photo_url IS NOT NULL AND photo_url != ''
+         ORDER BY id DESC`;
     const [repRows] = await pool2.execute(
-      `SELECT id, shamsi_date, recorded_time, activity_description, report_image_url, created_at
-       FROM daily_work_reports
-       WHERE report_image_url IS NOT NULL AND report_image_url != ''
-       ORDER BY id DESC`
+      repQuery,
+      isManager ? [] : [actorId]
     );
     for (const r of repRows) {
       const recordId = Number(r.id);
-      const fileUrl = String(r.report_image_url).trim();
+      const fileUrl = String(r.photo_url).trim();
       referencedUrls.add(fileUrl);
       const info = getMediaFileInfoOnDisk(fileUrl);
       items.push({
@@ -9350,7 +10056,7 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
         category: "IMAGE",
         record_id: recordId,
         file_url: fileUrl,
-        file_name: import_path3.default.basename(fileUrl),
+        file_name: r.photo_name ? String(r.photo_name) : import_path4.default.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ""),
         recorded_time: String(r.recorded_time || "").slice(0, 5),
@@ -9360,40 +10066,52 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
         created_at: r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
       });
     }
+    const finQuery = isManager ? `SELECT f.id, f.user_id, f.created_by_user_id, f.shamsi_date, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
+         FROM financial_transactions f
+         LEFT JOIN users u ON u.id = f.created_by_user_id
+         WHERE f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
+         ORDER BY f.id DESC` : `SELECT f.id, f.user_id, f.created_by_user_id, f.shamsi_date, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
+         FROM financial_transactions f
+         LEFT JOIN users u ON u.id = f.created_by_user_id
+         WHERE f.user_id = ? AND f.created_by_user_id = ? AND f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
+         ORDER BY f.id DESC`;
     const [finRows] = await pool2.execute(
-      `SELECT f.id, f.shamsi_date, f.recorded_time, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
-       FROM financial_transactions f
-       LEFT JOIN users u ON u.id = f.created_by_user_id
-       WHERE f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
-       ORDER BY f.id DESC`
+      finQuery,
+      isManager ? [] : [actorId, actorId]
     );
     for (const r of finRows) {
       const recordId = Number(r.id);
       const fileUrl = String(r.receipt_file_url).trim();
       referencedUrls.add(fileUrl);
       const info = getMediaFileInfoOnDisk(fileUrl);
-      const ext = import_path3.default.extname(fileUrl).toLowerCase();
+      const ext = import_path4.default.extname(fileUrl).toLowerCase();
+      const createdAtIso = r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
       items.push({
         id: `FIN_RECEIPT_${recordId}`,
         source_type: "FINANCE_RECEIPT",
         category: ext === ".pdf" ? "DOCUMENT" : "IMAGE",
         record_id: recordId,
         file_url: fileUrl,
-        file_name: r.receipt_file_name ? String(r.receipt_file_name) : import_path3.default.basename(fileUrl),
+        file_name: r.receipt_file_name ? String(r.receipt_file_name) : import_path4.default.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ""),
-        recorded_time: String(r.recorded_time || "").slice(0, 5),
+        recorded_time: "",
         title_or_context: `\u067E\u06CC\u0648\u0633\u062A \u0633\u0646\u062F \u0645\u0627\u0644\u06CC: ${String(r.description || "\u0631\u0633\u06CC\u062F \u062A\u0631\u0627\u06A9\u0646\u0634 \u0645\u0627\u0644\u06CC").slice(0, 60)}`,
         sender_or_creator: r.creator_name ? String(r.creator_name) : "\u062B\u0628\u062A \u0645\u0627\u0644\u06CC",
         exists_on_disk: info.exists,
-        created_at: r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
+        created_at: createdAtIso
       });
     }
+    const histQuery = isManager ? `SELECT id, user_id, created_by_user_id, shamsi_date, title, excel_file_url, excel_file_name, created_at
+         FROM historical_work_records
+         WHERE excel_file_url IS NOT NULL AND excel_file_url != ''
+         ORDER BY id DESC` : `SELECT id, user_id, created_by_user_id, shamsi_date, title, excel_file_url, excel_file_name, created_at
+         FROM historical_work_records
+         WHERE user_id = ? AND created_by_user_id = ? AND excel_file_url IS NOT NULL AND excel_file_url != ''
+         ORDER BY id DESC`;
     const [histRows] = await pool2.execute(
-      `SELECT id, shamsi_date, title, excel_file_url, excel_file_name, created_at
-       FROM historical_work_records
-       WHERE excel_file_url IS NOT NULL AND excel_file_url != ''
-       ORDER BY id DESC`
+      histQuery,
+      isManager ? [] : [actorId, actorId]
     );
     for (const r of histRows) {
       const recordId = Number(r.id);
@@ -9406,7 +10124,7 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
         category: "DOCUMENT",
         record_id: recordId,
         file_url: fileUrl,
-        file_name: r.excel_file_name ? String(r.excel_file_name) : import_path3.default.basename(fileUrl),
+        file_name: r.excel_file_name ? String(r.excel_file_name) : import_path4.default.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ""),
         title_or_context: `\u0641\u0627\u06CC\u0644 \u0627\u06A9\u0633\u0644 \u0633\u0648\u0627\u0628\u0642: ${String(r.title || "").slice(0, 60)}`,
@@ -9415,44 +10133,46 @@ apiRouter.get("/media/storage", requireAuth, async (_req, res) => {
         created_at: r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString()
       });
     }
-    const baseDir = getBaseMediaDirPath();
-    const scanFolders = [
-      { folder: "audio", cat: "AUDIO" },
-      { folder: "reports", cat: "IMAGE" },
-      { folder: "receipts", cat: "IMAGE" },
-      { folder: "attachments", cat: "DOCUMENT" },
-      { folder: "excel", cat: "DOCUMENT" }
-    ];
-    for (const { folder, cat } of scanFolders) {
-      const dirPath = import_path3.default.join(baseDir, folder);
-      if (!import_fs3.default.existsSync(dirPath)) continue;
-      let fileNames = [];
-      try {
-        fileNames = import_fs3.default.readdirSync(dirPath);
-      } catch {
-        fileNames = [];
-      }
-      for (const fName of fileNames) {
-        const publicUrl = `/assets/media/${folder}/${fName}`;
-        if (referencedUrls.has(publicUrl)) continue;
-        const info = getMediaFileInfoOnDisk(publicUrl);
-        if (!info.exists) continue;
-        const mtimeIso = info.mtimeIso || (/* @__PURE__ */ new Date()).toISOString();
-        const shamsiDate = gregorianToShamsi(mtimeIso.slice(0, 10));
-        items.push({
-          id: `ORPHAN_${folder}_${fName}`,
-          source_type: "ORPHAN_FILE",
-          category: cat,
-          record_id: null,
-          file_url: publicUrl,
-          file_name: fName,
-          size_bytes: info.sizeBytes,
-          shamsi_date: shamsiDate,
-          title_or_context: `\u0641\u0627\u06CC\u0644 \u0630\u062E\u06CC\u0631\u0647\u200C\u0634\u062F\u0647 \u0631\u0648\u06CC \u0647\u0627\u0633\u062A (${folder})`,
-          sender_or_creator: "\u0633\u06CC\u0633\u062A\u0645",
-          exists_on_disk: true,
-          created_at: mtimeIso
-        });
+    if (isManager) {
+      const baseDir = getBaseMediaDirPath();
+      const scanFolders = [
+        { folder: "audio", cat: "AUDIO" },
+        { folder: "reports", cat: "IMAGE" },
+        { folder: "receipts", cat: "IMAGE" },
+        { folder: "attachments", cat: "DOCUMENT" },
+        { folder: "excel", cat: "DOCUMENT" }
+      ];
+      for (const { folder, cat } of scanFolders) {
+        const dirPath = import_path4.default.join(baseDir, folder);
+        if (!import_fs4.default.existsSync(dirPath)) continue;
+        let fileNames = [];
+        try {
+          fileNames = import_fs4.default.readdirSync(dirPath);
+        } catch {
+          fileNames = [];
+        }
+        for (const fName of fileNames) {
+          const publicUrl = `/assets/media/${folder}/${fName}`;
+          if (referencedUrls.has(publicUrl)) continue;
+          const info = getMediaFileInfoOnDisk(publicUrl);
+          if (!info.exists) continue;
+          const mtimeIso = info.mtimeIso || (/* @__PURE__ */ new Date()).toISOString();
+          const shamsiDate = gregorianToShamsi(mtimeIso.slice(0, 10));
+          items.push({
+            id: `ORPHAN_${folder}_${fName}`,
+            source_type: "ORPHAN_FILE",
+            category: cat,
+            record_id: null,
+            file_url: publicUrl,
+            file_name: fName,
+            size_bytes: info.sizeBytes,
+            shamsi_date: shamsiDate,
+            title_or_context: `\u0641\u0627\u06CC\u0644 \u0630\u062E\u06CC\u0631\u0647\u200C\u0634\u062F\u0647 \u0631\u0648\u06CC \u0647\u0627\u0633\u062A (${folder})`,
+            sender_or_creator: "\u0633\u06CC\u0633\u062A\u0645",
+            exists_on_disk: true,
+            created_at: mtimeIso
+          });
+        }
       }
     }
     let totalSizeBytes = 0;
@@ -9497,6 +10217,7 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
   try {
     const actorId = req.user.id;
     const actorRole = req.user.role;
+    const isManager = actorRole === "manager";
     const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
     const olderThanDays = req.body?.older_than_days !== void 0 && req.body?.older_than_days !== null ? Number(req.body.older_than_days) : null;
     const targetCategory = req.body?.category ? String(req.body.category).toUpperCase() : "ALL";
@@ -9505,8 +10226,10 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
     const targets = [...rawItems];
     if (targets.length === 0 && olderThanDays !== null && !Number.isNaN(olderThanDays) && olderThanDays >= 0) {
       const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1e3;
+      const corrBulkSql = isManager ? `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences FOR UPDATE` : `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences WHERE sender_user_id = ? OR receiver_user_id = ? FOR UPDATE`;
       const [corrRows] = await conn.execute(
-        `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences FOR UPDATE`
+        corrBulkSql,
+        isManager ? [] : [actorId, actorId]
       );
       for (const r of corrRows) {
         const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -9529,7 +10252,7 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
           if (Array.isArray(parsedAtts)) {
             for (const att of parsedAtts) {
               if (!att?.file_url) continue;
-              const ext = import_path3.default.extname(att.file_url).toLowerCase();
+              const ext = import_path4.default.extname(att.file_url).toLowerCase();
               const isImg = [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
               const isAud = [".webm", ".ogg", ".mp3", ".m4a", ".wav"].includes(ext);
               const cat = isAud ? "AUDIO" : isImg ? "IMAGE" : "DOCUMENT";
@@ -9545,8 +10268,10 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
         }
       }
       if (targetCategory === "ALL" || targetCategory === "IMAGE") {
+        const repBulkSql = isManager ? `SELECT id, photo_url, created_at FROM daily_work_reports WHERE photo_url IS NOT NULL AND photo_url != '' FOR UPDATE` : `SELECT id, photo_url, created_at FROM daily_work_reports WHERE user_id = ? AND photo_url IS NOT NULL AND photo_url != '' FOR UPDATE`;
         const [repRows] = await conn.execute(
-          `SELECT id, report_image_url, created_at FROM daily_work_reports WHERE report_image_url IS NOT NULL AND report_image_url != '' FOR UPDATE`
+          repBulkSql,
+          isManager ? [] : [actorId]
         );
         for (const r of repRows) {
           const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -9554,13 +10279,15 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
           targets.push({
             source_type: "REPORT_PHOTO",
             record_id: Number(r.id),
-            file_url: String(r.report_image_url).trim()
+            file_url: String(r.photo_url).trim()
           });
         }
       }
       if (targetCategory === "ALL" || targetCategory === "IMAGE" || targetCategory === "DOCUMENT") {
+        const finBulkSql = isManager ? `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE` : `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE user_id = ? AND created_by_user_id = ? AND receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`;
         const [finRows] = await conn.execute(
-          `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`
+          finBulkSql,
+          isManager ? [] : [actorId, actorId]
         );
         for (const r of finRows) {
           const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -9573,8 +10300,10 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
         }
       }
       if (targetCategory === "ALL" || targetCategory === "DOCUMENT") {
+        const histBulkSql = isManager ? `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE` : `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE user_id = ? AND created_by_user_id = ? AND excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`;
         const [histRows] = await conn.execute(
-          `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`
+          histBulkSql,
+          isManager ? [] : [actorId, actorId]
         );
         for (const r of histRows) {
           const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -9599,6 +10328,7 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
     }
     let deletedCount = 0;
     let freedBytes = 0;
+    let forbiddenAttempts = 0;
     for (const target of targets) {
       const sourceType = String(target.source_type || "").toUpperCase();
       const recordId = target.record_id ? Number(target.record_id) : null;
@@ -9606,84 +10336,137 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
       if (!fileUrl) continue;
       if (sourceType === "CORRESPONDENCE_AUDIO" && recordId) {
         const [rows] = await conn.execute(
-          `SELECT id, message_text, audio_url FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          `SELECT id, sender_user_id, receiver_user_id, message_text, audio_url FROM work_correspondences WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (!isManager && Number(rows[0].sender_user_id) !== actorId && Number(rows[0].receiver_user_id) !== actorId) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           const currentMsg = String(rows[0].message_text || "").trim();
           const updatedMsg = !currentMsg || currentMsg === "\u067E\u06CC\u0627\u0645 \u0635\u0648\u062A\u06CC \u062C\u062F\u06CC\u062F" ? "\u067E\u06CC\u0627\u0645 \u0635\u0648\u062A\u06CC (\u0641\u0627\u06CC\u0644 \u0635\u0648\u062A\u06CC \u062C\u0647\u062A \u0622\u0632\u0627\u062F\u0633\u0627\u0632\u06CC \u0641\u0636\u0627\u06CC \u0647\u0627\u0633\u062A \u062D\u0630\u0641 \u0634\u062F)" : currentMsg;
           await conn.execute(
             `UPDATE work_correspondences SET audio_url = NULL, audio_duration_seconds = NULL, message_text = ? WHERE id = ?`,
             [updatedMsg, recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].audio_url || fileUrl);
+          if (rows[0].audio_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].audio_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === "CORRESPONDENCE_ATTACHMENT" && recordId) {
         const [rows] = await conn.execute(
-          `SELECT id, message_text, attachments_json FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          `SELECT id, sender_user_id, receiver_user_id, message_text, attachments_json FROM work_correspondences WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (!isManager && Number(rows[0].sender_user_id) !== actorId && Number(rows[0].receiver_user_id) !== actorId) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           let parsedAtts = [];
           try {
             parsedAtts = typeof rows[0].attachments_json === "string" ? JSON.parse(rows[0].attachments_json) : rows[0].attachments_json || [];
           } catch {
             parsedAtts = [];
           }
-          const remaining = Array.isArray(parsedAtts) ? parsedAtts.filter((a) => String(a?.file_url || "").trim() !== fileUrl) : [];
+          const matchedAtt = Array.isArray(parsedAtts) ? parsedAtts.find((a) => String(a?.file_url || "").trim() === fileUrl) : void 0;
+          if (!matchedAtt) continue;
+          const remaining = parsedAtts.filter((a) => String(a?.file_url || "").trim() !== fileUrl);
           const currentMsg = String(rows[0].message_text || "").trim();
           const updatedMsg = !currentMsg || currentMsg === "\u0641\u0627\u06CC\u0644 \u067E\u06CC\u0648\u0633\u062A \u062C\u062F\u06CC\u062F" ? "\u067E\u06CC\u0648\u0633\u062A \u0645\u06A9\u0627\u062A\u0628\u0647 (\u0641\u0627\u06CC\u0644 \u067E\u06CC\u0648\u0633\u062A \u062C\u0647\u062A \u0622\u0632\u0627\u062F\u0633\u0627\u0632\u06CC \u0641\u0636\u0627\u06CC \u0647\u0627\u0633\u062A \u062D\u0630\u0641 \u0634\u062F)" : currentMsg;
           await conn.execute(
             `UPDATE work_correspondences SET attachments_json = ?, message_text = ? WHERE id = ?`,
             [remaining.length > 0 ? JSON.stringify(remaining) : null, updatedMsg, recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(fileUrl);
+          freedBytes += unlinkMediaUrlFromDisk(matchedAtt.file_url);
           deletedCount += 1;
         }
       } else if (sourceType === "REPORT_PHOTO" && recordId) {
         const [rows] = await conn.execute(
-          `SELECT id, report_image_url FROM daily_work_reports WHERE id = ? FOR UPDATE`,
+          `SELECT id, user_id, photo_url FROM daily_work_reports WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (!isManager && Number(rows[0].user_id) !== actorId) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           await conn.execute(
-            `UPDATE daily_work_reports SET report_image_url = NULL WHERE id = ?`,
+            `UPDATE daily_work_reports SET photo_url = NULL, photo_name = NULL WHERE id = ?`,
             [recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].report_image_url || fileUrl);
+          if (rows[0].photo_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].photo_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === "FINANCE_RECEIPT" && recordId) {
         const [rows] = await conn.execute(
-          `SELECT id, receipt_file_url FROM financial_transactions WHERE id = ? FOR UPDATE`,
+          `SELECT id, user_id, created_by_user_id, receipt_file_url FROM financial_transactions WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (!isManager && (Number(rows[0].user_id) !== actorId || Number(rows[0].created_by_user_id) !== actorId)) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           await conn.execute(
             `UPDATE financial_transactions SET receipt_file_url = NULL, receipt_file_name = NULL WHERE id = ?`,
             [recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].receipt_file_url || fileUrl);
+          if (rows[0].receipt_file_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].receipt_file_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === "HISTORICAL_EXCEL" && recordId) {
         const [rows] = await conn.execute(
-          `SELECT id, excel_file_url FROM historical_work_records WHERE id = ? FOR UPDATE`,
+          `SELECT id, user_id, created_by_user_id, excel_file_url FROM historical_work_records WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (!isManager && (Number(rows[0].user_id) !== actorId || Number(rows[0].created_by_user_id) !== actorId)) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           await conn.execute(
             `UPDATE historical_work_records SET excel_file_url = NULL, excel_file_name = NULL WHERE id = ?`,
             [recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].excel_file_url || fileUrl);
+          if (rows[0].excel_file_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].excel_file_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === "ORPHAN_FILE") {
+        if (!isManager) {
+          forbiddenAttempts += 1;
+          continue;
+        }
+        const match = fileUrl.match(/^\/assets\/media\/([a-z0-9_-]+)\/([^/\\]+)$/i);
+        if (!match || !ALLOWED_ORPHAN_CLEANUP_FOLDERS.has(match[1])) {
+          forbiddenAttempts += 1;
+          continue;
+        }
+        const stillReferenced = await isMediaUrlReferencedInDb(conn, fileUrl);
+        if (stillReferenced) {
+          forbiddenAttempts += 1;
+          continue;
+        }
         freedBytes += unlinkMediaUrlFromDisk(fileUrl);
         deletedCount += 1;
       }
+    }
+    if (deletedCount === 0 && forbiddenAttempts > 0) {
+      await conn.rollback();
+      res.status(403).json({
+        ok: false,
+        code: "FORBIDDEN",
+        message: "\u0634\u0645\u0627 \u0645\u062C\u0648\u0632 \u062D\u0630\u0641 \u0627\u06CC\u0646 \u0641\u0627\u06CC\u0644\u200C\u0647\u0627 \u0631\u0627 \u0646\u062F\u0627\u0631\u06CC\u062F."
+      });
+      return;
     }
     await recordAuditLog({
       actorUserId: actorId,
@@ -9743,7 +10526,17 @@ async function createApp() {
     next();
   });
   app.use((req, res, next) => {
-    const cleanPath = decodeURIComponent(req.path || "").toLowerCase();
+    let cleanPath = "";
+    try {
+      cleanPath = decodeURIComponent(req.path || "").toLowerCase();
+    } catch {
+      res.status(400).json({
+        ok: false,
+        code: "BAD_REQUEST",
+        message: "\u0646\u0634\u0627\u0646\u06CC \u062F\u0631\u062E\u0648\u0627\u0633\u062A \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A."
+      });
+      return;
+    }
     if (cleanPath.startsWith("/.data") || cleanPath.startsWith("/backups") || cleanPath.startsWith("/database") || cleanPath.includes("/.env")) {
       res.status(403).json({
         ok: false,
@@ -9754,11 +10547,11 @@ async function createApp() {
     }
     next();
   });
-  const privateBaseDir = import_path4.default.resolve(process.cwd(), ".data/private_media");
-  const legacyPublicMediaDir = import_path4.default.resolve(process.cwd(), "public/assets/media");
+  const privateBaseDir = import_path5.default.resolve(process.cwd(), ".data/private_media");
+  const legacyPublicMediaDir = import_path5.default.resolve(process.cwd(), "public/assets/media");
   for (const folder of PRIVATE_MEDIA_FOLDERS) {
     try {
-      import_fs4.default.mkdirSync(import_path4.default.join(privateBaseDir, folder), { recursive: true, mode: 448 });
+      import_fs5.default.mkdirSync(import_path5.default.join(privateBaseDir, folder), { recursive: true, mode: 448 });
     } catch {
     }
   }
@@ -9788,7 +10581,11 @@ async function createApp() {
     }
     next();
   });
-  app.use("/api", requireCsrfProtection, apiRouter);
+  const apiRateLimiter = createApiRateLimiter({
+    windowMs: 60 * 1e3,
+    maxRequests: process.env.VITEST === "true" ? 1e4 : 300
+  });
+  app.use("/api", apiRateLimiter, requireCsrfProtection, apiRouter);
   app.get("/assets/media/:folder/:filename", async (req, res) => {
     try {
       const folder = String(req.params.folder || "").trim();
@@ -9845,10 +10642,17 @@ async function createApp() {
           authorized = rows.length > 0;
         } else if (folder === "attachments") {
           const [rows] = await pool2.execute(
-            "SELECT id FROM work_correspondences WHERE attachments_json LIKE ? AND (sender_user_id = ? OR receiver_user_id = ?) LIMIT 1",
-            [`%${filename}%`, uid, uid]
+            "SELECT attachments_json FROM work_correspondences WHERE attachments_json IS NOT NULL AND (sender_user_id = ? OR receiver_user_id = ?)",
+            [uid, uid]
           );
-          authorized = rows.length > 0;
+          authorized = rows.some((r) => {
+            try {
+              const parsed = typeof r.attachments_json === "string" ? JSON.parse(r.attachments_json) : r.attachments_json;
+              return Array.isArray(parsed) && parsed.some((att) => String(att?.file_url || "").trim() === fileUrl);
+            } catch {
+              return false;
+            }
+          });
         } else if (folder === "avatars") {
           const [rows] = await pool2.execute(
             "SELECT id FROM users WHERE avatar_url = ? LIMIT 1",
@@ -9865,14 +10669,16 @@ async function createApp() {
           return;
         }
       }
-      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : privateBaseDir;
-      const candidatePrivate = import_path4.default.resolve(activePrivateBase, folder, filename);
-      const candidateLegacy = import_path4.default.resolve(legacyPublicMediaDir, folder, filename);
-      if (!candidatePrivate.startsWith(import_path4.default.resolve(activePrivateBase, folder)) || !candidateLegacy.startsWith(import_path4.default.resolve(legacyPublicMediaDir, folder))) {
+      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR ? import_path5.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : privateBaseDir;
+      const privateFolderRoot = import_path5.default.resolve(activePrivateBase, folder) + import_path5.default.sep;
+      const legacyFolderRoot = import_path5.default.resolve(legacyPublicMediaDir, folder) + import_path5.default.sep;
+      const candidatePrivate = import_path5.default.resolve(activePrivateBase, folder, filename);
+      const candidateLegacy = import_path5.default.resolve(legacyPublicMediaDir, folder, filename);
+      if (!candidatePrivate.startsWith(privateFolderRoot) || !candidateLegacy.startsWith(legacyFolderRoot)) {
         res.status(400).json({ ok: false, message: "\u0645\u0633\u06CC\u0631 \u0641\u0627\u06CC\u0644 \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A." });
         return;
       }
-      const targetPath = import_fs4.default.existsSync(candidatePrivate) ? candidatePrivate : import_fs4.default.existsSync(candidateLegacy) ? candidateLegacy : null;
+      const targetPath = import_fs5.default.existsSync(candidatePrivate) ? candidatePrivate : import_fs5.default.existsSync(candidateLegacy) ? candidateLegacy : null;
       if (!targetPath) {
         res.status(404).json({ ok: false, message: "\u0641\u0627\u06CC\u0644 \u0645\u0648\u0631\u062F \u0646\u0638\u0631 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
         return;
@@ -9893,7 +10699,7 @@ async function createApp() {
     }
     next();
   });
-  const publicDir = import_path4.default.resolve(process.cwd(), "public");
+  const publicDir = import_path5.default.resolve(process.cwd(), "public");
   app.use(import_express2.default.static(publicDir));
   return app;
 }
@@ -9910,10 +10716,9 @@ async function startServer() {
     );
   });
   const app = await createApp();
-  const PORT = Number(process.env.PORT || 3e3);
-  const isBundledRuntime = typeof __filename === "string" && import_path4.default.basename(__filename) === "app.cjs" || (process.argv[1] ? import_path4.default.basename(process.argv[1]) === "app.cjs" : false);
-  const isProductionMode = process.env.NODE_ENV === "production" || isBundledRuntime;
-  if (!isProductionMode) {
+  const appCfg = getAppConfig();
+  const isProductionMode2 = appCfg.isProduction || appCfg.isBundled;
+  if (!isProductionMode2) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: {
@@ -9926,7 +10731,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = import_path4.default.resolve(process.cwd(), "dist");
+    const distPath = import_path5.default.resolve(process.cwd(), "dist");
     app.use(import_express2.default.static(distPath));
     app.use("/api", (_req, res) => {
       res.status(404).json({
@@ -9936,11 +10741,13 @@ async function startServer() {
       });
     });
     app.get("*", (_req, res) => {
-      res.sendFile(import_path4.default.join(distPath, "index.html"));
+      res.sendFile(import_path5.default.join(distPath, "index.html"));
     });
   }
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${PORT}`);
+  const server = appCfg.isSocketOrPipe ? app.listen(appCfg.listenTarget, () => {
+    console.log(`[MGAMMON Duo] Server running on socket/pipe ${appCfg.listenTarget}`);
+  }) : app.listen(Number(appCfg.listenTarget), "0.0.0.0", () => {
+    console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${appCfg.listenTarget}`);
   });
   return server;
 }

@@ -1370,7 +1370,7 @@ export async function getSystemSettingsSnapshotsFromDb(): Promise<SystemSettings
   const current = await getSystemSettingsFromDb();
   try {
     const [rows] = await p.execute<mysql.RowDataPacket[]>(
-      `SELECT id, effective_from_shamsi, settings_json, changed_by_user_id, change_reason, created_at
+      `SELECT id, effective_from_shamsi, settings_json, created_by_user_id, created_at
        FROM system_settings_snapshots
        ORDER BY effective_from_shamsi ASC, id ASC`
     );
@@ -1393,8 +1393,8 @@ export async function getSystemSettingsSnapshotsFromDb(): Promise<SystemSettings
           banner_bg_url: current.banner_bg_url,
         },
         changed_by_user_id:
-          r.changed_by_user_id != null ? Number(r.changed_by_user_id) : null,
-        change_reason: r.change_reason ? String(r.change_reason) : null,
+          r.created_by_user_id != null ? Number(r.created_by_user_id) : null,
+        change_reason: null,
         created_at: r.created_at ? new Date(r.created_at).toISOString() : undefined,
       };
     });

@@ -20,6 +20,7 @@ import {
   listAvailableBackups,
   verifyBackupArchive,
 } from './backup';
+import { getAppConfig } from './config';
 import {
   AuthenticatedRequest,
   checkLoginRateLimit,
@@ -34,6 +35,7 @@ import {
   recordFailedLoginAttempt,
   requireAuth,
   requireRole,
+  safeEqualStrings,
   setSessionCookie,
 } from './auth';
 import {
@@ -846,7 +848,7 @@ apiRouter.post('/auth/login', async (req, res) => {
       return;
     }
 
-    if (process.env.NODE_ENV === 'production' && FORBIDDEN_DEFAULT_PASSWORDS.has(password)) {
+    if (getAppConfig().isProduction && FORBIDDEN_DEFAULT_PASSWORDS.has(password)) {
       await recordFailedLoginAttempt(clientIp, username);
       res.status(403).json({
         ok: false,
@@ -931,12 +933,17 @@ apiRouter.post('/auth/login', async (req, res) => {
 
     const mustChangePassword =
       Boolean(userRow.must_change_password) || FORBIDDEN_DEFAULT_PASSWORDS.has(password);
+    const passwordChangeRequired = Boolean(
+      (getAppConfig().enforcePasswordChange || req.headers['x-enforce-password-change'] === '1') &&
+        mustChangePassword
+    );
 
     res.json({
       ok: true,
       token: rawToken,
       csrfToken,
       requirePasswordChange: mustChangePassword,
+      passwordChangeRequired,
       user: {
         id: Number(userRow.id),
         username: String(userRow.username),
@@ -1045,8 +1052,8 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
     const expectedHash = hashSessionToken(biometricToken);
     if (
       !userRow.biometric_token_hash ||
-      String(userRow.biometric_credential_id) !== credentialId ||
-      String(userRow.biometric_token_hash) !== expectedHash
+      !safeEqualStrings(String(userRow.biometric_credential_id || ''), credentialId) ||
+      !safeEqualStrings(String(userRow.biometric_token_hash), expectedHash)
     ) {
       await recordFailedLoginAttempt(clientIp, username);
       res.status(401).json({
@@ -1066,10 +1073,17 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
     );
     setSessionCookie(res, rawToken, expiresAt);
 
+    const mustChangePassword = Boolean(userRow.must_change_password);
+    const passwordChangeRequired = Boolean(
+      (getAppConfig().enforcePasswordChange || req.headers['x-enforce-password-change'] === '1') &&
+        mustChangePassword
+    );
+
     res.json({
       ok: true,
       token: rawToken,
       csrfToken,
+      passwordChangeRequired,
       user: {
         id: Number(userRow.id),
         username: String(userRow.username),
@@ -1081,7 +1095,7 @@ apiRouter.post('/auth/biometric/login', async (req, res) => {
           : '1405/06/15',
         phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
         biometric_enabled: true,
-        must_change_password: Boolean(userRow.must_change_password),
+        must_change_password: mustChangePassword,
         last_login_at: new Date().toISOString(),
       },
     });
@@ -1109,10 +1123,15 @@ apiRouter.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Re
     const settings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(settings.timezone);
     const csrfToken = req.rawSessionToken ? generateCsrfToken(req.rawSessionToken) : undefined;
+    const passwordChangeRequired = Boolean(
+      (getAppConfig().enforcePasswordChange || req.headers['x-enforce-password-change'] === '1') &&
+        req.user?.must_change_password
+    );
     res.json({
       ok: true,
       user: req.user,
       csrfToken,
+      passwordChangeRequired,
       serverTime: nowInfo,
       settings: sanitizeSettingsForRole(settings, req.user!.role),
     });
@@ -1129,6 +1148,18 @@ apiRouter.post('/auth/verify-unlock', requireAuth, async (req: AuthenticatedRequ
     const password = String(req.body?.password || '');
     if (!password) {
       res.status(400).json({ ok: false, message: 'لطفاً رمز را وارد نمایید.' });
+      return;
+    }
+
+    const clientIp = req.ip || 'unknown';
+    const rateKey = `unlock:${req.user!.username}`;
+    const rateCheck = checkLoginRateLimit(clientIp, rateKey);
+    if (!rateCheck.allowed) {
+      res.status(429).json({
+        ok: false,
+        code: 'TOO_MANY_ATTEMPTS',
+        message: `تعداد تلاش‌های ناموفق بازگشایی قفل بیش از حد مجاز است. لطفاً ${rateCheck.retryAfterSeconds} ثانیه بعد تلاش کنید.`,
+      });
       return;
     }
 
@@ -1153,10 +1184,20 @@ apiRouter.post('/auth/verify-unlock', requireAuth, async (req: AuthenticatedRequ
     }
 
     if (!match) {
+      const attemptInfo = await recordFailedLoginAttempt(clientIp, rateKey);
+      if (attemptInfo.locked) {
+        res.status(429).json({
+          ok: false,
+          code: 'TOO_MANY_ATTEMPTS',
+          message: 'تعداد تلاش‌های ناموفق بازگشایی قفل بیش از حد مجاز بود. لطفاً چند دقیقه بعد مجدداً تلاش کنید.',
+        });
+        return;
+      }
       res.status(401).json({ ok: false, message: 'رمز واردشده صحیح نیست.' });
       return;
     }
 
+    clearLoginAttempts(clientIp, rateKey);
     res.json({ ok: true, unlocked: true });
   } catch (err) {
     handleServerError(res, err);
@@ -1255,7 +1296,7 @@ apiRouter.post('/auth/change-password', requireAuth, async (req: AuthenticatedRe
 
     const newHash = await bcrypt.hash(newPassword, 10);
     await pool.execute(
-      'UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?',
+      'UPDATE users SET password_hash = ?, must_change_password = 0, biometric_credential_id = NULL, biometric_token_hash = NULL WHERE id = ?',
       [newHash, userId]
     );
 
@@ -1356,6 +1397,17 @@ apiRouter.put('/auth/phone', requireAuth, async (req: AuthenticatedRequest, res:
  */
 apiRouter.post('/auth/forgot-password/request-otp', async (req, res) => {
   try {
+    const clientIp = req.ip || 'unknown';
+    const ipRateCheck = checkLoginRateLimit(clientIp, 'otp_request_ip');
+    if (!ipRateCheck.allowed) {
+      res.status(429).json({
+        ok: false,
+        code: 'TOO_MANY_ATTEMPTS',
+        message: `تعداد درخواست‌های ارسال کد بازیابی بیش از حد مجاز است. لطفاً ${ipRateCheck.retryAfterSeconds} ثانیه بعد تلاش کنید.`,
+      });
+      return;
+    }
+
     const username = toEnglishDigits(String(req.body?.username || ''))
       .trim()
       .toLowerCase();
@@ -1367,6 +1419,8 @@ apiRouter.post('/auth/forgot-password/request-otp', async (req, res) => {
       });
       return;
     }
+
+    await recordFailedLoginAttempt(clientIp, 'otp_request_ip');
 
     const pool = getPool();
     const [rows] = await pool.execute<mysql.RowDataPacket[]>(
@@ -1496,6 +1550,14 @@ apiRouter.post('/auth/forgot-password/reset', async (req, res) => {
       return;
     }
 
+    if (FORBIDDEN_DEFAULT_PASSWORDS.has(newPassword)) {
+      res.status(400).json({
+        ok: false,
+        message: 'رمز عبور جدید نباید از رمزهای پیش‌فرض و ناامن باشد.',
+      });
+      return;
+    }
+
     const pool = getPool();
     const [rows] = await pool.execute<mysql.RowDataPacket[]>(
       'SELECT id, username, full_name, role, avatar_url, collaboration_start_shamsi, phone_number, biometric_token_hash, is_active FROM users WHERE LOWER(username) = ? LIMIT 1',
@@ -1529,7 +1591,7 @@ apiRouter.post('/auth/forgot-password/reset', async (req, res) => {
       return;
     }
 
-    if (hashSessionToken(otpCode) !== otpEntry.codeHash) {
+    if (!safeEqualStrings(hashSessionToken(otpCode), otpEntry.codeHash)) {
       otpEntry.attempts += 1;
       res.status(400).json({
         ok: false,
@@ -1543,11 +1605,12 @@ apiRouter.post('/auth/forgot-password/reset', async (req, res) => {
     const newHash = await bcrypt.hash(newPassword, 10);
     const userId = Number(userRow.id);
     await pool.execute(
-      'UPDATE users SET password_hash = ?, must_change_password = 0, last_login_at = NOW() WHERE id = ?',
+      'UPDATE users SET password_hash = ?, must_change_password = 0, biometric_credential_id = NULL, biometric_token_hash = NULL, last_login_at = NOW() WHERE id = ?',
       [newHash, userId]
     );
     await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [userId]);
     clearLoginAttempts(req.ip || 'unknown', userKey);
+    clearLoginAttempts(req.ip || 'unknown', 'otp_request_ip');
 
     const { rawToken, csrfToken, expiresAt } = await createServerSession(
       userId,
@@ -1579,7 +1642,7 @@ apiRouter.post('/auth/forgot-password/reset', async (req, res) => {
           ? String(userRow.collaboration_start_shamsi)
           : '1405/06/15',
         phone_number: userRow.phone_number ? String(userRow.phone_number) : null,
-        biometric_enabled: Boolean(userRow.biometric_token_hash),
+        biometric_enabled: false,
         must_change_password: false,
         last_login_at: new Date().toISOString(),
       },
@@ -1609,6 +1672,14 @@ apiRouter.post(
         return;
       }
 
+      if (FORBIDDEN_DEFAULT_PASSWORDS.has(newPassword)) {
+        res.status(400).json({
+          ok: false,
+          message: 'رمز عبور جدید پرسنل نباید از رمزهای پیش‌فرض و ناامن باشد.',
+        });
+        return;
+      }
+
       const pool = getPool();
       const [workerRows] = await pool.execute<mysql.RowDataPacket[]>(
         "SELECT id, username, full_name, phone_number FROM users WHERE role = 'worker' LIMIT 1"
@@ -1624,7 +1695,7 @@ apiRouter.post(
       const newHash = await bcrypt.hash(newPassword, 10);
 
       await pool.execute(
-        'UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?',
+        'UPDATE users SET password_hash = ?, must_change_password = 1, biometric_credential_id = NULL, biometric_token_hash = NULL WHERE id = ?',
         [newHash, workerId]
       );
       await pool.execute('DELETE FROM user_sessions WHERE user_id = ?', [workerId]);
@@ -1898,6 +1969,16 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
 
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
+          if (row.late_status !== 'ABSENCE') {
+            if (row.late_deduction_toman && row.late_deduction_toman > 0) {
+              totalLateAndAbsenceDeductionToman += Math.round(row.late_deduction_toman);
+            } else if (row.late_status === 'CUSTOM') {
+              totalLateAndAbsenceDeductionToman +=
+                row.custom_deduction_toman && row.custom_deduction_toman > 0
+                  ? Math.round(row.custom_deduction_toman)
+                  : 0;
+            }
+          }
           const isRowBulk = rowDaysCount !== 1 || rowNetMins > 600;
           const rowDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normShamsi));
           hourlyEarnedRegularWorkToman +=
@@ -2066,7 +2147,7 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
         totalEntitlementToman,
         accountBalanceToman,
       },
-      bannerBgUrl: settings.banner_bg_url || '/assets/media/banner-bg.svg',
+      bannerBgUrl: settings.banner_bg_url || '/assets/media/banner-bg.webp',
     });
   } catch (err) {
     handleServerError(res, err);
@@ -2370,13 +2451,15 @@ apiRouter.post(
         const isFirstWorkStart =
           startEventType === 'WORK_START' &&
           !existingLogs.some((l) => l.event_type === 'WORK_START');
-        const isThursday = getDayOfWeekFromGregorian(workDate) === 5;
+        const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+        const normShamsi = normalizeShamsiDate(shamsiDate);
+        const isThursday = dayOfWeek === 4;
         const isHoliday =
-          getDayOfWeekFromGregorian(workDate) === 6 ||
-          effectiveSettings.official_holidays.includes(shamsiDate);
-        const isWorkingDay =
-          !isHoliday &&
-          effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+          dayOfWeek === 5 ||
+          effectiveSettings.official_holidays.some(
+            (h) => (isValidShamsiDate(h) ? normalizeShamsiDate(h) : h) === normShamsi
+          );
+        const isWorkingDay = !isHoliday && effectiveSettings.working_days.includes(dayOfWeek);
 
         const shiftStartMin = parseTimeToMinutes(
           isThursday
@@ -2627,13 +2710,15 @@ apiRouter.post(
       const isFirstWorkStart =
         startEventType === 'WORK_START' &&
         !existingLogs.some((l) => l.event_type === 'WORK_START');
-      const isThursday = getDayOfWeekFromGregorian(workDate) === 5;
+      const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+      const normShamsi = normalizeShamsiDate(shamsiDate);
+      const isThursday = dayOfWeek === 4;
       const isHoliday =
-        getDayOfWeekFromGregorian(workDate) === 6 ||
-        effectiveSettings.official_holidays.includes(shamsiDate);
-      const isWorkingDay =
-        !isHoliday &&
-        effectiveSettings.working_days.includes(getDayOfWeekFromGregorian(workDate));
+        dayOfWeek === 5 ||
+        effectiveSettings.official_holidays.some(
+          (h) => (isValidShamsiDate(h) ? normalizeShamsiDate(h) : h) === normShamsi
+        );
+      const isWorkingDay = !isHoliday && effectiveSettings.working_days.includes(dayOfWeek);
 
       const shiftStartMin = parseTimeToMinutes(
         isThursday
@@ -3140,6 +3225,7 @@ apiRouter.post('/historical-work/upload-excel', requireAuth, async (req: Authent
         type: 'buffer',
         cellFormula: false,
         cellHTML: false,
+        sheetRows: 550,
       });
     } catch {
       res.status(400).json({ ok: false, message: 'فایل اکسل خراب یا غیرقابل خواندن است.' });
@@ -3153,7 +3239,16 @@ apiRouter.post('/historical-work/upload-excel', requireAuth, async (req: Authent
     }
 
     const sheet = workbook.Sheets[firstSheetName];
-    const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+    const rawRows = XLSX.utils
+      .sheet_to_json<Record<string, unknown>>(sheet, { defval: '' })
+      .map((row) => {
+        const cleanRow: Record<string, unknown> = Object.create(null);
+        for (const [k, v] of Object.entries(row)) {
+          if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+          cleanRow[k] = v;
+        }
+        return cleanRow;
+      });
 
     if (rawRows.length === 0) {
       res.status(400).json({ ok: false, message: 'فایل اکسل خالی است و هیچ ردیف داده‌ای ندارد.' });
@@ -3306,10 +3401,12 @@ apiRouter.post('/historical-work/upload-excel', requireAuth, async (req: Authent
       return;
     }
 
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
+
     const savedFile = saveBase64MediaFile('excel', fileName, fileBase64);
     const shamsiDate = parsedRows[0]?.shamsi_date || nowInfo.shamsiDate;
     const workDate = shamsiToGregorian(shamsiDate);
-    const workerId = await getWorkerUserId(pool);
 
     const isManager = req.user!.role === 'manager';
     const initialStatus: FinancialStatus = isManager ? 'APPROVED' : 'PENDING';
@@ -3322,15 +3419,25 @@ apiRouter.post('/historical-work/upload-excel', requireAuth, async (req: Authent
     const [existingDup] = await conn.execute<mysql.RowDataPacket[]>(
       `SELECT id, status FROM historical_work_records
        WHERE user_id = ? AND shamsi_date = ? AND work_days_count = ? AND parsed_rows_json IS NOT NULL
-       ORDER BY id DESC LIMIT 1`,
+       ORDER BY id DESC LIMIT 1 FOR UPDATE`,
       [workerId, shamsiDate, totalDays]
     );
 
     let recordId = 0;
     if (existingDup.length > 0) {
+      if (!isManager && existingDup[0].status === 'APPROVED') {
+        await conn.rollback();
+        unlinkMediaUrlFromDisk(savedFile.publicUrl);
+        res.status(409).json({
+          ok: false,
+          code: 'APPROVED_RECORD_LOCKED',
+          message:
+            'این بازه کارکرد قبلاً توسط مدیریت تأیید شده است و امکان بازنویسی مستقیم آن توسط پرسنل وجود ندارد.',
+        });
+        return;
+      }
       recordId = Number(existingDup[0].id);
-      const effectiveStatus: FinancialStatus =
-        isManager || existingDup[0].status === 'APPROVED' ? 'APPROVED' : initialStatus;
+      const effectiveStatus: FinancialStatus = isManager ? 'APPROVED' : 'PENDING';
       await conn.execute(
         `UPDATE historical_work_records
          SET title = ?, net_work_minutes = ?, overtime_minutes = ?, note = ?, status = ?,
@@ -3505,7 +3612,8 @@ apiRouter.post('/historical-work', requireAuth, async (req: AuthenticatedRequest
           ])
         : null;
 
-    const workerId = await getWorkerUserId(pool);
+    const workerId = await resolveTargetWorkerId(pool, req, res);
+    if (workerId === null) return;
     const isManager = req.user!.role === 'manager';
     const initialStatus: FinancialStatus = isManager ? 'APPROVED' : 'PENDING';
     const seenByManager = isManager ? 1 : 0;
@@ -5056,6 +5164,20 @@ apiRouter.post(
       }
 
       const row = rows[0];
+      const isAuthorizedReminder =
+        req.user!.role === 'manager' ||
+        Number(row.user_id) === req.user!.id ||
+        Number(row.created_by_user_id) === req.user!.id ||
+        row.target_scope === 'WORKER' ||
+        row.target_scope === 'BOTH';
+      if (!isAuthorizedReminder) {
+        res.status(403).json({
+          ok: false,
+          code: 'FORBIDDEN',
+          message: 'مجوز دسترسی یا تغییر وضعیت این یادآوری را ندارید.',
+        });
+        return;
+      }
       const reminder = mapRowToUserReminder(row);
 
       if (action === 'SNOOZE_10M') {
@@ -6205,6 +6327,25 @@ apiRouter.post('/correspondences', requireAuth, async (req: AuthenticatedRequest
     }
 
     const pool = getPool();
+
+    if (parentId !== null) {
+      if (!Number.isInteger(parentId) || parentId <= 0) {
+        res.status(400).json({ ok: false, message: 'شناسه پیام مرجع معتبر نیست.' });
+        return;
+      }
+      const parentQuery =
+        req.user!.role === 'manager'
+          ? 'SELECT id FROM work_correspondences WHERE id = ? LIMIT 1'
+          : 'SELECT id FROM work_correspondences WHERE id = ? AND (sender_user_id = ? OR receiver_user_id = ?) LIMIT 1';
+      const parentParams =
+        req.user!.role === 'manager' ? [parentId] : [parentId, req.user!.id, req.user!.id];
+      const [parentRows] = await pool.execute<mysql.RowDataPacket[]>(parentQuery, parentParams);
+      if (parentRows.length === 0) {
+        res.status(404).json({ ok: false, message: 'پیام مرجع برای پاسخ یافت نشد.' });
+        return;
+      }
+    }
+
     const settings = await getSystemSettingsFromDb();
     const nowInfo = getNowInTimezone(settings.timezone);
 
@@ -6813,7 +6954,7 @@ const handleManagerExcelExport = async (req: AuthenticatedRequest, res: Response
     const leaveRows = leaveAllRows.filter((r) => inDateRange(String(r.shamsi_date || '')));
 
     const [repAllRows] = await pool.execute<mysql.RowDataPacket[]>(
-      'SELECT shamsi_date, recorded_time, duration_minutes, activity_description, materials_used, report_image_url FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC, id DESC',
+      'SELECT shamsi_date, recorded_time, duration_minutes, activity_description, photo_url, photo_name FROM daily_work_reports WHERE user_id = ? ORDER BY report_date DESC, id DESC',
       [workerId]
     );
     const repRows = repAllRows.filter((r) => inDateRange(String(r.shamsi_date || '')));
@@ -6954,8 +7095,8 @@ const handleManagerExcelExport = async (req: AuthenticatedRequest, res: Response
         'ساعت ثبت': r.recorded_time,
         'مدت (دقیقه)': r.duration_minutes || '',
         'شرح کامل گزارش کار': r.activity_description || '',
-        'مصارف کارگاه / متریال مصرفی': r.materials_used || '-',
-        'تصویر پیوست': r.report_image_url ? 'دارد' : 'ندارد',
+        'نام فایل پیوست': r.photo_name || '-',
+        'تصویر پیوست': r.photo_url ? 'دارد' : 'ندارد',
       }));
 
       XLSX.utils.book_append_sheet(
@@ -7703,20 +7844,101 @@ apiRouter.get(
 );
 
 // ============================================================================
-// ۱۰. مدیریت فضای ذخیره‌سازی هاست و پاکسازی فایل‌های صوتی، تصاویر و پیوست‌ها (مشترک مدیر و پرسنل)
+// ۱۰. مدیریت فضای ذخیره‌سازی هاست و پاکسازی فایل‌های صوتی، تصاویر و پیوست‌ها (با تفکیک مجوز مدیر و پرسنل)
 // ============================================================================
-apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+const ALLOWED_ORPHAN_CLEANUP_FOLDERS = new Set([
+  'audio',
+  'reports',
+  'receipts',
+  'attachments',
+  'excel',
+]);
+
+async function isMediaUrlReferencedInDb(
+  conn: mysql.PoolConnection,
+  fileUrl: string
+): Promise<boolean> {
+  const [uRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT id FROM users WHERE avatar_url = ? LIMIT 1',
+    [fileUrl]
+  );
+  if (uRows.length > 0) return true;
+
+  const [sRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT id FROM system_settings WHERE banner_bg_url = ? LIMIT 1',
+    [fileUrl]
+  );
+  if (sRows.length > 0) return true;
+
+  const [fRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT id FROM financial_transactions WHERE receipt_file_url = ? LIMIT 1',
+    [fileUrl]
+  );
+  if (fRows.length > 0) return true;
+
+  const [rRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT id FROM daily_work_reports WHERE photo_url = ? LIMIT 1',
+    [fileUrl]
+  );
+  if (rRows.length > 0) return true;
+
+  const [hRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT id FROM historical_work_records WHERE excel_file_url = ? LIMIT 1',
+    [fileUrl]
+  );
+  if (hRows.length > 0) return true;
+
+  const [cAudioRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT id FROM work_correspondences WHERE audio_url = ? LIMIT 1',
+    [fileUrl]
+  );
+  if (cAudioRows.length > 0) return true;
+
+  const [cAttRows] = await conn.execute<mysql.RowDataPacket[]>(
+    'SELECT attachments_json FROM work_correspondences WHERE attachments_json IS NOT NULL'
+  );
+  for (const row of cAttRows) {
+    try {
+      const parsed =
+        typeof row.attachments_json === 'string'
+          ? JSON.parse(row.attachments_json)
+          : row.attachments_json;
+      if (
+        Array.isArray(parsed) &&
+        parsed.some((att) => String(att?.file_url || '').trim() === fileUrl)
+      ) {
+        return true;
+      }
+    } catch {
+      // ignore malformed json
+    }
+  }
+
+  return false;
+}
+
+apiRouter.get('/media/storage', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const pool = getPool();
+    const isManager = req.user!.role === 'manager';
+    const actorId = req.user!.id;
     const items: MediaStorageItem[] = [];
     const referencedUrls = new Set<string>();
 
     // ۱. پیام‌ها و مکاتبات (فایل‌های صوتی و پیوست‌ها)
+    const corrQuery = isManager
+      ? `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
+         FROM work_correspondences c
+         LEFT JOIN users u ON u.id = c.sender_user_id
+         ORDER BY c.id DESC`
+      : `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
+         FROM work_correspondences c
+         LEFT JOIN users u ON u.id = c.sender_user_id
+         WHERE c.sender_user_id = ? OR c.receiver_user_id = ?
+         ORDER BY c.id DESC`;
     const [corrRows] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT c.*, u.full_name AS sender_name, u.role AS sender_role
-       FROM work_correspondences c
-       LEFT JOIN users u ON u.id = c.sender_user_id
-       ORDER BY c.id DESC`
+      corrQuery,
+      isManager ? [] : [actorId, actorId]
     );
 
     for (const r of corrRows) {
@@ -7787,16 +8009,23 @@ apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, 
       }
     }
 
-    // ۲. تصاویر گزارش کارهای روزانه
+    // ۲. تصاویر گزارش کارهای روزانه (ستون واقعی: photo_url / photo_name)
+    const repQuery = isManager
+      ? `SELECT id, user_id, shamsi_date, recorded_time, activity_description, photo_url, photo_name, created_at
+         FROM daily_work_reports
+         WHERE photo_url IS NOT NULL AND photo_url != ''
+         ORDER BY id DESC`
+      : `SELECT id, user_id, shamsi_date, recorded_time, activity_description, photo_url, photo_name, created_at
+         FROM daily_work_reports
+         WHERE user_id = ? AND photo_url IS NOT NULL AND photo_url != ''
+         ORDER BY id DESC`;
     const [repRows] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT id, shamsi_date, recorded_time, activity_description, report_image_url, created_at
-       FROM daily_work_reports
-       WHERE report_image_url IS NOT NULL AND report_image_url != ''
-       ORDER BY id DESC`
+      repQuery,
+      isManager ? [] : [actorId]
     );
     for (const r of repRows) {
       const recordId = Number(r.id);
-      const fileUrl = String(r.report_image_url).trim();
+      const fileUrl = String(r.photo_url).trim();
       referencedUrls.add(fileUrl);
       const info = getMediaFileInfoOnDisk(fileUrl);
       items.push({
@@ -7805,7 +8034,7 @@ apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, 
         category: 'IMAGE',
         record_id: recordId,
         file_url: fileUrl,
-        file_name: path.basename(fileUrl),
+        file_name: r.photo_name ? String(r.photo_name) : path.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ''),
         recorded_time: String(r.recorded_time || '').slice(0, 5),
@@ -7816,13 +8045,21 @@ apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, 
       });
     }
 
-    // ۳. تصاویر رسید و فاکتور تراکنش‌های مالی
+    // ۳. تصاویر رسید و فاکتور تراکنش‌های مالی (پرسنل فقط رسیدهای ثبت‌شده توسط خودش را می‌بیند)
+    const finQuery = isManager
+      ? `SELECT f.id, f.user_id, f.created_by_user_id, f.shamsi_date, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
+         FROM financial_transactions f
+         LEFT JOIN users u ON u.id = f.created_by_user_id
+         WHERE f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
+         ORDER BY f.id DESC`
+      : `SELECT f.id, f.user_id, f.created_by_user_id, f.shamsi_date, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
+         FROM financial_transactions f
+         LEFT JOIN users u ON u.id = f.created_by_user_id
+         WHERE f.user_id = ? AND f.created_by_user_id = ? AND f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
+         ORDER BY f.id DESC`;
     const [finRows] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT f.id, f.shamsi_date, f.recorded_time, f.description, f.receipt_file_url, f.receipt_file_name, f.created_at, u.full_name AS creator_name
-       FROM financial_transactions f
-       LEFT JOIN users u ON u.id = f.created_by_user_id
-       WHERE f.receipt_file_url IS NOT NULL AND f.receipt_file_url != ''
-       ORDER BY f.id DESC`
+      finQuery,
+      isManager ? [] : [actorId, actorId]
     );
     for (const r of finRows) {
       const recordId = Number(r.id);
@@ -7830,6 +8067,7 @@ apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, 
       referencedUrls.add(fileUrl);
       const info = getMediaFileInfoOnDisk(fileUrl);
       const ext = path.extname(fileUrl).toLowerCase();
+      const createdAtIso = r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString();
       items.push({
         id: `FIN_RECEIPT_${recordId}`,
         source_type: 'FINANCE_RECEIPT',
@@ -7839,20 +8077,27 @@ apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, 
         file_name: r.receipt_file_name ? String(r.receipt_file_name) : path.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ''),
-        recorded_time: String(r.recorded_time || '').slice(0, 5),
+        recorded_time: '',
         title_or_context: `پیوست سند مالی: ${String(r.description || 'رسید تراکنش مالی').slice(0, 60)}`,
         sender_or_creator: r.creator_name ? String(r.creator_name) : 'ثبت مالی',
         exists_on_disk: info.exists,
-        created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
+        created_at: createdAtIso,
       });
     }
 
-    // ۴. فایل‌های اکسل سوابق کاری گذشته
+    // ۴. فایل‌های اکسل سوابق کاری گذشته (پرسنل فقط فایل‌های بارگذاری‌شده توسط خودش را می‌بیند)
+    const histQuery = isManager
+      ? `SELECT id, user_id, created_by_user_id, shamsi_date, title, excel_file_url, excel_file_name, created_at
+         FROM historical_work_records
+         WHERE excel_file_url IS NOT NULL AND excel_file_url != ''
+         ORDER BY id DESC`
+      : `SELECT id, user_id, created_by_user_id, shamsi_date, title, excel_file_url, excel_file_name, created_at
+         FROM historical_work_records
+         WHERE user_id = ? AND created_by_user_id = ? AND excel_file_url IS NOT NULL AND excel_file_url != ''
+         ORDER BY id DESC`;
     const [histRows] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT id, shamsi_date, title, excel_file_url, excel_file_name, created_at
-       FROM historical_work_records
-       WHERE excel_file_url IS NOT NULL AND excel_file_url != ''
-       ORDER BY id DESC`
+      histQuery,
+      isManager ? [] : [actorId, actorId]
     );
     for (const r of histRows) {
       const recordId = Number(r.id);
@@ -7875,46 +8120,48 @@ apiRouter.get('/media/storage', requireAuth, async (_req: AuthenticatedRequest, 
       });
     }
 
-    // ۵. بررسی فایل‌های بدون مرجع (Orphan) روی دیسک در پوشه‌های audio, attachments, reports, receipts, excel
-    const baseDir = getBaseMediaDirPath();
-    const scanFolders: Array<{ folder: string; cat: 'AUDIO' | 'IMAGE' | 'DOCUMENT' }> = [
-      { folder: 'audio', cat: 'AUDIO' },
-      { folder: 'reports', cat: 'IMAGE' },
-      { folder: 'receipts', cat: 'IMAGE' },
-      { folder: 'attachments', cat: 'DOCUMENT' },
-      { folder: 'excel', cat: 'DOCUMENT' },
-    ];
+    // ۵. بررسی فایل‌های بدون مرجع (Orphan) روی دیسک — صرفاً مجاز برای مدیر سامانه
+    if (isManager) {
+      const baseDir = getBaseMediaDirPath();
+      const scanFolders: Array<{ folder: string; cat: 'AUDIO' | 'IMAGE' | 'DOCUMENT' }> = [
+        { folder: 'audio', cat: 'AUDIO' },
+        { folder: 'reports', cat: 'IMAGE' },
+        { folder: 'receipts', cat: 'IMAGE' },
+        { folder: 'attachments', cat: 'DOCUMENT' },
+        { folder: 'excel', cat: 'DOCUMENT' },
+      ];
 
-    for (const { folder, cat } of scanFolders) {
-      const dirPath = path.join(baseDir, folder);
-      if (!fs.existsSync(dirPath)) continue;
-      let fileNames: string[] = [];
-      try {
-        fileNames = fs.readdirSync(dirPath);
-      } catch {
-        fileNames = [];
-      }
-      for (const fName of fileNames) {
-        const publicUrl = `/assets/media/${folder}/${fName}`;
-        if (referencedUrls.has(publicUrl)) continue;
-        const info = getMediaFileInfoOnDisk(publicUrl);
-        if (!info.exists) continue;
-        const mtimeIso = info.mtimeIso || new Date().toISOString();
-        const shamsiDate = gregorianToShamsi(mtimeIso.slice(0, 10));
-        items.push({
-          id: `ORPHAN_${folder}_${fName}`,
-          source_type: 'ORPHAN_FILE',
-          category: cat,
-          record_id: null,
-          file_url: publicUrl,
-          file_name: fName,
-          size_bytes: info.sizeBytes,
-          shamsi_date: shamsiDate,
-          title_or_context: `فایل ذخیره‌شده روی هاست (${folder})`,
-          sender_or_creator: 'سیستم',
-          exists_on_disk: true,
-          created_at: mtimeIso,
-        });
+      for (const { folder, cat } of scanFolders) {
+        const dirPath = path.join(baseDir, folder);
+        if (!fs.existsSync(dirPath)) continue;
+        let fileNames: string[] = [];
+        try {
+          fileNames = fs.readdirSync(dirPath);
+        } catch {
+          fileNames = [];
+        }
+        for (const fName of fileNames) {
+          const publicUrl = `/assets/media/${folder}/${fName}`;
+          if (referencedUrls.has(publicUrl)) continue;
+          const info = getMediaFileInfoOnDisk(publicUrl);
+          if (!info.exists) continue;
+          const mtimeIso = info.mtimeIso || new Date().toISOString();
+          const shamsiDate = gregorianToShamsi(mtimeIso.slice(0, 10));
+          items.push({
+            id: `ORPHAN_${folder}_${fName}`,
+            source_type: 'ORPHAN_FILE',
+            category: cat,
+            record_id: null,
+            file_url: publicUrl,
+            file_name: fName,
+            size_bytes: info.sizeBytes,
+            shamsi_date: shamsiDate,
+            title_or_context: `فایل ذخیره‌شده روی هاست (${folder})`,
+            sender_or_creator: 'سیستم',
+            exists_on_disk: true,
+            created_at: mtimeIso,
+          });
+        }
       }
     }
 
@@ -7964,6 +8211,7 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
   try {
     const actorId = req.user!.id;
     const actorRole = req.user!.role;
+    const isManager = actorRole === 'manager';
 
     const rawItems: Array<{
       source_type: MediaSourceType;
@@ -7990,8 +8238,12 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
     if (targets.length === 0 && olderThanDays !== null && !Number.isNaN(olderThanDays) && olderThanDays >= 0) {
       const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
 
+      const corrBulkSql = isManager
+        ? `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences FOR UPDATE`
+        : `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences WHERE sender_user_id = ? OR receiver_user_id = ? FOR UPDATE`;
       const [corrRows] = await conn.execute<mysql.RowDataPacket[]>(
-        `SELECT id, audio_url, attachments_json, created_at FROM work_correspondences FOR UPDATE`
+        corrBulkSql,
+        isManager ? [] : [actorId, actorId]
       );
       for (const r of corrRows) {
         const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -8034,8 +8286,12 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
       }
 
       if (targetCategory === 'ALL' || targetCategory === 'IMAGE') {
+        const repBulkSql = isManager
+          ? `SELECT id, photo_url, created_at FROM daily_work_reports WHERE photo_url IS NOT NULL AND photo_url != '' FOR UPDATE`
+          : `SELECT id, photo_url, created_at FROM daily_work_reports WHERE user_id = ? AND photo_url IS NOT NULL AND photo_url != '' FOR UPDATE`;
         const [repRows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, report_image_url, created_at FROM daily_work_reports WHERE report_image_url IS NOT NULL AND report_image_url != '' FOR UPDATE`
+          repBulkSql,
+          isManager ? [] : [actorId]
         );
         for (const r of repRows) {
           const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -8043,14 +8299,18 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
           targets.push({
             source_type: 'REPORT_PHOTO',
             record_id: Number(r.id),
-            file_url: String(r.report_image_url).trim(),
+            file_url: String(r.photo_url).trim(),
           });
         }
       }
 
       if (targetCategory === 'ALL' || targetCategory === 'IMAGE' || targetCategory === 'DOCUMENT') {
+        const finBulkSql = isManager
+          ? `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`
+          : `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE user_id = ? AND created_by_user_id = ? AND receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`;
         const [finRows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, receipt_file_url, created_at FROM financial_transactions WHERE receipt_file_url IS NOT NULL AND receipt_file_url != '' FOR UPDATE`
+          finBulkSql,
+          isManager ? [] : [actorId, actorId]
         );
         for (const r of finRows) {
           const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -8064,8 +8324,12 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
       }
 
       if (targetCategory === 'ALL' || targetCategory === 'DOCUMENT') {
+        const histBulkSql = isManager
+          ? `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`
+          : `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE user_id = ? AND created_by_user_id = ? AND excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`;
         const [histRows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, excel_file_url, created_at FROM historical_work_records WHERE excel_file_url IS NOT NULL AND excel_file_url != '' FOR UPDATE`
+          histBulkSql,
+          isManager ? [] : [actorId, actorId]
         );
         for (const r of histRows) {
           const createdMs = r.created_at ? new Date(r.created_at).getTime() : 0;
@@ -8092,6 +8356,7 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
 
     let deletedCount = 0;
     let freedBytes = 0;
+    let forbiddenAttempts = 0;
 
     for (const target of targets) {
       const sourceType = String(target.source_type || '').toUpperCase() as MediaSourceType;
@@ -8102,10 +8367,18 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
 
       if (sourceType === 'CORRESPONDENCE_AUDIO' && recordId) {
         const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, message_text, audio_url FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          `SELECT id, sender_user_id, receiver_user_id, message_text, audio_url FROM work_correspondences WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (
+            !isManager &&
+            Number(rows[0].sender_user_id) !== actorId &&
+            Number(rows[0].receiver_user_id) !== actorId
+          ) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           const currentMsg = String(rows[0].message_text || '').trim();
           const updatedMsg =
             !currentMsg || currentMsg === 'پیام صوتی جدید'
@@ -8115,15 +8388,25 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
             `UPDATE work_correspondences SET audio_url = NULL, audio_duration_seconds = NULL, message_text = ? WHERE id = ?`,
             [updatedMsg, recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].audio_url || fileUrl);
+          if (rows[0].audio_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].audio_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === 'CORRESPONDENCE_ATTACHMENT' && recordId) {
         const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, message_text, attachments_json FROM work_correspondences WHERE id = ? FOR UPDATE`,
+          `SELECT id, sender_user_id, receiver_user_id, message_text, attachments_json FROM work_correspondences WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (
+            !isManager &&
+            Number(rows[0].sender_user_id) !== actorId &&
+            Number(rows[0].receiver_user_id) !== actorId
+          ) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           let parsedAtts: CorrespondenceAttachment[] = [];
           try {
             parsedAtts =
@@ -8133,9 +8416,11 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
           } catch {
             parsedAtts = [];
           }
-          const remaining = Array.isArray(parsedAtts)
-            ? parsedAtts.filter((a) => String(a?.file_url || '').trim() !== fileUrl)
-            : [];
+          const matchedAtt = Array.isArray(parsedAtts)
+            ? parsedAtts.find((a) => String(a?.file_url || '').trim() === fileUrl)
+            : undefined;
+          if (!matchedAtt) continue;
+          const remaining = parsedAtts.filter((a) => String(a?.file_url || '').trim() !== fileUrl);
           const currentMsg = String(rows[0].message_text || '').trim();
           const updatedMsg =
             !currentMsg || currentMsg === 'فایل پیوست جدید'
@@ -8145,52 +8430,100 @@ apiRouter.post('/media/cleanup', requireAuth, async (req: AuthenticatedRequest, 
             `UPDATE work_correspondences SET attachments_json = ?, message_text = ? WHERE id = ?`,
             [remaining.length > 0 ? JSON.stringify(remaining) : null, updatedMsg, recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(fileUrl);
+          freedBytes += unlinkMediaUrlFromDisk(matchedAtt.file_url);
           deletedCount += 1;
         }
       } else if (sourceType === 'REPORT_PHOTO' && recordId) {
         const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, report_image_url FROM daily_work_reports WHERE id = ? FOR UPDATE`,
+          `SELECT id, user_id, photo_url FROM daily_work_reports WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (!isManager && Number(rows[0].user_id) !== actorId) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           await conn.execute(
-            `UPDATE daily_work_reports SET report_image_url = NULL WHERE id = ?`,
+            `UPDATE daily_work_reports SET photo_url = NULL, photo_name = NULL WHERE id = ?`,
             [recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].report_image_url || fileUrl);
+          if (rows[0].photo_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].photo_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === 'FINANCE_RECEIPT' && recordId) {
         const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, receipt_file_url FROM financial_transactions WHERE id = ? FOR UPDATE`,
+          `SELECT id, user_id, created_by_user_id, receipt_file_url FROM financial_transactions WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (
+            !isManager &&
+            (Number(rows[0].user_id) !== actorId || Number(rows[0].created_by_user_id) !== actorId)
+          ) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           await conn.execute(
             `UPDATE financial_transactions SET receipt_file_url = NULL, receipt_file_name = NULL WHERE id = ?`,
             [recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].receipt_file_url || fileUrl);
+          if (rows[0].receipt_file_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].receipt_file_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === 'HISTORICAL_EXCEL' && recordId) {
         const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-          `SELECT id, excel_file_url FROM historical_work_records WHERE id = ? FOR UPDATE`,
+          `SELECT id, user_id, created_by_user_id, excel_file_url FROM historical_work_records WHERE id = ? FOR UPDATE`,
           [recordId]
         );
         if (rows.length > 0) {
+          if (
+            !isManager &&
+            (Number(rows[0].user_id) !== actorId || Number(rows[0].created_by_user_id) !== actorId)
+          ) {
+            forbiddenAttempts += 1;
+            continue;
+          }
           await conn.execute(
             `UPDATE historical_work_records SET excel_file_url = NULL, excel_file_name = NULL WHERE id = ?`,
             [recordId]
           );
-          freedBytes += unlinkMediaUrlFromDisk(rows[0].excel_file_url || fileUrl);
+          if (rows[0].excel_file_url) {
+            freedBytes += unlinkMediaUrlFromDisk(String(rows[0].excel_file_url));
+          }
           deletedCount += 1;
         }
       } else if (sourceType === 'ORPHAN_FILE') {
+        if (!isManager) {
+          forbiddenAttempts += 1;
+          continue;
+        }
+        const match = fileUrl.match(/^\/assets\/media\/([a-z0-9_-]+)\/([^/\\]+)$/i);
+        if (!match || !ALLOWED_ORPHAN_CLEANUP_FOLDERS.has(match[1])) {
+          forbiddenAttempts += 1;
+          continue;
+        }
+        const stillReferenced = await isMediaUrlReferencedInDb(conn, fileUrl);
+        if (stillReferenced) {
+          forbiddenAttempts += 1;
+          continue;
+        }
         freedBytes += unlinkMediaUrlFromDisk(fileUrl);
         deletedCount += 1;
       }
+    }
+
+    if (deletedCount === 0 && forbiddenAttempts > 0) {
+      await conn.rollback();
+      res.status(403).json({
+        ok: false,
+        code: 'FORBIDDEN',
+        message: 'شما مجوز حذف این فایل‌ها را ندارید.',
+      });
+      return;
     }
 
     await recordAuditLog({

@@ -3,6 +3,7 @@ import { SystemSettings, UserProfile } from './shared/types';
 import {
   AUTH_EXPIRED_EVENT,
   CONNECTION_RESTORED_EVENT,
+  PASSWORD_CHANGE_REQUIRED_EVENT,
   apiRequest,
   setStoredToken,
 } from './services/api';
@@ -21,6 +22,7 @@ import { BrandLogo, updateAppNotificationBadge } from './components/BrandLogo';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { TopShamsiCalendarBar } from './components/TopShamsiCalendarBar';
 import { ForgotPasswordModal } from './components/ForgotPasswordModal';
+import { PasswordModal } from './components/PasswordModal';
 import { Footer } from './components/Footer';
 import { WorkerPanel } from './components/WorkerPanel';
 import { ManagerPanel } from './components/ManagerPanel';
@@ -58,6 +60,7 @@ export default function App() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [storedBio, setStoredBio] = useState<StoredBiometricInfo | null>(null);
   const [isForgotOpen, setIsForgotOpen] = useState(false);
+  const [passwordChangeRequired, setPasswordChangeRequired] = useState(false);
 
   useEffect(() => {
     setStoredBio(getStoredBiometricInfo());
@@ -141,17 +144,23 @@ export default function App() {
     const handleAuthExpired = () => {
       setStoredToken(null);
       setUser(null);
+      setPasswordChangeRequired(false);
       setAppCurrentlyLocked(false);
       setIsLocked(false);
       updateAppNotificationBadge(0);
+    };
+    const handlePasswordChangeRequired = () => {
+      setPasswordChangeRequired(true);
     };
     const handleConnectionRestored = () => {
       setConnectionError(null);
     };
     window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    window.addEventListener(PASSWORD_CHANGE_REQUIRED_EVENT, handlePasswordChangeRequired);
     window.addEventListener(CONNECTION_RESTORED_EVENT, handleConnectionRestored);
     return () => {
       window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+      window.removeEventListener(PASSWORD_CHANGE_REQUIRED_EVENT, handlePasswordChangeRequired);
       window.removeEventListener(CONNECTION_RESTORED_EVENT, handleConnectionRestored);
     };
   }, []);
@@ -193,12 +202,14 @@ export default function App() {
           const meRes = await apiRequest<{
             ok: boolean;
             user: UserProfile;
+            passwordChangeRequired?: boolean;
             serverTime: { shamsiDate: string };
             settings?: SystemSettings;
           }>('/api/auth/me');
 
           if (mounted) {
             setUser(meRes.user);
+            setPasswordChangeRequired(Boolean(meRes.passwordChangeRequired));
             if (meRes.serverTime?.shamsiDate) {
               setServerShamsiDate(meRes.serverTime.shamsiDate);
             }
@@ -251,6 +262,7 @@ export default function App() {
       const res = await apiRequest<{
         ok: boolean;
         token: string;
+        passwordChangeRequired?: boolean;
         user: UserProfile;
       }>('/api/auth/login', {
         method: 'POST',
@@ -270,6 +282,7 @@ export default function App() {
       setAppCurrentlyLocked(false);
       setIsLocked(false);
       lastActivityRef.current = Date.now();
+      setPasswordChangeRequired(Boolean(res.passwordChangeRequired));
       setUser(res.user);
       setPassword('');
       setShowPassword(false);
@@ -305,6 +318,7 @@ export default function App() {
     } finally {
       setStoredToken(null);
       setUser(null);
+      setPasswordChangeRequired(false);
       setAppCurrentlyLocked(false);
       setIsLocked(false);
       updateAppNotificationBadge(0);
@@ -576,6 +590,17 @@ export default function App() {
               }}
             />
           </div>
+        ) : passwordChangeRequired ? (
+          <PasswordModal
+            isOpen={true}
+            forced={true}
+            onClose={() => {}}
+            onLogout={handleLogout}
+            onSuccess={() => {
+              setPasswordChangeRequired(false);
+              setUser((prev) => (prev ? { ...prev, must_change_password: false } : prev));
+            }}
+          />
         ) : user.role === 'manager' ? (
           <ManagerPanel
             user={user}

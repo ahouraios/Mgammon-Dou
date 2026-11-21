@@ -523,6 +523,9 @@ export function isProductionMode(env: NodeJS.ProcessEnv = process.env): boolean 
   if (env.NODE_ENV === 'development' || env.NODE_ENV === 'test') return false;
   if (env.PASSENGER_APP_ENV === 'production') return true;
   if (env.VITEST === 'true') return false;
+  if (isUsingProcessEnv(env) && (isBundledAppCjs() || env.CPANEL_ENV === 'true')) {
+    return true;
+  }
   return false;
 }
 

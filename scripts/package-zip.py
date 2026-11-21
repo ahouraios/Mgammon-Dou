@@ -11,12 +11,15 @@ OUTPUT_ZIP_PATH = os.path.join(ROOT_DIR, OUTPUT_ZIP_NAME)
 INCLUDE_ITEMS = [
     "app.cjs",
     "package.json",
-    "package-lock.json",
     ".env.example",
     "DEPLOYMENT_CPANEL.md",
     "dist",
     "public",
     "database/schema.sql",
+]
+
+OPTIONAL_ITEMS = [
+    "package-lock.json",
 ]
 
 def is_forbidden(rel_path):
@@ -28,7 +31,7 @@ def is_forbidden(rel_path):
     for p in parts:
         if p.startswith(".env") and p != ".env.example":
             return True
-        if p in [".data", "node_modules", "tests", ".git", "coverage", ".DS_Store", "__pycache__", "scripts"]:
+        if p in [".data", "node_modules", "tests", ".git", "coverage", ".DS_Store", "__pycache__", "scripts", "aistudio"]:
             return True
         if p.endswith(".log"):
             return True
@@ -44,8 +47,13 @@ def create_package():
 
     added_files = []
 
+    items_to_pack = list(INCLUDE_ITEMS)
+    for opt in OPTIONAL_ITEMS:
+        if os.path.exists(os.path.join(ROOT_DIR, opt)):
+            items_to_pack.append(opt)
+
     with zipfile.ZipFile(OUTPUT_ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item in INCLUDE_ITEMS:
+        for item in items_to_pack:
             full_path = os.path.join(ROOT_DIR, item)
             if not os.path.exists(full_path):
                 raise FileNotFoundError(f"Required item missing for release package: {item}")

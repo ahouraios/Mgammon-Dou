@@ -297,7 +297,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const [serverShamsiDate, setServerShamsiDate] = useState<string>(initialShamsiDate);
   const [serverTimeHHMM, setServerTimeHHMM] = useState<string>('');
   const [bannerBgUrl, setBannerBgUrl] = useState<string | null>(
-    initialBannerBgUrl || '/assets/media/banner-bg.svg'
+    initialBannerBgUrl || '/assets/media/banner-bg.webp'
   );
   const [unreadMessagesCount, setUnreadMessagesCount] = useState(0);
   const [latestUnreadMessage, setLatestUnreadMessage] = useState<LatestUnreadMessageInfo | null>(

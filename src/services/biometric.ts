@@ -1,4 +1,4 @@
-import { apiRequest, setStoredToken } from './api';
+import { apiRequest, PASSWORD_CHANGE_REQUIRED_EVENT, setStoredToken } from './api';
 import { UserProfile } from '../shared/types';
 
 const BIOMETRIC_STORAGE_KEY = 'mgammon_biometric_cred_v1';
@@ -168,6 +168,7 @@ export async function authenticateWithDeviceBiometric(): Promise<UserProfile> {
   const res = await apiRequest<{
     ok: boolean;
     token: string;
+    passwordChangeRequired?: boolean;
     user: UserProfile;
   }>('/api/auth/biometric/login', {
     method: 'POST',
@@ -179,6 +180,9 @@ export async function authenticateWithDeviceBiometric(): Promise<UserProfile> {
   });
 
   setStoredToken(res.token);
+  if (res.passwordChangeRequired && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(PASSWORD_CHANGE_REQUIRED_EVENT));
+  }
   return res.user;
 }
 

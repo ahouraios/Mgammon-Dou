@@ -18,6 +18,7 @@ import { UserProfile } from '../shared/types';
 import { apiRequest, withAuthTokenUrl } from '../services/api';
 import {
   AppLockConfig,
+  clearStoredBiometricInfo,
   disableDeviceBiometric,
   getAppLockConfig,
   getStoredBiometricInfo,
@@ -218,6 +219,8 @@ export const AccountSettingsPanel: React.FC<AccountSettingsPanelProps> = ({
         method: 'POST',
         body: JSON.stringify({ currentPassword, newPassword }),
       });
+      clearStoredBiometricInfo();
+      setBioEnabled(false);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');

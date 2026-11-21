@@ -18,8 +18,11 @@ export const BACKUP_TABLES_ORDERED = [
   'work_correspondences',
   'leave_requests',
   'work_tasks',
+  'user_reminders',
   'audit_logs',
 ] as const;
+
+const OPTIONAL_LEGACY_BACKUP_TABLES = new Set<string>(['user_reminders']);
 
 export const PRIVATE_MEDIA_SUBFOLDERS = [
   'avatars',
@@ -366,6 +369,9 @@ export function verifyBackupArchive(backupFilePath: string): {
 
     for (const tbl of BACKUP_TABLES_ORDERED) {
       if (!Array.isArray(tables[tbl])) {
+        if (OPTIONAL_LEGACY_BACKUP_TABLES.has(tbl) && manifest.tableCounts[tbl] === undefined) {
+          continue;
+        }
         return { valid: false, reason: `جدول اجباری ${tbl} در نسخه پشتیبان وجود ندارد.` };
       }
       if (tables[tbl].length !== manifest.tableCounts[tbl]) {

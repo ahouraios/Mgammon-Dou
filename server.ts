@@ -13,7 +13,8 @@ import {
   validateProductionSecurityConfig,
   waitForPendingDatabaseInit,
 } from './src/server/db';
-import { getSessionUser, requireCsrfProtection } from './src/server/auth';
+import { getAppConfig } from './src/server/config';
+import { createApiRateLimiter, getSessionUser, requireCsrfProtection } from './src/server/auth';
 import { apiRouter } from './src/server/routes';
 
 const PRIVATE_MEDIA_FOLDERS = new Set([
@@ -46,7 +47,17 @@ export async function createApp() {
 
   // مسدودسازی کامل دسترسی وب به مسیرهای مخفی، پشتیبان‌ها و اسکریپت‌های دیتابیس
   app.use((req, res, next) => {
-    const cleanPath = decodeURIComponent(req.path || '').toLowerCase();
+    let cleanPath = '';
+    try {
+      cleanPath = decodeURIComponent(req.path || '').toLowerCase();
+    } catch {
+      res.status(400).json({
+        ok: false,
+        code: 'BAD_REQUEST',
+        message: 'نشانی درخواست معتبر نیست.',
+      });
+      return;
+    }
     if (
       cleanPath.startsWith('/.data') ||
       cleanPath.startsWith('/backups') ||
@@ -103,8 +114,14 @@ export async function createApp() {
     next();
   });
 
-  // محافظت CSRF روی مسیرهای تغییردهنده API
-  app.use('/api', requireCsrfProtection, apiRouter);
+  // محدودکننده نرخ درخواست عمومی API در برابر حملات Flood/DoS
+  const apiRateLimiter = createApiRateLimiter({
+    windowMs: 60 * 1000,
+    maxRequests: process.env.VITEST === 'true' ? 10000 : 300,
+  });
+
+  // محافظت نرخ درخواست و CSRF روی مسیرهای API
+  app.use('/api', apiRateLimiter, requireCsrfProtection, apiRouter);
 
   // محافظت از فایل‌ها و پیوست‌های خصوصی پیش از express.static
   app.get('/assets/media/:folder/:filename', async (req, res) => {
@@ -176,10 +193,23 @@ export async function createApp() {
           authorized = rows.length > 0;
         } else if (folder === 'attachments') {
           const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-            'SELECT id FROM work_correspondences WHERE attachments_json LIKE ? AND (sender_user_id = ? OR receiver_user_id = ?) LIMIT 1',
-            [`%${filename}%`, uid, uid]
+            'SELECT attachments_json FROM work_correspondences WHERE attachments_json IS NOT NULL AND (sender_user_id = ? OR receiver_user_id = ?)',
+            [uid, uid]
           );
-          authorized = rows.length > 0;
+          authorized = rows.some((r) => {
+            try {
+              const parsed =
+                typeof r.attachments_json === 'string'
+                  ? JSON.parse(r.attachments_json)
+                  : r.attachments_json;
+              return (
+                Array.isArray(parsed) &&
+                parsed.some((att) => String(att?.file_url || '').trim() === fileUrl)
+              );
+            } catch {
+              return false;
+            }
+          });
         } else if (folder === 'avatars') {
           const [rows] = await pool.execute<mysql.RowDataPacket[]>(
             'SELECT id FROM users WHERE avatar_url = ? LIMIT 1',
@@ -202,12 +232,14 @@ export async function createApp() {
         ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
         : privateBaseDir;
 
+      const privateFolderRoot = path.resolve(activePrivateBase, folder) + path.sep;
+      const legacyFolderRoot = path.resolve(legacyPublicMediaDir, folder) + path.sep;
       const candidatePrivate = path.resolve(activePrivateBase, folder, filename);
       const candidateLegacy = path.resolve(legacyPublicMediaDir, folder, filename);
 
       if (
-        !candidatePrivate.startsWith(path.resolve(activePrivateBase, folder)) ||
-        !candidateLegacy.startsWith(path.resolve(legacyPublicMediaDir, folder))
+        !candidatePrivate.startsWith(privateFolderRoot) ||
+        !candidateLegacy.startsWith(legacyFolderRoot)
       ) {
         res.status(400).json({ ok: false, message: 'مسیر فایل نامعتبر است.' });
         return;
@@ -268,12 +300,8 @@ export async function startServer() {
     });
 
   const app = await createApp();
-  const PORT = Number(process.env.PORT || 3000);
-
-  const isBundledRuntime =
-    (typeof __filename === 'string' && path.basename(__filename) === 'app.cjs') ||
-    (process.argv[1] ? path.basename(process.argv[1]) === 'app.cjs' : false);
-  const isProductionMode = process.env.NODE_ENV === 'production' || isBundledRuntime;
+  const appCfg = getAppConfig();
+  const isProductionMode = appCfg.isProduction || appCfg.isBundled;
 
   if (!isProductionMode) {
     const { createServer: createViteServer } = await import('vite');
@@ -302,9 +330,13 @@ export async function startServer() {
     });
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${PORT}`);
-  });
+  const server = appCfg.isSocketOrPipe
+    ? app.listen(appCfg.listenTarget, () => {
+        console.log(`[MGAMMON Duo] Server running on socket/pipe ${appCfg.listenTarget}`);
+      })
+    : app.listen(Number(appCfg.listenTarget), '0.0.0.0', () => {
+        console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${appCfg.listenTarget}`);
+      });
 
   return server;
 }

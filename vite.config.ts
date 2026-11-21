@@ -50,7 +50,7 @@ export default defineConfig(() => {
           clientsClaim: true,
           cleanupOutdatedCaches: true,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
-          navigateFallbackDenylist: [/^\/api\//],
+          navigateFallbackDenylist: [/^\/api\//, /^\/assets\/media\//],
           importScripts: ['/sw-notifications.js'],
         },
         devOptions: {

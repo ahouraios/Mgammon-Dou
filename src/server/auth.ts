@@ -55,10 +55,30 @@ export async function createServerSession(
   return { rawToken, csrfToken, expiresAt };
 }
 
-export function setSessionCookie(res: Response, rawToken: string, expiresAt: Date): string {
+export function safeEqualStrings(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function isRequestHttps(res: Response): boolean {
   const cfg = getAppConfig();
-  const isSecure =
-    cfg.isProduction || Boolean(cfg.appUrl?.startsWith('https://'));
+  const req = res.req;
+  const forwardedProto = String(req?.headers?.['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  return Boolean(
+    cfg.isProduction ||
+      cfg.appUrl?.startsWith('https://') ||
+      req?.secure ||
+      forwardedProto === 'https'
+  );
+}
+
+export function setSessionCookie(res: Response, rawToken: string, expiresAt: Date): string {
+  const isSecure = isRequestHttps(res);
   const csrfToken = generateCsrfToken(rawToken);
 
   res.cookie(SESSION_COOKIE_NAME, rawToken, {
@@ -82,9 +102,7 @@ export function setSessionCookie(res: Response, rawToken: string, expiresAt: Dat
 }
 
 export function clearSessionCookie(res: Response): void {
-  const cfg = getAppConfig();
-  const isSecure =
-    cfg.isProduction || Boolean(cfg.appUrl?.startsWith('https://'));
+  const isSecure = isRequestHttps(res);
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     secure: isSecure,
@@ -97,6 +115,49 @@ export function clearSessionCookie(res: Response): void {
     sameSite: 'lax',
     path: '/',
   });
+}
+
+export function createApiRateLimiter(options: {
+  windowMs: number;
+  maxRequests: number;
+  message?: string;
+}) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const windowMs = Math.max(1000, options.windowMs);
+  const maxRequests = Math.max(1, options.maxRequests);
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const now = Date.now();
+    const ip = String(req.ip || req.socket?.remoteAddress || 'unknown');
+    const existing = hits.get(ip);
+
+    if (!existing || now > existing.resetAt) {
+      if (hits.size > 5000) {
+        for (const [k, v] of hits.entries()) {
+          if (now > v.resetAt) hits.delete(k);
+        }
+      }
+      hits.set(ip, { count: 1, resetAt: now + windowMs });
+      next();
+      return;
+    }
+
+    existing.count += 1;
+    if (existing.count > maxRequests) {
+      const retryAfterSec = Math.max(1, Math.ceil((existing.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      res.status(429).json({
+        ok: false,
+        code: 'RATE_LIMITED',
+        message:
+          options.message ||
+          'تعداد درخواست‌های شما بیش از حد مجاز است. لطفاً چند لحظه بعد مجدداً تلاش کنید.',
+      });
+      return;
+    }
+
+    next();
+  };
 }
 
 // ============================================================================
@@ -267,14 +328,10 @@ export async function getSessionUser(
   const cookieToken = req.cookies?.[SESSION_COOKIE_NAME]
     ? String(req.cookies[SESSION_COOKIE_NAME]).trim()
     : null;
-  const queryToken =
-    req.method === 'GET' && typeof req.query?.token === 'string'
-      ? req.query.token.trim()
-      : null;
 
   const candidateTokens = Array.from(
     new Set(
-      [bearerToken, cookieToken, queryToken].filter(
+      [bearerToken, cookieToken].filter(
         (t): t is string => Boolean(t && typeof t === 'string' && t.length >= 32)
       )
     )
@@ -353,7 +410,7 @@ export async function requireAuth(
     }
 
     const enforceInitialPassChange =
-      process.env.ENFORCE_PASSWORD_CHANGE === 'true' ||
+      getAppConfig().enforcePasswordChange ||
       req.headers['x-enforce-password-change'] === '1';
 
     const allowedDuringPassChange = ['/auth/change-password', '/auth/logout', '/auth/me'];
