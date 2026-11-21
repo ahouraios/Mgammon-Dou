@@ -1707,7 +1707,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                         </h3>
                       </div>
                       <span className="text-[10px] text-slate-500 tabular-nums">
-                        {toPersianDigits(workerKpis.totalWorkDays)} روز کاری ثبت‌شده
+                        روزشمار · {toPersianDigits(workerKpis.totalWorkDays)} روز کاری ثبت‌شده
                       </span>
                     </div>
 

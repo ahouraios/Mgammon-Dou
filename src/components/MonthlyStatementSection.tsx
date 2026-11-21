@@ -178,12 +178,15 @@ export function MonthlyStatementSection({
                   : 'صورتحساب ماهانه پرسنل (۱۵ام به ۱۵ام) — حقوق + اضافه‌کاری و پرداختی مدیر'}
               </h3>
               <span className="px-2 py-0.5 rounded-md bg-[#FCF9F2] border border-[#C5A059]/50 text-[10px] font-bold text-[#9A7428]">
-                ماه کاری {toPersianDigits(STANDARD_MONTHLY_WORK_DAYS)} روزه
+                محاسبه روزشمار (مبنای {toPersianDigits(STANDARD_MONTHLY_WORK_DAYS)} روز)
               </span>
             </div>
             <p className="text-[10.5px] text-slate-500 mt-0.5 leading-5">
-              محاسبه ماهانه (از ۱۵ام هر ماه تا ۱۵ام ماه بعد) شامل پایه حقوق کامل ماهانه + اضافه‌کاری ثبت‌شده در همان ماه و جمع کل{' '}
-              {role === 'worker' ? 'دریافتی شما' : 'پرداختی مدیر'}
+              محاسبه روزشمار بر اساس کارکرد واقعی ثبت‌شده از تاریخ شروع قرارداد (
+              {toPersianDigits(
+                collaborationStartShamsi || effectiveSettings.collaboration_start_shamsi || '1405/06/15'
+              )}
+              ) به بعد + اضافه‌کاری و کسر مجموع {role === 'worker' ? 'دریافتی شما' : 'پرداختی مدیر'}
             </p>
           </div>
         </div>
@@ -308,7 +311,7 @@ export function MonthlyStatementSection({
               <span>جمع حقوق + اضافه‌کاری این ماه</span>
             </span>
             <span className="text-[9.5px] px-1.5 py-0.5 rounded bg-[#0B192C] text-[#C5A059] font-bold tabular-nums">
-              ماهانه
+              روزشمار
             </span>
           </div>
 
@@ -316,11 +319,11 @@ export function MonthlyStatementSection({
             {formatToman(activeStatement.salaryPlusOvertimeToman)}
           </div>
 
-          {/* ریز جزئیات حقوق ماهانه و اضافه‌کاری در داخل کارت */}
+          {/* ریز جزئیات حقوق روزشمار و اضافه‌کاری در داخل کارت */}
           <div className="pt-2 border-t border-[#C5A059]/35 space-y-1 text-[10.5px] tabular-nums">
             <div className="flex items-center justify-between text-slate-700">
               <span>
-                ۱. حقوق ماهانه (ماه کاری {toPersianDigits(STANDARD_MONTHLY_WORK_DAYS)} روزه):
+                ۱. حقوق کارکرد روزشمار ({toPersianDigits(activeStatement.workDaysCount)} روز کارکرد):
               </span>
               <strong className="text-[#0B192C]">
                 {formatToman(activeStatement.earnedRegularSalaryToman)}
@@ -624,7 +627,7 @@ export function MonthlyStatementSection({
             <thead>
               <tr className="border-b border-slate-200 text-slate-600">
                 <th className="py-1.5 px-2">ماه کاری (۱۵ام به ۱۵ام)</th>
-                <th className="py-1.5 px-2">حقوق ماهانه</th>
+                <th className="py-1.5 px-2">حقوق کارکرد روزشمار</th>
                 <th className="py-1.5 px-2">ساعت و مبلغ اضافه‌کاری</th>
                 <th className="py-1.5 px-2 text-[#0B192C] font-extrabold">
                   جمع حقوق + اضافه‌کاری ماه

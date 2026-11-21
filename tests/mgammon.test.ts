@@ -2172,6 +2172,16 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
           excel_file_name: null,
           parsed_rows: [
             {
+              shamsi_date: '1405/06/10',
+              title: 'روز پیش از شروع قرارداد (نباید لحاظ شود)',
+              work_days_count: 1,
+              check_in: '07:00',
+              check_out: '15:00',
+              net_work_minutes: 8 * 60,
+              overtime_minutes: 0,
+              note: 'پیش از تاریخ شروع قرارداد',
+            },
+            {
               shamsi_date: '1405/06/20',
               title: 'کارکرد ماه اول',
               work_days_count: 1,
@@ -2230,9 +2240,11 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(cycle1).toBeDefined();
     expect(cycle2).toBeDefined();
 
-    // هر دو ماه فعال، حقوق کامل ۲۵,۰۰۰,۰۰۰ تومان می‌گیرند (نه روزشمار)
-    expect(cycle1.earnedRegularSalaryToman).toBe(25000000);
-    expect(cycle2.earnedRegularSalaryToman).toBe(25000000);
+    // محاسبه روزشمار بر اساس کارکرد واقعی از تاریخ شروع قرارداد (۱۴۰۵/۰۶/۱۵) به بعد — روز ۱۴۰۵/۰۶/۱۰ لحاظ نمی‌شود
+    const expectedHourlyRate = Math.round(25000000 / 208);
+    expect(cycle1.earnedRegularSalaryToman).toBe(Math.round(224 * expectedHourlyRate));
+    expect(cycle2.earnedRegularSalaryToman).toBe(Math.round(112 * expectedHourlyRate));
+    expect(cycle1.dayDetails.some((d) => d.shamsiDate === '1405/06/10')).toBe(false);
 
     // پرداخت ۴۰ میلیون در ۱۴۰۵/۰۷/۱۵ فقط در ماه اول (۱۵ شهریور تا ۱۵ مهر) لحاظ می‌شود و در ماه دوم تکرار نمی‌شود
     expect(cycle1.approvedTotalPaidOrReceivedToman).toBe(40000000);
@@ -2240,7 +2252,7 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
 
     // مانده ماه اول و ماه دوم هر دو مثبت (بستانکار) هستند و پرسنل بدهکار نمی‌شود
     expect(cycle1.periodBalanceToman).toBeGreaterThan(2800000);
-    expect(cycle2.periodBalanceToman).toBeGreaterThan(34000000);
+    expect(cycle2.periodBalanceToman).toBeGreaterThan(20000000);
   });
 });
 

@@ -1416,6 +1416,12 @@ export function calculatePeriodStatement(params: {
   const effectiveCollabStart =
     collabStartShamsi || settings.collaboration_start_shamsi || '1405/06/15';
 
+  const normCollabStart = isValidShamsiDate(effectiveCollabStart)
+    ? normalizeShamsiDate(effectiveCollabStart)
+    : '1405/06/15';
+  const effectiveStartDate =
+    normFrom && normFrom < normCollabStart ? normCollabStart : normFrom;
+
   const [periodStartYear, periodStartMonth] = (normFrom || '1405/08/15')
     .split('/')
     .map(Number);
@@ -1443,7 +1449,7 @@ export function calculatePeriodStatement(params: {
       ? normalizeShamsiDate(day.shamsi_date)
       : day.shamsi_date;
 
-    if (normDate < normFrom || normDate > normTo) {
+    if (normDate < effectiveStartDate || normDate > normTo) {
       continue;
     }
 
@@ -1520,7 +1526,7 @@ export function calculatePeriodStatement(params: {
       for (const row of rec.parsed_rows) {
         if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
         const normRowDate = normalizeShamsiDate(row.shamsi_date);
-        if (normRowDate < normFrom || normRowDate > normTo) continue;
+        if (normRowDate < effectiveStartDate || normRowDate > normTo) continue;
         if (coveredDates.has(normRowDate)) continue;
         coveredDates.add(normRowDate);
         activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normRowDate, 15));
@@ -1533,10 +1539,16 @@ export function calculatePeriodStatement(params: {
           snapshots
         );
         const rowRates = calculateSalaryAndOvertimeRates(effRowSettings, rowOtMins);
-        const rowRegPay = Math.round((rowRegMins / 60) * rowRates.effectiveHourlyRateToman);
+        const rowDaysCount = Number(row.work_days_count || 1);
+        const rowRegPay =
+          rowRegMins > 0
+            ? Math.round((rowRegMins / 60) * rowRates.effectiveHourlyRateToman)
+            : rowDaysCount > 0
+              ? Math.round(rowDaysCount * rowRates.dailyBaseRateToman)
+              : 0;
         const rowOtPay = rowRates.totalOvertimePayToman;
 
-        workDaysCount += Number(row.work_days_count || 1);
+        workDaysCount += rowDaysCount;
         regularWorkMinutes += rowRegMins;
         overtimeMinutes += rowOtMins;
         totalNetWorkMinutes += rowRegMins;
@@ -1556,14 +1568,14 @@ export function calculatePeriodStatement(params: {
           lastOutTime: row.check_out || null,
           statusLabel: row.note || row.title || rec.title || 'سابقه کارکرد',
           isHistorical: true,
-          workDaysCount: Number(row.work_days_count || 1),
+          workDaysCount: rowDaysCount,
         });
       }
     } else {
       const normRecDate = isValidShamsiDate(rec.shamsi_date)
         ? normalizeShamsiDate(rec.shamsi_date)
         : rec.shamsi_date;
-      if (!normRecDate || normRecDate < normFrom || normRecDate > normTo) continue;
+      if (!normRecDate || normRecDate < effectiveStartDate || normRecDate > normTo) continue;
       if (rec.work_days_count === 1 && coveredDates.has(normRecDate)) continue;
       if (rec.work_days_count === 1) coveredDates.add(normRecDate);
       activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normRecDate, 15));
@@ -1576,10 +1588,16 @@ export function calculatePeriodStatement(params: {
         snapshots
       );
       const recRates = calculateSalaryAndOvertimeRates(effRecSettings, recOtMins);
-      const recRegPay = Math.round((recRegMins / 60) * recRates.effectiveHourlyRateToman);
+      const recDaysCount = Number(rec.work_days_count || 1);
+      const recRegPay =
+        recRegMins > 0
+          ? Math.round((recRegMins / 60) * recRates.effectiveHourlyRateToman)
+          : recDaysCount > 0
+            ? Math.round(recDaysCount * recRates.dailyBaseRateToman)
+            : 0;
       const recOtPay = recRates.totalOvertimePayToman;
 
-      workDaysCount += Number(rec.work_days_count || 1);
+      workDaysCount += recDaysCount;
       regularWorkMinutes += recRegMins;
       overtimeMinutes += recOtMins;
       totalNetWorkMinutes += recRegMins;
@@ -1599,28 +1617,19 @@ export function calculatePeriodStatement(params: {
         lastOutTime: null,
         statusLabel: rec.title || rec.note || 'سابقه کارکرد تجمیعی',
         isHistorical: true,
-        workDaysCount: Number(rec.work_days_count || 1),
+        workDaysCount: recDaysCount,
       });
     }
   }
 
   dayDetails.sort((a, b) => b.shamsiDate.localeCompare(a.shamsiDate));
 
-  // اگر حقوق پایه ماهانه تنظیم شده باشد و نرخ ساعتی دستی جداگانه وارد نشده باشد،
-  // محاسبه حقوق به صورت ماهانه (مبلغ کامل حقوق پایه ماهانه برای هر دوره ماهانه فعال) انجام می‌شود.
-  const isMonthlyFixedSalaryMode =
-    refRates.baseSalaryToman > 0 &&
-    (!refSettings.hourly_rate_toman || refSettings.hourly_rate_toman <= 0);
-
-  let earnedRegularSalaryToman = 0;
-  if (workDaysCount > 0) {
-    if (isMonthlyFixedSalaryMode) {
-      const cyclesCount = Math.max(1, activeMonthlyCycles.size);
-      earnedRegularSalaryToman = refRates.baseSalaryToman * cyclesCount;
-    } else {
-      earnedRegularSalaryToman = hourlyAccumRegularSalaryToman;
-    }
-  }
+  // محاسبه حقوق عادی به صورت روزشمار (منحصراً بر اساس کارکرد واقعی ثبت‌شده از تاریخ شروع قرارداد به بعد)
+  // از اعطای یکجای حقوق کل ماه پیش از انجام کار یا محاسبه روزهای پیش از شروع قرارداد جلوگیری می‌شود.
+  const earnedRegularSalaryToman =
+    workDaysCount > 0 || hourlyAccumRegularSalaryToman > 0
+      ? hourlyAccumRegularSalaryToman
+      : 0;
 
   // ۱. تراکنش‌های یکجا (LUMP_SUM) و تنخواه ثبت‌شده در این بازه زمانی
   const directPeriodTransactions = transactions.filter((tx) => {

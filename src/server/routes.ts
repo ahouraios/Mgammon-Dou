@@ -1797,6 +1797,12 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       byDate.set(log.work_date, list);
     }
 
+    const rawCollabStart =
+      settings.collaboration_start_shamsi || workerInfo.collaboration_start_shamsi || '1405/06/15';
+    const normCollabStart = isValidShamsiDate(rawCollabStart)
+      ? normalizeShamsiDate(rawCollabStart)
+      : '1405/06/15';
+
     let totalConfirmedNetWorkMinutes = 0;
     let totalConfirmedOvertimeMinutes = 0;
     let totalRecordedWorkDays = 0;
@@ -1804,11 +1810,13 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
     let earnedOvertimeToman = 0;
     let totalLateAndAbsenceDeductionToman = 0;
     const confirmedAttendanceShamsiDates = new Set<string>();
-    const activeMonthlyCycles = new Set<string>();
     const recentLateDecisions: DailyAttendanceSummary[] = [];
 
     for (const [workDate, dayLogs] of byDate.entries()) {
       const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
+      if (shamsiDate < normCollabStart) {
+        continue;
+      }
       const effectiveSettings = await getSystemSettingsFromDb(shamsiDate);
       const summary = calculateDailyAttendance(workDate, shamsiDate, dayLogs, effectiveSettings, {
         isToday: workDate === nowInfo.workDate,
@@ -1827,13 +1835,6 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
       }
       if (!summary.is_incomplete && summary.logs.length > 0) {
         confirmedAttendanceShamsiDates.add(shamsiDate);
-        if (
-          summary.net_work_minutes > 0 ||
-          summary.overtime_minutes > 0 ||
-          summary.late_status === 'ABSENCE'
-        ) {
-          activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(shamsiDate, 15));
-        }
         if (summary.late_status !== 'ABSENCE') {
           totalRecordedWorkDays += 1;
         }
@@ -1865,63 +1866,60 @@ apiRouter.get('/attendance/live-status', requireAuth, async (req: AuthenticatedR
         for (const row of rec.parsed_rows) {
           if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
           const normShamsi = normalizeShamsiDate(row.shamsi_date);
+          if (normShamsi < normCollabStart) continue;
           if (confirmedAttendanceShamsiDates.has(normShamsi)) continue;
           confirmedAttendanceShamsiDates.add(normShamsi);
 
           const rowNetMins = Number(row.net_work_minutes || 0);
           const rowOtMins = Number(row.overtime_minutes || 0);
-          if (rowNetMins > 0 || rowOtMins > 0) {
-            activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
-          }
-          totalRecordedWorkDays += 1;
+          const rowDaysCount = Number(row.work_days_count || 1);
+          totalRecordedWorkDays += rowDaysCount;
           totalConfirmedNetWorkMinutes += rowNetMins;
           totalConfirmedOvertimeMinutes += rowOtMins;
 
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
-          hourlyEarnedRegularWorkToman += Math.round(
-            (rowNetMins / 60) * rowCalc.effectiveHourlyRateToman
-          );
+          hourlyEarnedRegularWorkToman +=
+            rowNetMins > 0
+              ? Math.round((rowNetMins / 60) * rowCalc.effectiveHourlyRateToman)
+              : rowDaysCount > 0
+                ? Math.round(rowDaysCount * rowCalc.dailyBaseRateToman)
+                : 0;
           earnedOvertimeToman += rowCalc.totalOvertimePayToman;
         }
       } else {
         const normShamsi = isValidShamsiDate(rec.shamsi_date)
           ? normalizeShamsiDate(rec.shamsi_date)
           : rec.shamsi_date;
+        if (normShamsi && isValidShamsiDate(normShamsi) && normShamsi < normCollabStart) {
+          continue;
+        }
         if (rec.work_days_count === 1 && confirmedAttendanceShamsiDates.has(normShamsi)) {
           continue;
         }
         if (rec.work_days_count === 1 && normShamsi) {
           confirmedAttendanceShamsiDates.add(normShamsi);
         }
-        if ((rec.net_work_minutes > 0 || rec.overtime_minutes > 0) && normShamsi && isValidShamsiDate(normShamsi)) {
-          activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
-        }
 
-        totalRecordedWorkDays += rec.work_days_count;
+        const recDaysCount = Number(rec.work_days_count || 0);
+        totalRecordedWorkDays += recDaysCount;
         totalConfirmedNetWorkMinutes += rec.net_work_minutes;
         totalConfirmedOvertimeMinutes += rec.overtime_minutes;
 
         const effSet = await getSystemSettingsFromDb(normShamsi);
         const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
-        hourlyEarnedRegularWorkToman += Math.round(
-          (rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman
-        );
+        hourlyEarnedRegularWorkToman +=
+          rec.net_work_minutes > 0
+            ? Math.round((rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman)
+            : recDaysCount > 0
+              ? Math.round(recDaysCount * recCalc.dailyBaseRateToman)
+              : 0;
         earnedOvertimeToman += recCalc.totalOvertimePayToman;
       }
     }
 
-    const hasMonthlyFixedSalary =
-      settings.base_salary_toman !== null &&
-      settings.base_salary_toman !== undefined &&
-      Number(settings.base_salary_toman) > 0 &&
-      (settings.hourly_rate_toman === null ||
-        settings.hourly_rate_toman === undefined ||
-        Number(settings.hourly_rate_toman) <= 0);
-
-    const earnedRegularWorkToman = hasMonthlyFixedSalary
-      ? activeMonthlyCycles.size * Math.round(Number(settings.base_salary_toman))
-      : hourlyEarnedRegularWorkToman;
+    // محاسبه روزشمار حقوق کارکرد عادی (صرفاً بر اساس کارکرد واقعی ثبت‌شده از تاریخ شروع قرارداد به بعد)
+    const earnedRegularWorkToman = hourlyEarnedRegularWorkToman;
 
     const [finAllRows] = await pool.execute<mysql.RowDataPacket[]>(
       `SELECT f.*, u.role AS creator_role, u.full_name AS creator_name
@@ -6280,6 +6278,14 @@ apiRouter.get(
 
       await attachForgottenCheckoutWarning(pool, workerId, liveState, currentSettings, nowInfo);
 
+      const rawCollabStart =
+        currentSettings.collaboration_start_shamsi ||
+        workerInfo.collaboration_start_shamsi ||
+        '1405/06/15';
+      const normCollabStart = isValidShamsiDate(rawCollabStart)
+        ? normalizeShamsiDate(rawCollabStart)
+        : '1405/06/15';
+
       let totalConfirmedNetWorkMinutes = 0;
       let totalConfirmedOvertimeMinutes = 0;
       let totalRecordedWorkDays = 0;
@@ -6288,7 +6294,6 @@ apiRouter.get(
       let totalOvertimePayTomanAccum = 0;
       let totalLateDeductionTomanAccum = 0;
       const confirmedAttendanceShamsiDates = new Set<string>();
-      const activeMonthlyCycles = new Set<string>();
 
       const dailySummaries: DailyAttendanceSummary[] = [];
       const pendingLateReviews: DailyAttendanceSummary[] = [];
@@ -6311,6 +6316,11 @@ apiRouter.get(
           }
         }
 
+        // روزهای پیش از تاریخ شروع قرارداد/همکاری در محاسبات کارکرد و حقوق لحاظ نمی‌شوند
+        if (shamsiDate < normCollabStart) {
+          continue;
+        }
+
         if (summary.late_deduction_toman && summary.late_deduction_toman > 0) {
           totalLateDeductionTomanAccum += summary.late_deduction_toman;
         }
@@ -6319,13 +6329,6 @@ apiRouter.get(
           incompleteDaysCount += 1;
         } else if (summary.logs.length > 0) {
           confirmedAttendanceShamsiDates.add(shamsiDate);
-          if (
-            summary.net_work_minutes > 0 ||
-            summary.overtime_minutes > 0 ||
-            summary.late_status === 'ABSENCE'
-          ) {
-            activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(shamsiDate, 15));
-          }
           if (summary.late_status !== 'ABSENCE') {
             totalRecordedWorkDays += 1;
           }
@@ -6369,16 +6372,15 @@ apiRouter.get(
           for (const row of rec.parsed_rows) {
             if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
             const normShamsi = normalizeShamsiDate(row.shamsi_date);
+            if (normShamsi < normCollabStart) continue;
             if (confirmedAttendanceShamsiDates.has(normShamsi)) continue;
             confirmedAttendanceShamsiDates.add(normShamsi);
 
             const rowNetMins = Number(row.net_work_minutes || 0);
             const rowOtMins = Number(row.overtime_minutes || 0);
-            if (rowNetMins > 0 || rowOtMins > 0 || row.late_status === 'ABSENCE') {
-              activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
-            }
+            const rowDaysCount = Number(row.work_days_count || 1);
             if (row.late_status !== 'ABSENCE') {
-              totalRecordedWorkDays += 1;
+              totalRecordedWorkDays += rowDaysCount;
             }
             totalConfirmedNetWorkMinutes += rowNetMins;
             totalConfirmedOvertimeMinutes += rowOtMins;
@@ -6396,49 +6398,47 @@ apiRouter.get(
                   ? Math.round(row.custom_deduction_toman)
                   : 0;
             }
-            hourlyEarnedRegularWorkToman += Math.round(
-              (rowNetMins / 60) * rowCalc.effectiveHourlyRateToman
-            );
+            hourlyEarnedRegularWorkToman +=
+              rowNetMins > 0
+                ? Math.round((rowNetMins / 60) * rowCalc.effectiveHourlyRateToman)
+                : rowDaysCount > 0 && row.late_status !== 'ABSENCE'
+                  ? Math.round(rowDaysCount * rowCalc.dailyBaseRateToman)
+                  : 0;
             totalOvertimePayTomanAccum += rowCalc.totalOvertimePayToman;
           }
         } else {
           const normShamsi = isValidShamsiDate(rec.shamsi_date)
             ? normalizeShamsiDate(rec.shamsi_date)
             : rec.shamsi_date;
+          if (normShamsi && isValidShamsiDate(normShamsi) && normShamsi < normCollabStart) {
+            continue;
+          }
           if (rec.work_days_count === 1 && confirmedAttendanceShamsiDates.has(normShamsi)) {
             continue;
           }
           if (rec.work_days_count === 1 && normShamsi) {
             confirmedAttendanceShamsiDates.add(normShamsi);
           }
-          if ((rec.net_work_minutes > 0 || rec.overtime_minutes > 0) && normShamsi && isValidShamsiDate(normShamsi)) {
-            activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normShamsi, 15));
-          }
 
-          totalRecordedWorkDays += rec.work_days_count;
+          const recDaysCount = Number(rec.work_days_count || 0);
+          totalRecordedWorkDays += recDaysCount;
           totalConfirmedNetWorkMinutes += rec.net_work_minutes;
           totalConfirmedOvertimeMinutes += rec.overtime_minutes;
 
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
-          hourlyEarnedRegularWorkToman += Math.round(
-            (rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman
-          );
+          hourlyEarnedRegularWorkToman +=
+            rec.net_work_minutes > 0
+              ? Math.round((rec.net_work_minutes / 60) * recCalc.effectiveHourlyRateToman)
+              : recDaysCount > 0
+                ? Math.round(recDaysCount * recCalc.dailyBaseRateToman)
+                : 0;
           totalOvertimePayTomanAccum += recCalc.totalOvertimePayToman;
         }
       }
 
-      const hasMonthlyFixedSalary =
-        currentSettings.base_salary_toman !== null &&
-        currentSettings.base_salary_toman !== undefined &&
-        Number(currentSettings.base_salary_toman) > 0 &&
-        (currentSettings.hourly_rate_toman === null ||
-          currentSettings.hourly_rate_toman === undefined ||
-          Number(currentSettings.hourly_rate_toman) <= 0);
-
-      const earnedRegularWorkToman = hasMonthlyFixedSalary
-        ? activeMonthlyCycles.size * Math.round(Number(currentSettings.base_salary_toman))
-        : hourlyEarnedRegularWorkToman;
+      // محاسبه روزشمار حقوق کارکرد عادی (صرفاً بر اساس کارکرد واقعی ثبت‌شده از تاریخ شروع قرارداد به بعد)
+      const earnedRegularWorkToman = hourlyEarnedRegularWorkToman;
       const totalSalaryPlusOvertimeToman = Math.max(
         0,
         earnedRegularWorkToman + totalOvertimePayTomanAccum - totalLateDeductionTomanAccum
