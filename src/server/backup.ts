@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import mysql from 'mysql2/promise';
 import { getDbConfig, getPool } from './db';
+import { getAppConfig } from './config';
 
 export const BACKUP_TABLES_ORDERED = [
   'schema_migrations',
@@ -192,13 +193,9 @@ export async function createFullBackup(options?: {
 }> {
   const p = options?.customPool || getPool();
   const cfg = getDbConfig();
-  const backupDir =
-    options?.backupDir ||
-    process.env.BACKUP_DIR ||
-    path.resolve(process.cwd(), '.data/backups');
-  const privateMediaDir =
-    options?.privateMediaDir ||
-    path.resolve(process.cwd(), '.data/private_media');
+  const appCfg = getAppConfig();
+  const backupDir = options?.backupDir || appCfg.backupDir;
+  const privateMediaDir = options?.privateMediaDir || appCfg.privateMediaDir;
 
   fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
 
@@ -566,10 +563,7 @@ export function listAvailableBackups(customBackupDir?: string): Array<{
   manifest?: BackupManifest;
   error?: string;
 }> {
-  const backupDir =
-    customBackupDir ||
-    process.env.BACKUP_DIR ||
-    path.resolve(process.cwd(), '.data/backups');
+  const backupDir = customBackupDir || getAppConfig().backupDir;
 
   if (!fs.existsSync(backupDir)) {
     return [];

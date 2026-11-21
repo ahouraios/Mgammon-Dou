@@ -27,7 +27,9 @@ import {
   FinancialTransaction,
   FinancialTxType,
   HistoricalWorkRecord,
+  LeaveRequestItem,
   SystemSettings,
+  SystemSettingsSnapshot,
   UserRole,
 } from '../shared/types';
 
@@ -39,6 +41,8 @@ interface MonthlyStatementSectionProps {
   historicalRecords: HistoricalWorkRecord[];
   transactions: FinancialTransaction[];
   settings: SystemSettings | null;
+  snapshots?: SystemSettingsSnapshot[];
+  leaveRequests?: LeaveRequestItem[];
   cumulativeBalanceToman?: number;
 }
 
@@ -98,6 +102,8 @@ export function MonthlyStatementSection({
   historicalRecords,
   transactions,
   settings,
+  snapshots,
+  leaveRequests,
   cumulativeBalanceToman,
 }: MonthlyStatementSectionProps): React.ReactElement | null {
   const effectiveSettings = settings || DEFAULT_FALLBACK_SETTINGS;
@@ -108,6 +114,7 @@ export function MonthlyStatementSection({
 
   // تولید دوره‌های ماهانه ثابت ۱۵ام به ۱۵ام هر ماه (بر مبنای ماه کاری ۲۶ روزه)
   const generatedPeriods = useMemo(() => {
+    const approvedLeaves = (leaveRequests || []).filter((l) => l.status === 'APPROVED');
     return generateStatementPeriods({
       mode: 'CONTRACT_CYCLE',
       cycleStartDay: 15,
@@ -118,7 +125,9 @@ export function MonthlyStatementSection({
       dailySummaries,
       historicalRecords,
       transactions,
+      approvedLeaves,
       settings: effectiveSettings,
+      snapshots: snapshots || [],
     });
   }, [
     currentShamsiDate,
@@ -127,6 +136,8 @@ export function MonthlyStatementSection({
     dailySummaries,
     historicalRecords,
     transactions,
+    leaveRequests,
+    snapshots,
   ]);
 
   // محاسبه مجموع کل ماه‌ها (برای نمایش مانده کل در صورتی که از بیرون پاس داده نشده باشد)
@@ -329,6 +340,16 @@ export function MonthlyStatementSection({
                 {formatToman(activeStatement.earnedRegularSalaryToman)}
               </strong>
             </div>
+            {(activeStatement.paidLeaveMinutes || 0) > 0 && (
+              <div className="flex items-center justify-between text-teal-800 text-[10px]">
+                <span>
+                  شامل {formatMinutesToDurationPersian(activeStatement.paidLeaveMinutes || 0)} مرخصی باحقوق:
+                </span>
+                <strong className="font-bold">
+                  {formatToman(activeStatement.paidLeavePayToman || 0)}
+                </strong>
+              </div>
+            )}
             <div className="flex items-center justify-between text-[#9A7428]">
               <span>
                 ۲. اضافه‌کاری ماه (

@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   calculateDailyAttendance,
+  calculateDayRegularPayToman,
   calculateMonthlyPayrollPeriod,
   calculatePeriodStatement,
+  computePaidLeaveBreakdown,
   evaluateWorkerLiveState,
   generateStatementPeriods,
   validateAttendanceSequence,
@@ -509,6 +511,72 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     } finally {
       setSimulatedDatabaseDisconnect(false);
     }
+  });
+
+  it('سناریوی همخوانی API مدیر و امور مالی: بازگرداندن settingsSnapshots، جداسازی OTHER از تنخواه و PETTY_CASH از پرداختی و کسر صفر برای ABSENCE', async () => {
+    const beforeFinRes = await fetch(`${baseUrl}/api/finance`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    const beforeFin = await beforeFinRes.json();
+    const prevPettyCash = Number(beforeFin.summary?.approvedPettyCashToman || 0);
+
+    const beforeDashRes = await fetch(`${baseUrl}/api/manager/dashboard`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    const beforeDash = await beforeDashRes.json();
+    expect(beforeDash.ok).toBe(true);
+    expect(Array.isArray(beforeDash.settingsSnapshots)).toBe(true);
+    expect(typeof beforeDash.kpis.accountBalanceToman).toBe('number');
+    expect(typeof beforeDash.kpis.paidLeavePayToman).toBe('number');
+    expect(typeof beforeDash.kpis.approvedPettyCashToman).toBe('number');
+    const prevDashPayments = Number(beforeDash.kpis.approvedPaymentsToman || 0);
+    const prevDashPetty = Number(beforeDash.kpis.approvedPettyCashToman || 0);
+
+    // ثبت ۱ مورد PETTY_CASH (تنخواه کارگاهی -> باید به تنخواه اضافه شود نه به پرداختی) و ۱ مورد OTHER (هزینه/تعهد -> نباید به تنخواه اضافه شود)
+    const pettyRes = await fetch(`${baseUrl}/api/finance/manager-direct`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        amount_toman: 450000,
+        tx_type: 'PETTY_CASH',
+        shamsi_date: '1405/07/25',
+        description: 'خرید متریال کارگاه',
+      }),
+    });
+    expect(pettyRes.status).toBe(201);
+
+    const otherRes = await fetch(`${baseUrl}/api/finance/manager-direct`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${managerToken}`,
+      },
+      body: JSON.stringify({
+        amount_toman: 300000,
+        tx_type: 'OTHER',
+        shamsi_date: '1405/07/26',
+        description: 'تعهد کسرشونده تست',
+      }),
+    });
+    expect(otherRes.status).toBe(201);
+
+    const afterFinRes = await fetch(`${baseUrl}/api/finance`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    const afterFin = await afterFinRes.json();
+    // فقط PETTY_CASH باید در approvedPettyCashToman شمرده شود و OTHER وارد آن نشود
+    expect(afterFin.summary.approvedPettyCashToman).toBe(prevPettyCash + 450000);
+
+    const afterDashRes = await fetch(`${baseUrl}/api/manager/dashboard`, {
+      headers: { Authorization: `Bearer ${managerToken}` },
+    });
+    const afterDash = await afterDashRes.json();
+    expect(afterDash.kpis.approvedPettyCashToman).toBe(prevDashPetty + 450000);
+    // PETTY_CASH نباید در approvedPaymentsToman مدیر جمع شود؛ فقط OTHER به پرداختی/کسر از حساب اضافه می‌شود
+    expect(afterDash.kpis.approvedPaymentsToman).toBe(prevDashPayments + 300000);
   });
 
   it('آزمون امنیتی ۱: بررسی ورود با رمز اشتباه، منع رمز پیش‌فرض و SESSION_SECRET ضعیف در محیط عملیاتی، و محدودیت تلاش ورود (Brute-Force)', async () => {
@@ -2253,6 +2321,185 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     // مانده ماه اول و ماه دوم هر دو مثبت (بستانکار) هستند و پرسنل بدهکار نمی‌شود
     expect(cycle1.periodBalanceToman).toBeGreaterThan(2800000);
     expect(cycle2.periodBalanceToman).toBeGreaterThan(20000000);
+  });
+
+  it('سناریوی تکمیلی ۲۴: پایه حقوق ماهانه بدون نرخ ساعتی (کامل کردن شیفت شنبه تا چهارشنبه و پنجشنبه ۷ ساعته = دقیقاً مزد ۱ روز کامل)', () => {
+    const monthlySettings: SystemSettings = {
+      ...BASE_SETTINGS,
+      shift_start_time: '08:30',
+      shift_end_time: '17:00',
+      thursday_shift_start_time: '07:00',
+      thursday_shift_end_time: '14:00',
+      break_duration_minutes: 30,
+      base_salary_toman: 25000000,
+      hourly_rate_toman: null,
+      overtime_calc_mode: 'PERCENTAGE',
+      overtime_percentage: 140,
+      overtime_rate_toman: null,
+    };
+    const dailyRate = Math.round(25000000 / 26);
+
+    // شنبه کامل: ۰۸:۳۰ تا ۱۷:۰۰ (۵۱۰ دقیقه حضور) با ۳۰ دقیقه استراحت => ۴۸۰ دقیقه خالص = ۱ روز کامل
+    const satFull = calculateDayRegularPayToman({
+      dayRegularMinutes: 480,
+      dayOfWeek: 6,
+      settings: monthlySettings,
+      isBulkHistorical: false,
+    });
+    expect(satFull).toBe(dailyRate);
+
+    // پنجشنبه ۷ ساعته کامل: ۰۷:۰۰ تا ۱۴:۰۰ (۴۲۰ دقیقه حضور) با ۳۰ دقیقه استراحت => ۳۹۰ دقیقه خالص = ۱ روز کامل
+    const thuFull = calculateDayRegularPayToman({
+      dayRegularMinutes: 390,
+      dayOfWeek: 4,
+      settings: monthlySettings,
+      isBulkHistorical: false,
+    });
+    expect(thuFull).toBe(dailyRate);
+
+    // نصف شیفت عادی (۲۴۰ از ۴۸۰ دقیقه) => ۵۰٪ مزد روزانه
+    const satHalf = calculateDayRegularPayToman({
+      dayRegularMinutes: 240,
+      dayOfWeek: 6,
+      settings: monthlySettings,
+      isBulkHistorical: false,
+    });
+    expect(satHalf).toBe(Math.round(dailyRate * 0.5));
+  });
+
+  it('سناریوی تکمیلی ۲۵: احتساب مرخصی باحقوق تا سقف سهمیه ماهانه (۲.۵ روز = ۱۲۰۰ دقیقه) و عدم پرداخت مازاد + همپوشانی با کارکرد همان روز', () => {
+    const leaveSettings: SystemSettings = {
+      ...BASE_SETTINGS,
+      base_salary_toman: 26000000, // مزد روزانه دقیقاً ۱,۰۰۰,۰۰۰ تومان
+      hourly_rate_toman: null,
+      monthly_leave_quota_days: 2.5,
+      collaboration_start_shamsi: '1405/07/01',
+    };
+
+    const breakdown = computePaidLeaveBreakdown({
+      approvedLeaves: [
+        {
+          id: 1,
+          user_id: 2,
+          leave_type: 'DAILY',
+          shamsi_date: '1405/07/05',
+          work_date: '2026-09-27',
+          start_time: null,
+          end_time: null,
+          duration_minutes: 480,
+          reason: 'مرخصی روزانه اول',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          manager_note: null,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          created_at: '',
+        },
+        {
+          id: 2,
+          user_id: 2,
+          leave_type: 'DAILY',
+          shamsi_date: '1405/07/06',
+          work_date: '2026-09-28',
+          start_time: null,
+          end_time: null,
+          duration_minutes: 480,
+          reason: 'مرخصی روزانه دوم',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          manager_note: null,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          created_at: '',
+        },
+        {
+          id: 3,
+          user_id: 2,
+          leave_type: 'HOURLY',
+          shamsi_date: '1405/07/10',
+          work_date: '2026-10-02',
+          start_time: '08:30',
+          end_time: '12:30',
+          duration_minutes: 240,
+          reason: 'مرخصی ساعتی (تکمیل سقف ۱۲۰۰ دقیقه)',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          manager_note: null,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          created_at: '',
+        },
+        {
+          id: 4,
+          user_id: 2,
+          leave_type: 'DAILY',
+          shamsi_date: '1405/07/20',
+          work_date: '2026-10-12',
+          start_time: null,
+          end_time: null,
+          duration_minutes: 480,
+          reason: 'مرخصی مازاد بر سهمیه ماهانه (بدون حقوق)',
+          status: 'APPROVED',
+          is_seen_by_manager: true,
+          manager_note: null,
+          reviewed_by_user_id: 1,
+          reviewed_at: null,
+          created_at: '',
+        },
+      ],
+      workedRegularMinutesByDate: new Map<string, number>([['1405/07/10', 300]]), // ۵ ساعت کار + حداکثر ۱۸۰ دقیقه مرخصی ساعتی = ۴۸۰ دقیقه
+      currentSettings: leaveSettings,
+      collabStartShamsi: '1405/07/01',
+    });
+
+    // ۴۸۰ + ۴۸۰ + ۱۸۰ (به‌خاطر همپوشانی با کارکرد همان روز) + ۶۰ (باقیمانده سهمیه ۱۲۰۰ دقیقه) = ۱۲۰۰ دقیقه باحقوق
+    expect(breakdown.totalPaidMinutes).toBe(1200);
+    expect(breakdown.totalPaidToman).toBe(2500000);
+    expect(breakdown.items.find((i) => i.shamsiDate === '1405/07/10')?.paidMinutes).toBe(180);
+    expect(breakdown.items.find((i) => i.shamsiDate === '1405/07/20')?.paidMinutes).toBe(60);
+    expect(breakdown.items.find((i) => i.shamsiDate === '1405/07/20')?.unpaidMinutes).toBe(420);
+  });
+
+  it('سناریوی تکمیلی ۲۶: غیبت روزانه (ABSENCE) نباید جریمه مضاعف (۲ برابری) ایجاد کند', () => {
+    const absSettings: SystemSettings = {
+      ...BASE_SETTINGS,
+      base_salary_toman: 26000000,
+      hourly_rate_toman: null,
+      absence_deduction_unit: 'DAY',
+      absence_deduction_rate_toman: 1000000,
+    };
+
+    const absStartLog: AttendanceLog = {
+      ...makeLog(1, 'WORK_START', '11:00:00', '2026-09-29', '1405/07/07'),
+      late_status: 'ABSENCE',
+      late_reason: 'تست غیبت روزانه',
+    };
+    const absDay = calculateDailyAttendance(
+      '2026-09-29',
+      '1405/07/07',
+      [absStartLog, makeLog(2, 'WORK_END', '17:00:00', '2026-09-29', '1405/07/07')],
+      absSettings
+    );
+
+    expect(absDay.net_work_minutes).toBe(0);
+    expect(absDay.overtime_minutes).toBe(0);
+    // چون در سیستم روزشمار کارکرد این روز صفر شده، کسر مجدد غیبت باید ۰ باشد تا ۲ بار از حقوق کم نشود
+    expect(absDay.late_deduction_toman).toBe(0);
+
+    const stmt = calculatePeriodStatement({
+      periodKey: 'test-abs',
+      title: 'مهر',
+      subtitle: '',
+      fromShamsi: '1405/07/01',
+      toShamsi: '1405/07/30',
+      collabStartShamsi: '1405/07/01',
+      dailySummaries: [absDay],
+      transactions: [],
+      settings: absSettings,
+    });
+    expect(stmt.earnedRegularSalaryToman).toBe(0);
+    expect(stmt.lateAndAbsenceDeductionToman).toBe(0);
+    expect(stmt.periodBalanceToman).toBe(0);
   });
 });
 

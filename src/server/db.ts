@@ -5,7 +5,26 @@ import fs from 'fs';
 import path from 'path';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
-import { OvertimeCalcMode, SystemSettings } from '../shared/types';
+import { OvertimeCalcMode, SystemSettings, SystemSettingsSnapshot } from '../shared/types';
+import {
+  FORBIDDEN_DEFAULT_PASSWORDS,
+  FORBIDDEN_DEFAULT_SECRETS,
+  getAppConfig,
+  getDbConfig,
+  isCpanelOrProductionEnvironment,
+  isProductionMode,
+  sanitizeSecretErrorText,
+  validateProductionDatabaseConfig,
+  validateProductionSecurityConfig,
+} from './config';
+
+export {
+  FORBIDDEN_DEFAULT_PASSWORDS,
+  FORBIDDEN_DEFAULT_SECRETS,
+  getDbConfig,
+  isCpanelOrProductionEnvironment,
+  validateProductionSecurityConfig,
+};
 
 const execAsync = promisify(exec);
 
@@ -19,47 +38,8 @@ let localMariaDbBootstrapPromise: Promise<void> | null = null;
 let simulatedDisconnect = false;
 let simulatedMidTxFailureTag: string | null = null;
 
-const PLACEHOLDER_DB_USERS = new Set(['', 'cpanel_username_mgammon', 'your_db_user']);
-const PLACEHOLDER_DB_PASSWORDS = new Set(['', 'YOUR_STRONG_MYSQL_PASSWORD', 'your_db_password']);
-const PLACEHOLDER_DB_NAMES = new Set(['', 'cpanel_username_mgammon_duo', 'your_db_name']);
-
 export function sanitizeDbErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err || 'Unknown database error');
-  return raw
-    .replace(/(password|passwd|pwd|token|secret|authorization|key)\s*[:=]\s*[^\s,;'"&]+/gi, '$1=[REDACTED]')
-    .replace(/using password:\s*(YES|NO)/gi, 'using password: [REDACTED]')
-    .replace(/'[^']*'@'[^']*'/g, "'[USER]'@'[HOST]'");
-}
-
-export function isCpanelOrProductionEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.NODE_ENV === 'production') return true;
-  if (env.CPANEL_ENV === 'true' || env.CPANEL === '1') return true;
-  const rawUser = (env.DB_USER || '').trim();
-  if (rawUser && !PLACEHOLDER_DB_USERS.has(rawUser) && rawUser !== 'root') {
-    return true;
-  }
-  return false;
-}
-
-export function getDbConfig(env: NodeJS.ProcessEnv = process.env) {
-  const rawUser = (env.DB_USER || '').trim();
-  const rawPassword = env.DB_PASSWORD || '';
-  const rawDbName = (env.DB_NAME || '').trim();
-
-  return {
-    host: env.DB_HOST || '127.0.0.1',
-    port: Number(env.DB_PORT || 3306),
-    user: PLACEHOLDER_DB_USERS.has(rawUser) ? 'root' : rawUser,
-    password: PLACEHOLDER_DB_PASSWORDS.has(rawPassword) ? '' : rawPassword,
-    database: PLACEHOLDER_DB_NAMES.has(rawDbName) ? 'mgammon_duo' : rawDbName,
-    waitForConnections: true,
-    connectionLimit: 10,
-    connectTimeout: 5000,
-    queueLimit: 0,
-    charset: 'utf8mb4',
-    timezone: '+03:30',
-    dateStrings: ['DATE'] as ('DATE' | 'DATETIME' | 'TIMESTAMP')[],
-  };
+  return sanitizeSecretErrorText(err);
 }
 
 async function hasMariadbdBinary(): Promise<boolean> {
@@ -113,8 +93,9 @@ async function ensureLocalMariaDbRunningIfNeeded(): Promise<void> {
 
   localMariaDbBootstrapPromise = (async () => {
     try {
-      const persistentDataDir = process.env.LOCAL_MARIADB_DATADIR || '/var/lib/mysql';
-      const debCacheDir = process.env.LOCAL_DEB_CACHE_DIR || '/var/cache/apt/archives';
+      const appCfg = getAppConfig();
+      const persistentDataDir = appCfg.localMariaDbDataDir;
+      const debCacheDir = appCfg.localDebCacheDir;
       fs.mkdirSync(debCacheDir, { recursive: true });
       let hasMariadbd = await hasMariadbdBinary();
 
@@ -379,7 +360,7 @@ export async function checkDatabaseConnection(): Promise<{
       message: 'ارتباط با پایگاه داده MySQL موقتاً در دسترس نیست.',
     };
   }
-  if (process.env.SIMULATE_DB_DOWN === 'true') {
+  if (getAppConfig().simulateDbDown) {
     return {
       connected: false,
       initialized: false,
@@ -389,7 +370,7 @@ export async function checkDatabaseConnection(): Promise<{
   if (!isDatabaseInitialized()) {
     await waitForPendingDatabaseInit();
   }
-  if (!isDatabaseInitialized() && process.env.VITEST !== 'true') {
+  if (!isDatabaseInitialized() && !getAppConfig().isVitest) {
     try {
       await initializeDatabase();
     } catch {
@@ -417,54 +398,9 @@ export async function checkDatabaseConnection(): Promise<{
   }
 }
 
-export const FORBIDDEN_DEFAULT_SECRETS = new Set([
-  '',
-  'mgammon-duo-default-server-secret-2026',
-  'mgammon-duo-enterprise-secret-2026',
-  'CHANGE_THIS_TO_A_STRONG_64_CHAR_RANDOM_SECRET_KEY',
-  'replace_with_a_long_random_64_char_secret_string',
-  'secret',
-  'changeme',
-]);
-
-export const FORBIDDEN_DEFAULT_PASSWORDS = new Set([
-  'Mgammon@1405',
-  'Worker@1405',
-  'CHANGE_ME_MANAGER_PASSWORD',
-  'CHANGE_ME_WORKER_PASSWORD',
-  '123456',
-  '12345678',
-  'password',
-  'admin',
-]);
-
-export function validateProductionSecurityConfig(env: NodeJS.ProcessEnv = process.env): void {
-  if (env.NODE_ENV !== 'production') {
-    return;
-  }
-
-  const sessionSecret = (env.SESSION_SECRET || '').trim();
-  if (
-    !sessionSecret ||
-    sessionSecret.length < 32 ||
-    FORBIDDEN_DEFAULT_SECRETS.has(sessionSecret)
-  ) {
-    throw new Error(
-      'SECURITY_CONFIG_ERROR: متغیر محیطی SESSION_SECRET در محیط عملیاتی (Production) خالی، کوتاه‌تر از ۳۲ کاراکتر یا دارای مقدار پیش‌فرض است. راه‌اندازی سرور متوقف شد.'
-    );
-  }
-
-  const mgrPass = (env.INITIAL_MANAGER_PASSWORD || '').trim();
-  const wrkPass = (env.INITIAL_WORKER_PASSWORD || '').trim();
-  if (
-    (mgrPass && (mgrPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(mgrPass))) ||
-    (wrkPass && (wrkPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(wrkPass)))
-  ) {
-    throw new Error(
-      'SECURITY_CONFIG_ERROR: استفاده از رمز عبور پیش‌فرض یا ضعیف برای حساب‌های اولیه در محیط عملیاتی (Production) مجاز نیست.'
-    );
-  }
-}
+// ============================================================================
+// توابع اعتبارسنجی امنیتی و محیطی از ماژول مرکزی src/server/config.ts باز-صادر شده‌اند.
+// ============================================================================
 
 // ============================================================================
 // توابع کمکی مهاجرت سازگار با هر دو موتور MySQL 5.7/8.0+ و MariaDB 10.3+
@@ -1175,6 +1111,10 @@ export async function initializeDatabase(): Promise<void> {
   dbInitializingPromise = (async () => {
     try {
       validateProductionSecurityConfig(process.env);
+      const dbValidation = validateProductionDatabaseConfig(process.env);
+      if (!dbValidation.valid && isProductionMode(process.env) && process.env.VITEST !== 'true') {
+        throw new Error(`DB_CONFIG_ERROR: ${dbValidation.message}`);
+      }
       await ensureLocalMariaDbRunningIfNeeded();
       migrateLegacyPublicMediaToPrivate();
 
@@ -1230,10 +1170,11 @@ export async function initializeDatabase(): Promise<void> {
 
       const hasManager = existingUsers.some((u) => u.role === 'manager');
       const hasWorker = existingUsers.some((u) => u.role === 'worker');
-      const isProd = process.env.NODE_ENV === 'production';
+      const appCfg = getAppConfig();
+      const isProd = appCfg.isProduction;
 
-      const rawMgrPass = (process.env.INITIAL_MANAGER_PASSWORD || '').trim();
-      const managerUsername = (process.env.INITIAL_MANAGER_USERNAME || 'manager').trim();
+      const rawMgrPass = appCfg.initialManagerPassword;
+      const managerUsername = appCfg.initialManagerUsername;
       const managerPassword =
         !rawMgrPass || (!isProd && rawMgrPass === 'CHANGE_ME_MANAGER_PASSWORD')
           ? isProd
@@ -1264,8 +1205,8 @@ export async function initializeDatabase(): Promise<void> {
         );
       }
 
-      const rawWrkPass = (process.env.INITIAL_WORKER_PASSWORD || '').trim();
-      const workerUsername = (process.env.INITIAL_WORKER_USERNAME || 'worker').trim();
+      const rawWrkPass = appCfg.initialWorkerPassword;
+      const workerUsername = appCfg.initialWorkerUsername;
       const workerPassword =
         !rawWrkPass || (!isProd && rawWrkPass === 'CHANGE_ME_WORKER_PASSWORD')
           ? isProd
@@ -1343,7 +1284,7 @@ export async function initializeDatabase(): Promise<void> {
             'PAID_AS_WORK',
             'ALL_OVERTIME',
             JSON.stringify([]),
-            process.env.APP_TIMEZONE || 'Asia/Tehran',
+            appCfg.appTimezone,
             '1405/06/15',
           ]
         );
@@ -1422,6 +1363,44 @@ export async function getSystemSettingsFromDb(targetShamsiDate?: string): Promis
   }
 
   return currentMapped;
+}
+
+export async function getSystemSettingsSnapshotsFromDb(): Promise<SystemSettingsSnapshot[]> {
+  const p = getPool();
+  const current = await getSystemSettingsFromDb();
+  try {
+    const [rows] = await p.execute<mysql.RowDataPacket[]>(
+      `SELECT id, effective_from_shamsi, settings_json, changed_by_user_id, change_reason, created_at
+       FROM system_settings_snapshots
+       ORDER BY effective_from_shamsi ASC, id ASC`
+    );
+    return rows.map((r) => {
+      let parsed: Partial<SystemSettings> = {};
+      try {
+        parsed =
+          typeof r.settings_json === 'string'
+            ? (JSON.parse(r.settings_json) as Partial<SystemSettings>)
+            : ((r.settings_json || {}) as Partial<SystemSettings>);
+      } catch {
+        parsed = {};
+      }
+      return {
+        id: Number(r.id),
+        effective_from_shamsi: String(r.effective_from_shamsi || '1400/01/01'),
+        settings: {
+          ...current,
+          ...parsed,
+          banner_bg_url: current.banner_bg_url,
+        },
+        changed_by_user_id:
+          r.changed_by_user_id != null ? Number(r.changed_by_user_id) : null,
+        change_reason: r.change_reason ? String(r.change_reason) : null,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : undefined,
+      };
+    });
+  } catch {
+    return [];
+  }
 }
 
 export function mapRowToSystemSettings(row: mysql.RowDataPacket): SystemSettings {

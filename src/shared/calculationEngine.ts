@@ -7,6 +7,7 @@ import {
   HistoricalWorkRecord,
   LateArrivalDisposition,
   LateDeductionUnit,
+  LeaveRequestItem,
   SystemSettings,
   WorkerLiveState,
   WorkerLiveStatus,
@@ -464,7 +465,9 @@ export function calculateDailyAttendance(
     lateMinutes = rawLateMinutes;
     netWorkMinutes = 0;
     confirmedOvertimeMinutes = 0;
-    lateDeductionToman = deductionRates.effectiveDailyAbsenceRateToman;
+    // در محاسبه روزشمار، صفر شدن کارکردِ روز غیبت خودبه‌خود کل دستمزد آن روز را حذف می‌کند؛
+    // بنابراین جریمه اضافه ثبت نمی‌شود تا از کسر مضاعف (دوبرابر) جلوگیری گردد.
+    lateDeductionToman = 0;
   } else if (effectiveLateStatus === 'CUSTOM') {
     isLate = true;
     lateMinutes = rawLateMinutes;
@@ -731,6 +734,153 @@ export function calculateSalaryAndOvertimeRates(
     effectiveHourlyRateToman,
     effectiveOvertimeHourlyRateToman,
     totalOvertimePayToman,
+  };
+}
+
+/**
+ * محاسبه دقیق دستمزد عادی یک روز کاری بر اساس نوع قرارداد:
+ * - اگر نرخ ساعتی مستقیم تعیین شده باشد یا ردیف تجمیعی چندروزه باشد: دقیقاً بر اساس ساعت کارکرد × نرخ ساعتی محاسبه می‌شود.
+ * - اگر حقوق پایه ماهانه (۲۶ روزه) مبنا باشد: تکمیل کامل شیفت مصوب آن روز (شامل شیفت ۷ ساعته پنجشنبه و کسر استراحت مصوب)
+ *   معادل ۱ روز کامل مزد پایه (حقوق پایه ÷ ۲۶) و کارکرد ناقص به نسبت همان شیفت محاسبه می‌گردد.
+ */
+export function calculateDayRegularPayToman(params: {
+  dayRegularMinutes: number;
+  dayOfWeek: number;
+  settings: SystemSettings;
+  isBulkHistorical?: boolean;
+}): number {
+  const { dayRegularMinutes, dayOfWeek, settings, isBulkHistorical = false } = params;
+  const safeRegMins = Math.max(0, Number(dayRegularMinutes) || 0);
+  if (safeRegMins <= 0) return 0;
+
+  const rates = calculateSalaryAndOvertimeRates(settings, 0);
+  const hasExplicitHourlyRate = Boolean(settings.hourly_rate_toman && settings.hourly_rate_toman > 0);
+
+  if (hasExplicitHourlyRate || isBulkHistorical || rates.dailyBaseRateToman <= 0) {
+    return Math.round((safeRegMins / 60) * rates.effectiveHourlyRateToman);
+  }
+
+  const { shiftStartMin, shiftEndMin } = getDayShiftSchedule(dayOfWeek, settings);
+  const scheduledGross = Math.max(60, shiftEndMin - shiftStartMin);
+  const scheduledBreak =
+    scheduledGross > 240
+      ? Math.min(Math.max(0, Number(settings.break_duration_minutes) || 0), scheduledGross)
+      : 0;
+  const scheduledNet = Math.max(60, scheduledGross - scheduledBreak);
+
+  const completionRatio = Math.min(1, safeRegMins / scheduledNet);
+  return Math.round(completionRatio * rates.dailyBaseRateToman);
+}
+
+export interface PaidLeaveBreakdownItem {
+  leave: LeaveRequestItem;
+  shamsiDate: string;
+  shamsiMonthKey: string;
+  requestedMinutes: number;
+  paidMinutes: number;
+  unpaidMinutes: number;
+  paidToman: number;
+}
+
+/**
+ * محاسبه دقیق مرخصی‌های باحقوق تأییدشده در چارچوب سقف سهمیه ماهانه (پیش‌فرض ۲.۵ روز = ۱۲۰۰ دقیقه در هر ماه شمسی)
+ * - مرخصی‌های تأییدشده پیش از تاریخ شروع همکاری یا مازاد بر سهمیه ماهانه، بدون حقوق (۰ تومان) لحاظ می‌شوند.
+ * - برای جلوگیری از هم‌پوشانی با کارکرد ثبت‌شده همان روز، مجموع ساعت کار عادی + مرخصی باحقوق یک روز حداکثر تا ۴۸۰ دقیقه محاسبه می‌شود.
+ */
+export function computePaidLeaveBreakdown(params: {
+  approvedLeaves: LeaveRequestItem[];
+  currentSettings: SystemSettings;
+  snapshots?: { effective_from_shamsi: string; settings: SystemSettings }[];
+  collabStartShamsi?: string | null;
+  workedRegularMinutesByDate?: Map<string, number>;
+}): {
+  items: PaidLeaveBreakdownItem[];
+  totalPaidMinutes: number;
+  totalPaidToman: number;
+} {
+  const {
+    approvedLeaves = [],
+    currentSettings,
+    snapshots = [],
+    collabStartShamsi,
+    workedRegularMinutesByDate,
+  } = params;
+
+  const rawCollabStart =
+    collabStartShamsi || currentSettings.collaboration_start_shamsi || '1405/06/15';
+  const normCollabStart = isValidShamsiDate(rawCollabStart)
+    ? normalizeShamsiDate(rawCollabStart)
+    : '1405/06/15';
+
+  const validApproved = approvedLeaves
+    .filter((l) => l && l.status === 'APPROVED' && l.shamsi_date && isValidShamsiDate(l.shamsi_date))
+    .map((l) => ({
+      leave: l,
+      shamsiDate: normalizeShamsiDate(l.shamsi_date),
+    }))
+    .filter((item) => item.shamsiDate >= normCollabStart)
+    .sort((a, b) => a.shamsiDate.localeCompare(b.shamsiDate) || (a.leave.id || 0) - (b.leave.id || 0));
+
+  const usedQuotaByMonth = new Map<string, number>();
+  const usedDayMinutes = new Map<string, number>(workedRegularMinutesByDate || []);
+  const items: PaidLeaveBreakdownItem[] = [];
+  let totalPaidMinutes = 0;
+  let totalPaidToman = 0;
+
+  for (const entry of validApproved) {
+    const { leave, shamsiDate } = entry;
+    const monthKey = shamsiDate.slice(0, 7);
+    const effSet = resolveEffectiveSettingsForShamsiDate(shamsiDate, currentSettings, snapshots);
+    const quotaDays =
+      effSet.monthly_leave_quota_days !== null && effSet.monthly_leave_quota_days !== undefined
+        ? Math.max(0, Number(effSet.monthly_leave_quota_days))
+        : 2.5;
+    const monthlyQuotaMins = Math.round(quotaDays * 480);
+
+    const rawDuration = Math.max(0, Math.round(Number(leave.duration_minutes) || 0));
+    const requestedMinutes = leave.leave_type === 'DAILY' ? Math.max(rawDuration, 480) : rawDuration;
+
+    const alreadyWorkedOrCredited = usedDayMinutes.get(shamsiDate) || 0;
+    const dayRoomMinutes = Math.max(0, 480 - alreadyWorkedOrCredited);
+    const eligibleMinutes = Math.min(requestedMinutes, dayRoomMinutes);
+
+    const usedInMonth = usedQuotaByMonth.get(monthKey) || 0;
+    const remainingQuota = Math.max(0, monthlyQuotaMins - usedInMonth);
+    const paidMinutes = Math.min(eligibleMinutes, remainingQuota);
+    const unpaidMinutes = Math.max(0, requestedMinutes - paidMinutes);
+
+    usedQuotaByMonth.set(monthKey, usedInMonth + paidMinutes);
+    if (paidMinutes > 0) {
+      usedDayMinutes.set(shamsiDate, alreadyWorkedOrCredited + paidMinutes);
+    }
+
+    const rates = calculateSalaryAndOvertimeRates(effSet, 0);
+    const hasExplicitHourly = Boolean(effSet.hourly_rate_toman && effSet.hourly_rate_toman > 0);
+    const paidToman =
+      paidMinutes <= 0
+        ? 0
+        : !hasExplicitHourly && rates.dailyBaseRateToman > 0
+          ? Math.round((paidMinutes / 480) * rates.dailyBaseRateToman)
+          : Math.round((paidMinutes / 60) * rates.effectiveHourlyRateToman);
+
+    totalPaidMinutes += paidMinutes;
+    totalPaidToman += paidToman;
+
+    items.push({
+      leave,
+      shamsiDate,
+      shamsiMonthKey: monthKey,
+      requestedMinutes,
+      paidMinutes,
+      unpaidMinutes,
+      paidToman,
+    });
+  }
+
+  return {
+    items,
+    totalPaidMinutes,
+    totalPaidToman,
   };
 }
 
@@ -1014,7 +1164,13 @@ export function calculateMonthlyPayrollPeriod(params: {
       totalRegularWorkMinutes += dayRegularMins;
 
       const rates = calculateSalaryAndOvertimeRates(effSettings, summary.overtime_minutes);
-      exactEarnedRegularToman += (dayRegularMins / 60) * rates.effectiveHourlyRateToman;
+      const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+      exactEarnedRegularToman += calculateDayRegularPayToman({
+        dayRegularMinutes: dayRegularMins,
+        dayOfWeek,
+        settings: effSettings,
+        isBulkHistorical: false,
+      });
       exactEarnedOvertimeToman += (summary.overtime_minutes / 60) * rates.effectiveOvertimeHourlyRateToman;
     }
   }
@@ -1040,12 +1196,25 @@ export function calculateMonthlyPayrollPeriod(params: {
       snapshots
     );
     const rates = calculateSalaryAndOvertimeRates(effSettings, rec.overtime_minutes);
+    const recDaysCount = Number(rec.work_days_count || 0);
+    const isBulk = recDaysCount !== 1 || rec.net_work_minutes > 600;
+    const recDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normRecDate));
 
     totalConfirmedWorkDays += rec.work_days_count;
     totalNetWorkMinutes += rec.net_work_minutes;
     totalRegularWorkMinutes += rec.net_work_minutes;
     totalOvertimeMinutes += rec.overtime_minutes;
-    exactEarnedRegularToman += (rec.net_work_minutes / 60) * rates.effectiveHourlyRateToman;
+    exactEarnedRegularToman +=
+      rec.net_work_minutes > 0
+        ? calculateDayRegularPayToman({
+            dayRegularMinutes: rec.net_work_minutes,
+            dayOfWeek: recDayOfWeek,
+            settings: effSettings,
+            isBulkHistorical: isBulk,
+          })
+        : recDaysCount > 0
+          ? recDaysCount * rates.dailyBaseRateToman
+          : 0;
     exactEarnedOvertimeToman += (rec.overtime_minutes / 60) * rates.effectiveOvertimeHourlyRateToman;
   }
 
@@ -1347,6 +1516,8 @@ export interface PeriodStatementSummary {
   effectiveOvertimeHourlyRateToman: number;
   earnedRegularSalaryToman: number;
   earnedOvertimePayToman: number;
+  paidLeaveMinutes?: number;
+  paidLeavePayToman?: number;
   lateAndAbsenceDeductionToman: number;
   approvedLateMinutes: number;
   absenceDaysCount: number;
@@ -1370,9 +1541,7 @@ export interface PeriodStatementSummary {
 
 /**
  * محاسبه دقیق صورتحساب یک ماه کاری (مثلاً از ۱۵ شهریور تا ۱۵ مهر)
- * - در صورتی که حقوق پایه ماهانه (base_salary_toman) تنظیم شده باشد و قرارداد ساعتی دستی نباشد،
- *   حقوق کارکرد ماه به صورت ماهانه (مبلغ کامل حقوق پایه ماهانه به ازای هر ماه کاری فعال ۱۵ام به ۱۵ام) محاسبه می‌شود
- *   و نه روزبه‌روز، و اضافه‌کاری کل ماه به آن اضافه می‌گردد.
+ * - بر مبنای کارکرد روزشمار واقعی از تاریخ شروع قرارداد به بعد + مرخصی‌های باحقوق تأییدشده در سقف سهمیه ماهانه
  * - برای تعهدات مالی و پرداخت‌های غیرحقوق با شیوه تسویه تقسیطی (INSTALLMENT)، در هر دوره ماهانه صرفاً
  *   مبلغ قسط همان ماه (monthly_deduction_toman) به صورت خودکار کسر شده و مانده مستهلک‌نشده به ماه‌های بعد منتقل می‌شود.
  */
@@ -1388,6 +1557,7 @@ export function calculatePeriodStatement(params: {
   collabStartShamsi?: string;
   dailySummaries: DailyAttendanceSummary[];
   historicalRecords?: HistoricalWorkRecord[];
+  approvedLeaves?: LeaveRequestItem[];
   transactions: FinancialTransaction[];
   settings: SystemSettings;
   snapshots?: { effective_from_shamsi: string; settings: SystemSettings }[];
@@ -1404,6 +1574,7 @@ export function calculatePeriodStatement(params: {
     collabStartShamsi,
     dailySummaries = [],
     historicalRecords = [],
+    approvedLeaves = [],
     transactions = [],
     settings,
     snapshots = [],
@@ -1442,6 +1613,7 @@ export function calculatePeriodStatement(params: {
   const dayDetails: StatementDayDetail[] = [];
   const coveredDates = new Set<string>();
   const activeMonthlyCycles = new Set<string>();
+  const workedRegularMinutesByDate = new Map<string, number>();
 
   for (const day of dailySummaries) {
     if (!day.shamsi_date) continue;
@@ -1449,18 +1621,30 @@ export function calculatePeriodStatement(params: {
       ? normalizeShamsiDate(day.shamsi_date)
       : day.shamsi_date;
 
+    const isLiveLogDay = Array.isArray(day.logs) && day.logs.length > 0;
+    const isManagerAbsenceDay = day.late_status === 'ABSENCE';
+    const dayOtMinsPre = Math.max(0, Number(day.overtime_minutes) || 0);
+    const dayRegMinsPre = isLiveLogDay
+      ? Math.max(0, Number(day.net_work_minutes || 0) - dayOtMinsPre)
+      : Math.max(0, Number(day.net_work_minutes || 0));
+
+    if (!day.is_incomplete && !isManagerAbsenceDay && normDate >= normCollabStart && dayRegMinsPre > 0) {
+      workedRegularMinutesByDate.set(normDate, dayRegMinsPre);
+    }
+
     if (normDate < effectiveStartDate || normDate > normTo) {
       continue;
     }
 
-    const dayLateDeduction = Math.max(0, Math.round(Number(day.late_deduction_toman || 0)));
-    const isManagerAbsenceDay = day.late_status === 'ABSENCE';
+    // در مدل روزشمار، برای روز غیبت کارکرد صفر و بدون کسر مضاعف محاسبه می‌شود
+    const dayLateDeduction = isManagerAbsenceDay
+      ? 0
+      : Math.max(0, Math.round(Number(day.late_deduction_toman || 0)));
 
     if (day.is_incomplete && !isManagerAbsenceDay && dayLateDeduction === 0) {
       continue;
     }
 
-    const isLiveLogDay = Array.isArray(day.logs) && day.logs.length > 0;
     const hasHistoricalWork =
       !isLiveLogDay && (day.net_work_minutes > 0 || day.overtime_minutes > 0);
 
@@ -1472,16 +1656,23 @@ export function calculatePeriodStatement(params: {
     activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normDate, 15));
 
     const effDaySettings = resolveEffectiveSettingsForShamsiDate(normDate, settings, snapshots);
-    const dayOtMins = Math.max(0, Number(day.overtime_minutes) || 0);
-    const dayRegMins = isLiveLogDay
-      ? Math.max(0, Number(day.net_work_minutes || 0) - dayOtMins)
-      : Math.max(0, Number(day.net_work_minutes || 0));
+    const dayOtMins = dayOtMinsPre;
+    const dayRegMins = dayRegMinsPre;
     const dayTotalMins = isLiveLogDay
       ? Math.max(0, Number(day.net_work_minutes || 0))
       : dayRegMins + dayOtMins;
 
     const dayRates = calculateSalaryAndOvertimeRates(effDaySettings, dayOtMins);
-    const dayRegPay = Math.round((dayRegMins / 60) * dayRates.effectiveHourlyRateToman);
+    const workDate = day.work_date || shamsiToGregorian(normDate);
+    const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+    const dayRegPay = isManagerAbsenceDay
+      ? 0
+      : calculateDayRegularPayToman({
+          dayRegularMinutes: dayRegMins,
+          dayOfWeek,
+          settings: effDaySettings,
+          isBulkHistorical: !isLiveLogDay && dayRegMins > 600,
+        });
     const dayOtPay = dayRates.totalOvertimePayToman;
 
     if (!isManagerAbsenceDay) {
@@ -1526,12 +1717,15 @@ export function calculatePeriodStatement(params: {
       for (const row of rec.parsed_rows) {
         if (!row.shamsi_date || !isValidShamsiDate(row.shamsi_date)) continue;
         const normRowDate = normalizeShamsiDate(row.shamsi_date);
+        const rowRegMins = Math.max(0, Number(row.net_work_minutes || 0));
+        if (normRowDate >= normCollabStart && rowRegMins > 0 && row.late_status !== 'ABSENCE' && !workedRegularMinutesByDate.has(normRowDate)) {
+          workedRegularMinutesByDate.set(normRowDate, rowRegMins);
+        }
         if (normRowDate < effectiveStartDate || normRowDate > normTo) continue;
         if (coveredDates.has(normRowDate)) continue;
         coveredDates.add(normRowDate);
         activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normRowDate, 15));
 
-        const rowRegMins = Math.max(0, Number(row.net_work_minutes || 0));
         const rowOtMins = Math.max(0, Number(row.overtime_minutes || 0));
         const effRowSettings = resolveEffectiveSettingsForShamsiDate(
           normRowDate,
@@ -1540,15 +1734,28 @@ export function calculatePeriodStatement(params: {
         );
         const rowRates = calculateSalaryAndOvertimeRates(effRowSettings, rowOtMins);
         const rowDaysCount = Number(row.work_days_count || 1);
+        const isRowBulk = rowDaysCount !== 1 || rowRegMins > 600;
+        const rowDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normRowDate));
         const rowRegPay =
-          rowRegMins > 0
-            ? Math.round((rowRegMins / 60) * rowRates.effectiveHourlyRateToman)
-            : rowDaysCount > 0
-              ? Math.round(rowDaysCount * rowRates.dailyBaseRateToman)
-              : 0;
-        const rowOtPay = rowRates.totalOvertimePayToman;
+          row.late_status === 'ABSENCE'
+            ? 0
+            : rowRegMins > 0
+              ? calculateDayRegularPayToman({
+                  dayRegularMinutes: rowRegMins,
+                  dayOfWeek: rowDayOfWeek,
+                  settings: effRowSettings,
+                  isBulkHistorical: isRowBulk,
+                })
+              : rowDaysCount > 0
+                ? Math.round(rowDaysCount * rowRates.dailyBaseRateToman)
+                : 0;
+        const rowOtPay = row.late_status === 'ABSENCE' ? 0 : rowRates.totalOvertimePayToman;
 
-        workDaysCount += rowDaysCount;
+        if (row.late_status !== 'ABSENCE') {
+          workDaysCount += rowDaysCount;
+        } else {
+          absenceDaysCount += 1;
+        }
         regularWorkMinutes += rowRegMins;
         overtimeMinutes += rowOtMins;
         totalNetWorkMinutes += rowRegMins;
@@ -1568,19 +1775,22 @@ export function calculatePeriodStatement(params: {
           lastOutTime: row.check_out || null,
           statusLabel: row.note || row.title || rec.title || 'سابقه کارکرد',
           isHistorical: true,
-          workDaysCount: rowDaysCount,
+          workDaysCount: row.late_status === 'ABSENCE' ? 0 : rowDaysCount,
         });
       }
     } else {
       const normRecDate = isValidShamsiDate(rec.shamsi_date)
         ? normalizeShamsiDate(rec.shamsi_date)
         : rec.shamsi_date;
+      const recRegMins = Math.max(0, Number(rec.net_work_minutes || 0));
+      if (normRecDate && normRecDate >= normCollabStart && rec.work_days_count === 1 && recRegMins > 0 && !workedRegularMinutesByDate.has(normRecDate)) {
+        workedRegularMinutesByDate.set(normRecDate, recRegMins);
+      }
       if (!normRecDate || normRecDate < effectiveStartDate || normRecDate > normTo) continue;
       if (rec.work_days_count === 1 && coveredDates.has(normRecDate)) continue;
       if (rec.work_days_count === 1) coveredDates.add(normRecDate);
       activeMonthlyCycles.add(getMonthlyCycleKeyForShamsiDate(normRecDate, 15));
 
-      const recRegMins = Math.max(0, Number(rec.net_work_minutes || 0));
       const recOtMins = Math.max(0, Number(rec.overtime_minutes || 0));
       const effRecSettings = resolveEffectiveSettingsForShamsiDate(
         normRecDate,
@@ -1589,9 +1799,16 @@ export function calculatePeriodStatement(params: {
       );
       const recRates = calculateSalaryAndOvertimeRates(effRecSettings, recOtMins);
       const recDaysCount = Number(rec.work_days_count || 1);
+      const isRecBulk = recDaysCount !== 1 || recRegMins > 600;
+      const recDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normRecDate));
       const recRegPay =
         recRegMins > 0
-          ? Math.round((recRegMins / 60) * recRates.effectiveHourlyRateToman)
+          ? calculateDayRegularPayToman({
+              dayRegularMinutes: recRegMins,
+              dayOfWeek: recDayOfWeek,
+              settings: effRecSettings,
+              isBulkHistorical: isRecBulk,
+            })
           : recDaysCount > 0
             ? Math.round(recDaysCount * recRates.dailyBaseRateToman)
             : 0;
@@ -1622,14 +1839,62 @@ export function calculatePeriodStatement(params: {
     }
   }
 
+  // محاسبه مرخصی‌های باحقوق تأییدشده در سقف سهمیه ماهانه
+  const leaveBreakdown = computePaidLeaveBreakdown({
+    approvedLeaves,
+    currentSettings: settings,
+    snapshots,
+    collabStartShamsi: effectiveCollabStart,
+    workedRegularMinutesByDate,
+  });
+
+  let paidLeaveMinutes = 0;
+  let paidLeavePayToman = 0;
+  for (const item of leaveBreakdown.items) {
+    if (item.shamsiDate < effectiveStartDate || item.shamsiDate > normTo) {
+      continue;
+    }
+    if (item.paidMinutes <= 0) {
+      continue;
+    }
+    paidLeaveMinutes += item.paidMinutes;
+    paidLeavePayToman += item.paidToman;
+
+    const existingDetail = dayDetails.find((d) => d.shamsiDate === item.shamsiDate);
+    if (existingDetail) {
+      existingDetail.regularPayToman += item.paidToman;
+      existingDetail.totalDayPayToman += item.paidToman;
+      if (!existingDetail.statusLabel.includes('مرخصی')) {
+        existingDetail.statusLabel = `${existingDetail.statusLabel} + مرخصی باحقوق`;
+      }
+    } else {
+      const workDate = item.leave.work_date || shamsiToGregorian(item.shamsiDate);
+      dayDetails.push({
+        shamsiDate: item.shamsiDate,
+        dayName: getPersianDayName(workDate),
+        regularWorkMinutes: 0,
+        overtimeMinutes: 0,
+        totalWorkMinutes: 0,
+        regularPayToman: item.paidToman,
+        overtimePayToman: 0,
+        totalDayPayToman: item.paidToman,
+        firstInTime: item.leave.start_time || null,
+        lastOutTime: item.leave.end_time || null,
+        statusLabel:
+          item.leave.leave_type === 'DAILY'
+            ? 'مرخصی روزانه باحقوق'
+            : 'مرخصی ساعتی باحقوق',
+        isHistorical: false,
+        workDaysCount: 0,
+      });
+    }
+  }
+
   dayDetails.sort((a, b) => b.shamsiDate.localeCompare(a.shamsiDate));
 
-  // محاسبه حقوق عادی به صورت روزشمار (منحصراً بر اساس کارکرد واقعی ثبت‌شده از تاریخ شروع قرارداد به بعد)
-  // از اعطای یکجای حقوق کل ماه پیش از انجام کار یا محاسبه روزهای پیش از شروع قرارداد جلوگیری می‌شود.
+  // محاسبه حقوق عادی به صورت روزشمار (کارکرد واقعی + مرخصی‌های باحقوق تأییدشده در سقف سهمیه، از تاریخ شروع قرارداد به بعد)
   const earnedRegularSalaryToman =
-    workDaysCount > 0 || hourlyAccumRegularSalaryToman > 0
-      ? hourlyAccumRegularSalaryToman
-      : 0;
+    hourlyAccumRegularSalaryToman + paidLeavePayToman;
 
   // ۱. تراکنش‌های یکجا (LUMP_SUM) و تنخواه ثبت‌شده در این بازه زمانی
   const directPeriodTransactions = transactions.filter((tx) => {
@@ -1766,6 +2031,8 @@ export function calculatePeriodStatement(params: {
     effectiveOvertimeHourlyRateToman: refRates.effectiveOvertimeHourlyRateToman,
     earnedRegularSalaryToman,
     earnedOvertimePayToman,
+    paidLeaveMinutes,
+    paidLeavePayToman,
     lateAndAbsenceDeductionToman,
     approvedLateMinutes,
     absenceDaysCount,
@@ -1800,6 +2067,7 @@ export function generateStatementPeriods(params: {
   collaborationStartShamsi?: string | null;
   dailySummaries: DailyAttendanceSummary[];
   historicalRecords?: HistoricalWorkRecord[];
+  approvedLeaves?: LeaveRequestItem[];
   transactions: FinancialTransaction[];
   settings: SystemSettings;
   snapshots?: { effective_from_shamsi: string; settings: SystemSettings }[];
@@ -1811,6 +2079,7 @@ export function generateStatementPeriods(params: {
     collaborationStartShamsi,
     dailySummaries = [],
     historicalRecords = [],
+    approvedLeaves = [],
     transactions = [],
     settings,
     snapshots = [],
@@ -1848,6 +2117,11 @@ export function generateStatementPeriods(params: {
 
   for (const d of dailySummaries) {
     addYearMonthFromDate(d.shamsi_date);
+  }
+  for (const lv of approvedLeaves) {
+    if (lv.status === 'APPROVED') {
+      addYearMonthFromDate(lv.shamsi_date);
+    }
   }
   for (const h of historicalRecords) {
     addYearMonthFromDate(h.shamsi_date);
@@ -1925,6 +2199,7 @@ export function generateStatementPeriods(params: {
         collabStartShamsi: normCollabStart,
         dailySummaries,
         historicalRecords,
+        approvedLeaves,
         transactions,
         settings,
         snapshots,
@@ -1967,6 +2242,7 @@ export function generateStatementPeriods(params: {
         collabStartShamsi: normCollabStart,
         dailySummaries,
         historicalRecords,
+        approvedLeaves,
         transactions,
         settings,
         snapshots,
@@ -1983,6 +2259,7 @@ export function generateStatementPeriods(params: {
       stmt.workDaysCount > 0 ||
       stmt.totalNetWorkMinutes > 0 ||
       stmt.overtimeMinutes > 0 ||
+      (stmt.paidLeaveMinutes || 0) > 0 ||
       stmt.periodTransactions.length > 0;
     return isCurrentPeriod || hasData || idx === 0;
   });

@@ -1202,6 +1202,39 @@ async function getSystemSettingsFromDb(targetShamsiDate) {
   }
   return currentMapped;
 }
+async function getSystemSettingsSnapshotsFromDb() {
+  const p = getPool();
+  const current = await getSystemSettingsFromDb();
+  try {
+    const [rows] = await p.execute(
+      `SELECT id, effective_from_shamsi, settings_json, changed_by_user_id, change_reason, created_at
+       FROM system_settings_snapshots
+       ORDER BY effective_from_shamsi ASC, id ASC`
+    );
+    return rows.map((r) => {
+      let parsed = {};
+      try {
+        parsed = typeof r.settings_json === "string" ? JSON.parse(r.settings_json) : r.settings_json || {};
+      } catch {
+        parsed = {};
+      }
+      return {
+        id: Number(r.id),
+        effective_from_shamsi: String(r.effective_from_shamsi || "1400/01/01"),
+        settings: {
+          ...current,
+          ...parsed,
+          banner_bg_url: current.banner_bg_url
+        },
+        changed_by_user_id: r.changed_by_user_id != null ? Number(r.changed_by_user_id) : null,
+        change_reason: r.change_reason ? String(r.change_reason) : null,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : void 0
+      };
+    });
+  } catch {
+    return [];
+  }
+}
 function mapRowToSystemSettings(row) {
   let workingDays = [6, 0, 1, 2, 3, 4];
   try {
@@ -2482,7 +2515,7 @@ function calculateDailyAttendance(workDate, shamsiDate, dayLogs, settings, optio
     lateMinutes = rawLateMinutes;
     netWorkMinutes = 0;
     confirmedOvertimeMinutes = 0;
-    lateDeductionToman = deductionRates.effectiveDailyAbsenceRateToman;
+    lateDeductionToman = 0;
   } else if (effectiveLateStatus === "CUSTOM") {
     isLate = true;
     lateMinutes = rawLateMinutes;
@@ -2666,6 +2699,81 @@ function calculateSalaryAndOvertimeRates(settings, totalOvertimeMinutes) {
     totalOvertimePayToman
   };
 }
+function calculateDayRegularPayToman(params) {
+  const { dayRegularMinutes, dayOfWeek, settings, isBulkHistorical = false } = params;
+  const safeRegMins = Math.max(0, Number(dayRegularMinutes) || 0);
+  if (safeRegMins <= 0) return 0;
+  const rates = calculateSalaryAndOvertimeRates(settings, 0);
+  const hasExplicitHourlyRate = Boolean(settings.hourly_rate_toman && settings.hourly_rate_toman > 0);
+  if (hasExplicitHourlyRate || isBulkHistorical || rates.dailyBaseRateToman <= 0) {
+    return Math.round(safeRegMins / 60 * rates.effectiveHourlyRateToman);
+  }
+  const { shiftStartMin, shiftEndMin } = getDayShiftSchedule(dayOfWeek, settings);
+  const scheduledGross = Math.max(60, shiftEndMin - shiftStartMin);
+  const scheduledBreak = scheduledGross > 240 ? Math.min(Math.max(0, Number(settings.break_duration_minutes) || 0), scheduledGross) : 0;
+  const scheduledNet = Math.max(60, scheduledGross - scheduledBreak);
+  const completionRatio = Math.min(1, safeRegMins / scheduledNet);
+  return Math.round(completionRatio * rates.dailyBaseRateToman);
+}
+function computePaidLeaveBreakdown(params) {
+  const {
+    approvedLeaves = [],
+    currentSettings,
+    snapshots = [],
+    collabStartShamsi,
+    workedRegularMinutesByDate
+  } = params;
+  const rawCollabStart = collabStartShamsi || currentSettings.collaboration_start_shamsi || "1405/06/15";
+  const normCollabStart = isValidShamsiDate(rawCollabStart) ? normalizeShamsiDate(rawCollabStart) : "1405/06/15";
+  const validApproved = approvedLeaves.filter((l) => l && l.status === "APPROVED" && l.shamsi_date && isValidShamsiDate(l.shamsi_date)).map((l) => ({
+    leave: l,
+    shamsiDate: normalizeShamsiDate(l.shamsi_date)
+  })).filter((item) => item.shamsiDate >= normCollabStart).sort((a, b) => a.shamsiDate.localeCompare(b.shamsiDate) || (a.leave.id || 0) - (b.leave.id || 0));
+  const usedQuotaByMonth = /* @__PURE__ */ new Map();
+  const usedDayMinutes = new Map(workedRegularMinutesByDate || []);
+  const items = [];
+  let totalPaidMinutes = 0;
+  let totalPaidToman = 0;
+  for (const entry of validApproved) {
+    const { leave, shamsiDate } = entry;
+    const monthKey = shamsiDate.slice(0, 7);
+    const effSet = resolveEffectiveSettingsForShamsiDate(shamsiDate, currentSettings, snapshots);
+    const quotaDays = effSet.monthly_leave_quota_days !== null && effSet.monthly_leave_quota_days !== void 0 ? Math.max(0, Number(effSet.monthly_leave_quota_days)) : 2.5;
+    const monthlyQuotaMins = Math.round(quotaDays * 480);
+    const rawDuration = Math.max(0, Math.round(Number(leave.duration_minutes) || 0));
+    const requestedMinutes = leave.leave_type === "DAILY" ? Math.max(rawDuration, 480) : rawDuration;
+    const alreadyWorkedOrCredited = usedDayMinutes.get(shamsiDate) || 0;
+    const dayRoomMinutes = Math.max(0, 480 - alreadyWorkedOrCredited);
+    const eligibleMinutes = Math.min(requestedMinutes, dayRoomMinutes);
+    const usedInMonth = usedQuotaByMonth.get(monthKey) || 0;
+    const remainingQuota = Math.max(0, monthlyQuotaMins - usedInMonth);
+    const paidMinutes = Math.min(eligibleMinutes, remainingQuota);
+    const unpaidMinutes = Math.max(0, requestedMinutes - paidMinutes);
+    usedQuotaByMonth.set(monthKey, usedInMonth + paidMinutes);
+    if (paidMinutes > 0) {
+      usedDayMinutes.set(shamsiDate, alreadyWorkedOrCredited + paidMinutes);
+    }
+    const rates = calculateSalaryAndOvertimeRates(effSet, 0);
+    const hasExplicitHourly = Boolean(effSet.hourly_rate_toman && effSet.hourly_rate_toman > 0);
+    const paidToman = paidMinutes <= 0 ? 0 : !hasExplicitHourly && rates.dailyBaseRateToman > 0 ? Math.round(paidMinutes / 480 * rates.dailyBaseRateToman) : Math.round(paidMinutes / 60 * rates.effectiveHourlyRateToman);
+    totalPaidMinutes += paidMinutes;
+    totalPaidToman += paidToman;
+    items.push({
+      leave,
+      shamsiDate,
+      shamsiMonthKey: monthKey,
+      requestedMinutes,
+      paidMinutes,
+      unpaidMinutes,
+      paidToman
+    });
+  }
+  return {
+    items,
+    totalPaidMinutes,
+    totalPaidToman
+  };
+}
 function calculateLateAndAbsenceRates(settings) {
   const baseRates = calculateSalaryAndOvertimeRates(settings, 0);
   const legalHourlyRateToman = baseRates.effectiveHourlyRateToman;
@@ -2695,6 +2803,41 @@ function calculateLateAndAbsenceRates(settings) {
     effectiveHourlyAbsenceRateToman,
     isCustomLateRate: customLateRate !== null,
     isCustomAbsenceRate: customAbsenceRate !== null
+  };
+}
+function resolveEffectiveSettingsForShamsiDate(targetShamsiDate, currentSettings, snapshots = []) {
+  if (!targetShamsiDate || !isValidShamsiDate(targetShamsiDate)) {
+    return currentSettings;
+  }
+  const normTarget = normalizeShamsiDate(targetShamsiDate);
+  const currentEff = isValidShamsiDate(currentSettings.effective_from_shamsi) ? normalizeShamsiDate(currentSettings.effective_from_shamsi) : "1400/01/01";
+  if (normTarget >= currentEff || snapshots.length === 0) {
+    return currentSettings;
+  }
+  const sortedSnaps = [...snapshots].sort(
+    (a, b) => normalizeShamsiDate(b.effective_from_shamsi).localeCompare(
+      normalizeShamsiDate(a.effective_from_shamsi)
+    )
+  );
+  for (const snap of sortedSnaps) {
+    const snapEff = isValidShamsiDate(snap.effective_from_shamsi) ? normalizeShamsiDate(snap.effective_from_shamsi) : "1400/01/01";
+    if (snapEff <= normTarget) {
+      return {
+        ...currentSettings,
+        ...snap.settings,
+        base_salary_toman: snap.settings.base_salary_toman ?? currentSettings.base_salary_toman,
+        hourly_rate_toman: snap.settings.hourly_rate_toman ?? currentSettings.hourly_rate_toman,
+        banner_bg_url: currentSettings.banner_bg_url
+      };
+    }
+  }
+  const oldestSnap = sortedSnaps[sortedSnaps.length - 1];
+  return {
+    ...currentSettings,
+    ...oldestSnap.settings,
+    base_salary_toman: oldestSnap.settings.base_salary_toman ?? currentSettings.base_salary_toman,
+    hourly_rate_toman: oldestSnap.settings.hourly_rate_toman ?? currentSettings.hourly_rate_toman,
+    banner_bg_url: currentSettings.banner_bg_url
   };
 }
 function getFinancialCycleYearMonthForShamsiDate(shamsiDate, anchorDay = 15, collabStartShamsi = "1405/06/15", calendarMode = false) {
@@ -3365,7 +3508,7 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
           gross_presence_minutes: row.net_work_minutes + row.overtime_minutes,
           mission_minutes: isMission ? 60 : 0,
           break_deducted_minutes: 0,
-          net_work_minutes: savedLateStatus === "ABSENCE" ? 0 : savedLateStatus === "EXCUSED" && row.net_work_minutes < expectedShiftMins ? expectedShiftMins + row.overtime_minutes : row.net_work_minutes,
+          net_work_minutes: savedLateStatus === "ABSENCE" ? 0 : savedLateStatus === "EXCUSED" && row.net_work_minutes < expectedShiftMins ? expectedShiftMins : row.net_work_minutes,
           provisional_work_minutes: row.net_work_minutes,
           overtime_minutes: savedLateStatus === "ABSENCE" ? 0 : row.overtime_minutes,
           status_label: row.note || row.title || "\u062B\u0628\u062A\u200C\u0634\u062F\u0647 \u062F\u0631 \u0633\u0648\u0627\u0628\u0642 \u06A9\u0627\u0631\u06A9\u0631\u062F"
@@ -4312,6 +4455,7 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
     let earnedOvertimeToman = 0;
     let totalLateAndAbsenceDeductionToman = 0;
     const confirmedAttendanceShamsiDates = /* @__PURE__ */ new Set();
+    const workedRegMinsByDate = /* @__PURE__ */ new Map();
     const recentLateDecisions = [];
     for (const [workDate, dayLogs] of byDate.entries()) {
       const shamsiDate = normalizeShamsiDate(dayLogs[0]?.shamsi_date || gregorianToShamsi(workDate));
@@ -4337,13 +4481,20 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
         totalConfirmedNetWorkMinutes += summary.net_work_minutes;
         totalConfirmedOvertimeMinutes += summary.overtime_minutes;
         const dayRegularMinutes = Math.max(0, summary.net_work_minutes - summary.overtime_minutes);
+        if (summary.late_status !== "ABSENCE" && dayRegularMinutes > 0) {
+          workedRegMinsByDate.set(shamsiDate, dayRegularMinutes);
+        }
         const daySalaryCalc = calculateSalaryAndOvertimeRates(
           effectiveSettings,
           summary.overtime_minutes
         );
-        hourlyEarnedRegularWorkToman += Math.round(
-          dayRegularMinutes / 60 * daySalaryCalc.effectiveHourlyRateToman
-        );
+        const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+        hourlyEarnedRegularWorkToman += summary.late_status === "ABSENCE" ? 0 : calculateDayRegularPayToman({
+          dayRegularMinutes,
+          dayOfWeek,
+          settings: effectiveSettings,
+          isBulkHistorical: false
+        });
         earnedOvertimeToman += daySalaryCalc.totalOvertimePayToman;
       }
     }
@@ -4365,13 +4516,25 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
           const rowNetMins = Number(row.net_work_minutes || 0);
           const rowOtMins = Number(row.overtime_minutes || 0);
           const rowDaysCount = Number(row.work_days_count || 1);
-          totalRecordedWorkDays += rowDaysCount;
+          if (row.late_status !== "ABSENCE") {
+            totalRecordedWorkDays += rowDaysCount;
+            if (rowNetMins > 0 && !workedRegMinsByDate.has(normShamsi)) {
+              workedRegMinsByDate.set(normShamsi, rowNetMins);
+            }
+          }
           totalConfirmedNetWorkMinutes += rowNetMins;
           totalConfirmedOvertimeMinutes += rowOtMins;
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
-          hourlyEarnedRegularWorkToman += rowNetMins > 0 ? Math.round(rowNetMins / 60 * rowCalc.effectiveHourlyRateToman) : rowDaysCount > 0 ? Math.round(rowDaysCount * rowCalc.dailyBaseRateToman) : 0;
-          earnedOvertimeToman += rowCalc.totalOvertimePayToman;
+          const isRowBulk = rowDaysCount !== 1 || rowNetMins > 600;
+          const rowDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normShamsi));
+          hourlyEarnedRegularWorkToman += row.late_status === "ABSENCE" ? 0 : rowNetMins > 0 ? calculateDayRegularPayToman({
+            dayRegularMinutes: rowNetMins,
+            dayOfWeek: rowDayOfWeek,
+            settings: effSet,
+            isBulkHistorical: isRowBulk
+          }) : rowDaysCount > 0 ? Math.round(rowDaysCount * rowCalc.dailyBaseRateToman) : 0;
+          earnedOvertimeToman += row.late_status === "ABSENCE" ? 0 : rowCalc.totalOvertimePayToman;
         }
       } else {
         const normShamsi = isValidShamsiDate(rec.shamsi_date) ? normalizeShamsiDate(rec.shamsi_date) : rec.shamsi_date;
@@ -4383,6 +4546,9 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
         }
         if (rec.work_days_count === 1 && normShamsi) {
           confirmedAttendanceShamsiDates.add(normShamsi);
+          if (rec.net_work_minutes > 0 && !workedRegMinsByDate.has(normShamsi)) {
+            workedRegMinsByDate.set(normShamsi, rec.net_work_minutes);
+          }
         }
         const recDaysCount = Number(rec.work_days_count || 0);
         totalRecordedWorkDays += recDaysCount;
@@ -4390,11 +4556,35 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
         totalConfirmedOvertimeMinutes += rec.overtime_minutes;
         const effSet = await getSystemSettingsFromDb(normShamsi);
         const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
-        hourlyEarnedRegularWorkToman += rec.net_work_minutes > 0 ? Math.round(rec.net_work_minutes / 60 * recCalc.effectiveHourlyRateToman) : recDaysCount > 0 ? Math.round(recDaysCount * recCalc.dailyBaseRateToman) : 0;
+        const isRecBulk = recDaysCount !== 1 || rec.net_work_minutes > 600;
+        const recDayOfWeek = normShamsi && isValidShamsiDate(normShamsi) ? getDayOfWeekFromGregorian(shamsiToGregorian(normShamsi)) : 6;
+        hourlyEarnedRegularWorkToman += rec.net_work_minutes > 0 ? calculateDayRegularPayToman({
+          dayRegularMinutes: rec.net_work_minutes,
+          dayOfWeek: recDayOfWeek,
+          settings: effSet,
+          isBulkHistorical: isRecBulk
+        }) : recDaysCount > 0 ? Math.round(recDaysCount * recCalc.dailyBaseRateToman) : 0;
         earnedOvertimeToman += recCalc.totalOvertimePayToman;
       }
     }
-    const earnedRegularWorkToman = hourlyEarnedRegularWorkToman;
+    const [approvedLeaveRows] = await pool2.execute(
+      `SELECT * FROM leave_requests
+       WHERE user_id = ? AND status = 'APPROVED'
+       ORDER BY work_date ASC, id ASC`,
+      [workerInfo.id]
+    );
+    const approvedLeaves = approvedLeaveRows.map(mapRowToLeaveRequest);
+    const rawSettingsSnapshots = await getSystemSettingsSnapshotsFromDb();
+    const leaveBreakdown = computePaidLeaveBreakdown({
+      approvedLeaves,
+      currentSettings: settings,
+      snapshots: rawSettingsSnapshots,
+      collabStartShamsi: normCollabStart,
+      workedRegularMinutesByDate: workedRegMinsByDate
+    });
+    const paidLeaveMinutes = leaveBreakdown.totalPaidMinutes;
+    const paidLeavePayToman = leaveBreakdown.totalPaidToman;
+    const earnedRegularWorkToman = hourlyEarnedRegularWorkToman + paidLeavePayToman;
     const [finAllRows] = await pool2.execute(
       `SELECT f.*, u.role AS creator_role, u.full_name AS creator_name
        FROM financial_transactions f
@@ -4441,6 +4631,10 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
       serverTime: nowInfo,
       liveState,
       settings: sanitizeSettingsForRole(settings, req.user.role),
+      settingsSnapshots: rawSettingsSnapshots.map((s) => ({
+        ...s,
+        settings: sanitizeSettingsForRole(s.settings, req.user.role)
+      })),
       unreadMessagesCount,
       latestUnreadMessage,
       latestPendingTask,
@@ -4450,6 +4644,8 @@ apiRouter.get("/attendance/live-status", requireAuth, async (req, res) => {
         totalWorkDays: totalRecordedWorkDays,
         totalNetWorkMinutes: totalConfirmedNetWorkMinutes,
         totalOvertimeMinutes: totalConfirmedOvertimeMinutes,
+        paidLeaveMinutes,
+        paidLeavePayToman,
         approvedTotalToman,
         approvedReceivedToman,
         approvedPettyCashToman,
@@ -7096,7 +7292,7 @@ apiRouter.get("/finance", requireAuth, async (req, res) => {
       `SELECT
          COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN amount_toman ELSE 0 END), 0) AS approved_total,
          COALESCE(SUM(CASE WHEN status = 'PENDING' THEN amount_toman ELSE 0 END), 0) AS pending_total,
-         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type IN ('PETTY_CASH', 'OTHER') THEN amount_toman ELSE 0 END), 0) AS approved_petty_cash_total,
+         COALESCE(SUM(CASE WHEN status = 'APPROVED' AND tx_type = 'PETTY_CASH' THEN amount_toman ELSE 0 END), 0) AS approved_petty_cash_total,
          COUNT(CASE WHEN status = 'PENDING' THEN 1 END) AS pending_count
        FROM financial_transactions
        WHERE user_id = ?`,
@@ -7976,6 +8172,7 @@ apiRouter.get(
       let totalOvertimePayTomanAccum = 0;
       let totalLateDeductionTomanAccum = 0;
       const confirmedAttendanceShamsiDates = /* @__PURE__ */ new Set();
+      const workedRegMinsByDate = /* @__PURE__ */ new Map();
       const dailySummaries = [];
       const pendingLateReviews = [];
       const reviewedLateSummaries = [];
@@ -8010,13 +8207,20 @@ apiRouter.get(
           totalConfirmedNetWorkMinutes += summary.net_work_minutes;
           totalConfirmedOvertimeMinutes += summary.overtime_minutes;
           const dayRegularMinutes = Math.max(0, summary.net_work_minutes - summary.overtime_minutes);
+          if (summary.late_status !== "ABSENCE" && dayRegularMinutes > 0) {
+            workedRegMinsByDate.set(shamsiDate, dayRegularMinutes);
+          }
           const daySalaryCalc = calculateSalaryAndOvertimeRates(
             effectiveSettings,
             summary.overtime_minutes
           );
-          hourlyEarnedRegularWorkToman += Math.round(
-            dayRegularMinutes / 60 * daySalaryCalc.effectiveHourlyRateToman
-          );
+          const dayOfWeek = getDayOfWeekFromGregorian(workDate);
+          hourlyEarnedRegularWorkToman += summary.late_status === "ABSENCE" ? 0 : calculateDayRegularPayToman({
+            dayRegularMinutes,
+            dayOfWeek,
+            settings: effectiveSettings,
+            isBulkHistorical: false
+          });
           totalOvertimePayTomanAccum += daySalaryCalc.totalOvertimePayToman;
         }
       }
@@ -8051,21 +8255,30 @@ apiRouter.get(
             const rowDaysCount = Number(row.work_days_count || 1);
             if (row.late_status !== "ABSENCE") {
               totalRecordedWorkDays += rowDaysCount;
+              if (rowNetMins > 0 && !workedRegMinsByDate.has(normShamsi)) {
+                workedRegMinsByDate.set(normShamsi, rowNetMins);
+              }
             }
             totalConfirmedNetWorkMinutes += rowNetMins;
             totalConfirmedOvertimeMinutes += rowOtMins;
             const effSet = await getSystemSettingsFromDb(normShamsi);
             const rowCalc = calculateSalaryAndOvertimeRates(effSet, rowOtMins);
-            const deductionRatesRow = calculateLateAndAbsenceRates(effSet);
-            if (row.late_deduction_toman && row.late_deduction_toman > 0) {
-              totalLateDeductionTomanAccum += Math.round(row.late_deduction_toman);
-            } else if (row.late_status === "ABSENCE") {
-              totalLateDeductionTomanAccum += deductionRatesRow.effectiveDailyAbsenceRateToman;
-            } else if (row.late_status === "CUSTOM") {
-              totalLateDeductionTomanAccum += row.custom_deduction_toman && row.custom_deduction_toman > 0 ? Math.round(row.custom_deduction_toman) : 0;
+            if (row.late_status !== "ABSENCE") {
+              if (row.late_deduction_toman && row.late_deduction_toman > 0) {
+                totalLateDeductionTomanAccum += Math.round(row.late_deduction_toman);
+              } else if (row.late_status === "CUSTOM") {
+                totalLateDeductionTomanAccum += row.custom_deduction_toman && row.custom_deduction_toman > 0 ? Math.round(row.custom_deduction_toman) : 0;
+              }
             }
-            hourlyEarnedRegularWorkToman += rowNetMins > 0 ? Math.round(rowNetMins / 60 * rowCalc.effectiveHourlyRateToman) : rowDaysCount > 0 && row.late_status !== "ABSENCE" ? Math.round(rowDaysCount * rowCalc.dailyBaseRateToman) : 0;
-            totalOvertimePayTomanAccum += rowCalc.totalOvertimePayToman;
+            const isRowBulk = rowDaysCount !== 1 || rowNetMins > 600;
+            const rowDayOfWeek = getDayOfWeekFromGregorian(shamsiToGregorian(normShamsi));
+            hourlyEarnedRegularWorkToman += row.late_status === "ABSENCE" ? 0 : rowNetMins > 0 ? calculateDayRegularPayToman({
+              dayRegularMinutes: rowNetMins,
+              dayOfWeek: rowDayOfWeek,
+              settings: effSet,
+              isBulkHistorical: isRowBulk
+            }) : rowDaysCount > 0 ? Math.round(rowDaysCount * rowCalc.dailyBaseRateToman) : 0;
+            totalOvertimePayTomanAccum += row.late_status === "ABSENCE" ? 0 : rowCalc.totalOvertimePayToman;
           }
         } else {
           const normShamsi = isValidShamsiDate(rec.shamsi_date) ? normalizeShamsiDate(rec.shamsi_date) : rec.shamsi_date;
@@ -8077,6 +8290,9 @@ apiRouter.get(
           }
           if (rec.work_days_count === 1 && normShamsi) {
             confirmedAttendanceShamsiDates.add(normShamsi);
+            if (rec.net_work_minutes > 0 && !workedRegMinsByDate.has(normShamsi)) {
+              workedRegMinsByDate.set(normShamsi, rec.net_work_minutes);
+            }
           }
           const recDaysCount = Number(rec.work_days_count || 0);
           totalRecordedWorkDays += recDaysCount;
@@ -8084,18 +8300,58 @@ apiRouter.get(
           totalConfirmedOvertimeMinutes += rec.overtime_minutes;
           const effSet = await getSystemSettingsFromDb(normShamsi);
           const recCalc = calculateSalaryAndOvertimeRates(effSet, rec.overtime_minutes);
-          hourlyEarnedRegularWorkToman += rec.net_work_minutes > 0 ? Math.round(rec.net_work_minutes / 60 * recCalc.effectiveHourlyRateToman) : recDaysCount > 0 ? Math.round(recDaysCount * recCalc.dailyBaseRateToman) : 0;
+          const isRecBulk = recDaysCount !== 1 || rec.net_work_minutes > 600;
+          const recDayOfWeek = normShamsi && isValidShamsiDate(normShamsi) ? getDayOfWeekFromGregorian(shamsiToGregorian(normShamsi)) : 6;
+          hourlyEarnedRegularWorkToman += rec.net_work_minutes > 0 ? calculateDayRegularPayToman({
+            dayRegularMinutes: rec.net_work_minutes,
+            dayOfWeek: recDayOfWeek,
+            settings: effSet,
+            isBulkHistorical: isRecBulk
+          }) : recDaysCount > 0 ? Math.round(recDaysCount * recCalc.dailyBaseRateToman) : 0;
           totalOvertimePayTomanAccum += recCalc.totalOvertimePayToman;
         }
       }
-      const earnedRegularWorkToman = hourlyEarnedRegularWorkToman;
+      const [approvedLeaveRows] = await pool2.execute(
+        `SELECT * FROM leave_requests
+         WHERE user_id = ? AND status = 'APPROVED'
+         ORDER BY work_date ASC, id ASC`,
+        [workerId]
+      );
+      const approvedLeaves = approvedLeaveRows.map(mapRowToLeaveRequest);
+      const rawSettingsSnapshots = await getSystemSettingsSnapshotsFromDb();
+      const leaveBreakdown = computePaidLeaveBreakdown({
+        approvedLeaves,
+        currentSettings,
+        snapshots: rawSettingsSnapshots,
+        collabStartShamsi: normCollabStart,
+        workedRegularMinutesByDate: workedRegMinsByDate
+      });
+      const paidLeaveMinutes = leaveBreakdown.totalPaidMinutes;
+      const paidLeavePayToman = leaveBreakdown.totalPaidToman;
+      const earnedRegularWorkToman = hourlyEarnedRegularWorkToman + paidLeavePayToman;
       const totalSalaryPlusOvertimeToman = Math.max(
         0,
         earnedRegularWorkToman + totalOvertimePayTomanAccum - totalLateDeductionTomanAccum
       );
+      const [finAllRows] = await pool2.execute(
+        `SELECT f.*, u.role AS creator_role, u.full_name AS creator_name
+         FROM financial_transactions f
+         LEFT JOIN users u ON u.id = f.created_by_user_id
+         WHERE f.user_id = ?`,
+        [workerId]
+      );
+      const allWorkerTxs = finAllRows.map(mapRowToFinancialTx);
+      const finCumulative = calculateCumulativeFinancialSummaryAsOf({
+        transactions: allWorkerTxs,
+        currentShamsiDate: nowInfo.shamsiDate,
+        collabStartShamsi: normCollabStart,
+        anchorDay: 15
+      });
+      const approvedPettyCashToman = finCumulative.approvedPettyCashToman;
+      const totalEntitlementToman = totalSalaryPlusOvertimeToman + approvedPettyCashToman;
+      const accountBalanceToman = totalEntitlementToman - finCumulative.approvedMaturedReceivedToman;
       const [finRows] = await pool2.execute(
         `SELECT
-           COALESCE(SUM(CASE WHEN status = 'APPROVED' THEN amount_toman ELSE 0 END), 0) AS approved_total,
            COALESCE(SUM(CASE WHEN status = 'PENDING' THEN amount_toman ELSE 0 END), 0) AS pending_total,
            COUNT(CASE WHEN status = 'PENDING' THEN 1 END) AS pending_count,
            COUNT(CASE WHEN is_seen_by_manager = 0 OR status = 'PENDING' THEN 1 END) AS unseen_or_pending_fin
@@ -8161,12 +8417,15 @@ apiRouter.get(
         serverTime: nowInfo,
         liveState,
         kpis: {
-          approvedPaymentsToman: Number(finRows[0]?.approved_total || 0),
+          approvedPaymentsToman: finCumulative.approvedMaturedReceivedToman,
+          approvedPettyCashToman,
           pendingPaymentsToman: Number(finRows[0]?.pending_total || 0),
           pendingPaymentsCount: Number(finRows[0]?.pending_count || 0),
           totalNetWorkMinutes: totalConfirmedNetWorkMinutes,
           totalOvertimeMinutes: totalConfirmedOvertimeMinutes,
           totalWorkDays: totalRecordedWorkDays,
+          paidLeaveMinutes,
+          paidLeavePayToman,
           incompleteDaysCount,
           baseSalaryToman: salaryCalc.baseSalaryToman,
           effectiveHourlyRateToman: salaryCalc.effectiveHourlyRateToman,
@@ -8175,6 +8434,8 @@ apiRouter.get(
           totalOvertimePayToman: totalOvertimePayTomanAccum,
           totalLateDeductionToman: totalLateDeductionTomanAccum,
           totalSalaryPlusOvertimeToman,
+          totalEntitlementToman,
+          accountBalanceToman,
           deductionRates
         },
         pendingLateReviews,
@@ -8195,7 +8456,11 @@ apiRouter.get(
           monthly: monthlyChartData
         },
         recentSummaries: mergedDailySummaries.slice(0, 14),
-        settings: sanitizeSettingsForRole(currentSettings, "manager")
+        settings: sanitizeSettingsForRole(currentSettings, "manager"),
+        settingsSnapshots: rawSettingsSnapshots.map((s) => ({
+          ...s,
+          settings: sanitizeSettingsForRole(s.settings, "manager")
+        }))
       });
     } catch (err) {
       handleServerError(res, err);
@@ -8658,8 +8923,18 @@ apiRouter.post(
 );
 apiRouter.get("/settings", requireAuth, async (req, res) => {
   try {
-    const settings = await getSystemSettingsFromDb();
-    res.json({ ok: true, settings: sanitizeSettingsForRole(settings, req.user.role) });
+    const [settings, snapshots] = await Promise.all([
+      getSystemSettingsFromDb(),
+      getSystemSettingsSnapshotsFromDb()
+    ]);
+    res.json({
+      ok: true,
+      settings: sanitizeSettingsForRole(settings, req.user.role),
+      settingsSnapshots: snapshots.map((s) => ({
+        ...s,
+        settings: sanitizeSettingsForRole(s.settings, req.user.role)
+      }))
+    });
   } catch (err) {
     handleServerError(res, err);
   }

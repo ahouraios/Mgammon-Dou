@@ -12,6 +12,7 @@ import {
   LeaveType,
   MediaSourceType,
   SystemSettings,
+  SystemSettingsSnapshot,
   UserProfile,
   WorkerLiveState,
   WorkTaskItem,
@@ -101,6 +102,8 @@ interface WorkerSummaryKpis {
   approvedPettyCashToman: number;
   earnedRegularWorkToman: number;
   earnedOvertimeToman: number;
+  paidLeaveMinutes?: number;
+  paidLeavePayToman?: number;
   lateAndAbsenceDeductionToman?: number;
   totalEntitlementToman: number;
   accountBalanceToman: number;
@@ -290,6 +293,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
   const [activeTab, setActiveTab] = useState<WorkerTab>('attendance');
   const [liveState, setLiveState] = useState<WorkerLiveState | null>(null);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [settingsSnapshots, setSettingsSnapshots] = useState<SystemSettingsSnapshot[]>([]);
   const [serverShamsiDate, setServerShamsiDate] = useState<string>(initialShamsiDate);
   const [serverTimeHHMM, setServerTimeHHMM] = useState<string>('');
   const [bannerBgUrl, setBannerBgUrl] = useState<string | null>(
@@ -423,6 +427,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
           serverTime: { shamsiDate: string; timeHHMM: string };
           liveState: WorkerLiveState;
           settings: SystemSettings;
+          settingsSnapshots?: SystemSettingsSnapshot[];
           unreadMessagesCount: number;
           latestUnreadMessage?: LatestUnreadMessageInfo | null;
           latestPendingTask?: {
@@ -461,6 +466,7 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
 
       setLiveState(liveRes.liveState);
       setSettings(liveRes.settings);
+      setSettingsSnapshots(liveRes.settingsSnapshots || []);
       setServerShamsiDate(liveRes.serverTime.shamsiDate);
       setServerTimeHHMM(liveRes.serverTime.timeHHMM);
       setUnreadMessagesCount(liveRes.unreadMessagesCount);
@@ -1736,6 +1742,11 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                         <div className="text-[9.5px] text-slate-500 tabular-nums">
                           معادل {formatToman(workerKpis.earnedRegularWorkToman)}
                         </div>
+                        {(workerKpis.paidLeaveMinutes || 0) > 0 && (
+                          <div className="text-[9px] text-teal-700 font-semibold tabular-nums">
+                            + {formatMinutesToDurationPersian(workerKpis.paidLeaveMinutes || 0)} مرخصی باحقوق
+                          </div>
+                        )}
                       </div>
 
                       <div className="rounded-xl bg-[#FCF9F2] border border-[#C5A059]/50 p-2.5 space-y-0.5">
@@ -2613,6 +2624,8 @@ export const WorkerPanel: React.FC<WorkerPanelProps> = ({
                   historicalRecords={historicalRecords}
                   transactions={transactions}
                   settings={settings}
+                  snapshots={settingsSnapshots}
+                  leaveRequests={leaveRequests}
                   cumulativeBalanceToman={workerKpis.accountBalanceToman}
                 />
               )}

@@ -18,6 +18,7 @@ import {
   OvertimeCalcMode,
   SettlementMode,
   SystemSettings,
+  SystemSettingsSnapshot,
   UserProfile,
   WorkerLiveState,
 } from '../shared/types';
@@ -152,6 +153,7 @@ interface DashboardResponse {
   liveState: WorkerLiveState;
   kpis: {
     approvedPaymentsToman: number;
+    approvedPettyCashToman?: number;
     pendingPaymentsToman: number;
     pendingPaymentsCount: number;
     totalNetWorkMinutes: number;
@@ -162,9 +164,13 @@ interface DashboardResponse {
     effectiveHourlyRateToman: number;
     effectiveOvertimeHourlyRateToman: number;
     earnedRegularWorkToman?: number;
+    paidLeaveMinutes?: number;
+    paidLeavePayToman?: number;
     totalOvertimePayToman: number;
     totalLateDeductionToman?: number;
     totalSalaryPlusOvertimeToman?: number;
+    totalEntitlementToman?: number;
+    accountBalanceToman?: number;
   };
   unseenAlerts: {
     financeAlert: boolean;
@@ -200,6 +206,7 @@ interface DashboardResponse {
   pendingLateReviews?: DailyAttendanceSummary[];
   reviewedLateSummaries?: DailyAttendanceSummary[];
   settings: SystemSettings;
+  settingsSnapshots?: SystemSettingsSnapshot[];
 }
 
 const LATE_DISPOSITION_OPTIONS: {
@@ -224,8 +231,8 @@ const LATE_DISPOSITION_OPTIONS: {
   },
   {
     value: 'ABSENCE',
-    label: 'ثبت غیبت روزانه (کسر مبلغ غیبت)',
-    desc: 'این روز به‌عنوان غیبت ثبت شده و مبلغ کسر غیبت روزانه اعمال می‌شود.',
+    label: 'ثبت غیبت روزانه (بدون دستمزد و بدون جریمه مضاعف)',
+    desc: 'این روز با کارکرد صفر (بدون دستمزد روزانه و بدون کسر مضاعف) ثبت می‌شود.',
   },
   {
     value: 'CUSTOM',
@@ -485,7 +492,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
             late_deduction_toman:
               chosenDecision === 'CUSTOM'
                 ? chosenCustomDeduction
-                : chosenDecision === 'EXCUSED' || chosenDecision === 'DEDUCT_LEAVE'
+                : chosenDecision === 'EXCUSED' ||
+                    chosenDecision === 'DEDUCT_LEAVE' ||
+                    chosenDecision === 'ABSENCE'
                   ? 0
                   : item.late_deduction_toman,
             status_label: badgeInfo ? badgeInfo.label : item.status_label,
@@ -2878,6 +2887,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                 historicalRecords={historicalRecords}
                 transactions={transactions}
                 settings={effectiveDashboard.settings}
+                snapshots={effectiveDashboard.settingsSnapshots}
+                leaveRequests={leaveRequests}
+                cumulativeBalanceToman={dashboard ? dashboard.kpis.accountBalanceToman : undefined}
               />
             )}
 
@@ -4525,6 +4537,9 @@ export const ManagerPanel: React.FC<ManagerPanelProps> = ({
                   historicalRecords={historicalRecords}
                   transactions={transactions}
                   settings={effectiveDashboard.settings}
+                  snapshots={effectiveDashboard.settingsSnapshots}
+                  leaveRequests={leaveRequests}
+                  cumulativeBalanceToman={dashboard ? dashboard.kpis.accountBalanceToman : undefined}
                 />
               )}
 

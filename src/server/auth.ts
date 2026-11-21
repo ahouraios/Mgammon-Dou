@@ -1,12 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import mysql from 'mysql2/promise';
-import {
-  FORBIDDEN_DEFAULT_SECRETS,
-  getPool,
-  validateProductionSecurityConfig,
-} from './db';
+import { getPool } from './db';
+import { getAppConfig, getSessionSecret } from './config';
 import { UserProfile, UserRole } from '../shared/types';
+
+export { getSessionSecret };
 
 export const SESSION_COOKIE_NAME = 'mgammon_duo_sid';
 export const CSRF_COOKIE_NAME = 'mgammon_csrf_token';
@@ -16,20 +15,6 @@ export interface AuthenticatedRequest extends Request {
   user?: UserProfile;
   sessionTokenHash?: string;
   rawSessionToken?: string;
-}
-
-export function getSessionSecret(env: NodeJS.ProcessEnv = process.env): string {
-  validateProductionSecurityConfig(env);
-  const raw = (env.SESSION_SECRET || '').trim();
-  if (raw && raw !== 'undefined' && !FORBIDDEN_DEFAULT_SECRETS.has(raw) && raw.length >= 32) {
-    return raw;
-  }
-  if (env.NODE_ENV === 'production') {
-    throw new Error(
-      'SECURITY_CONFIG_ERROR: SESSION_SECRET در محیط عملیاتی تنظیم نشده یا ناامن است.'
-    );
-  }
-  return 'mgammon-duo-dev-only-ephemeral-secret-key-2026-local';
 }
 
 export function hashSessionToken(rawToken: string): string {
@@ -71,8 +56,9 @@ export async function createServerSession(
 }
 
 export function setSessionCookie(res: Response, rawToken: string, expiresAt: Date): string {
+  const cfg = getAppConfig();
   const isSecure =
-    process.env.NODE_ENV === 'production' || Boolean(process.env.APP_URL?.startsWith('https://'));
+    cfg.isProduction || Boolean(cfg.appUrl?.startsWith('https://'));
   const csrfToken = generateCsrfToken(rawToken);
 
   res.cookie(SESSION_COOKIE_NAME, rawToken, {
@@ -96,8 +82,9 @@ export function setSessionCookie(res: Response, rawToken: string, expiresAt: Dat
 }
 
 export function clearSessionCookie(res: Response): void {
+  const cfg = getAppConfig();
   const isSecure =
-    process.env.NODE_ENV === 'production' || Boolean(process.env.APP_URL?.startsWith('https://'));
+    cfg.isProduction || Boolean(cfg.appUrl?.startsWith('https://'));
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     secure: isSecure,
@@ -220,9 +207,10 @@ export function requireCsrfProtection(
       const originUrl = new URL(String(originHeader));
       const allowedHost = String(hostHeader).split(',')[0].trim();
       let appUrlHost = '';
-      if (process.env.APP_URL) {
+      const cfgUrl = getAppConfig().appUrl;
+      if (cfgUrl) {
         try {
-          appUrlHost = new URL(process.env.APP_URL).host;
+          appUrlHost = new URL(cfgUrl).host;
         } catch {
           appUrlHost = '';
         }
