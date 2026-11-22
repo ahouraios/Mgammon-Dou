@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'path';
@@ -13,9 +12,11 @@ import {
   validateProductionSecurityConfig,
   waitForPendingDatabaseInit,
 } from './src/server/db';
-import { getAppConfig, getAppRootDir } from './src/server/config';
+import { getAppConfig, getAppRootDir, loadEnvironmentOnce } from './src/server/config';
 import { createApiRateLimiter, getSessionUser, requireCsrfProtection } from './src/server/auth';
 import { apiRouter } from './src/server/routes';
+
+loadEnvironmentOnce();
 
 const PRIVATE_MEDIA_FOLDERS = new Set([
   'avatars',

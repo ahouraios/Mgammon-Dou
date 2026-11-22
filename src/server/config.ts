@@ -253,10 +253,24 @@ let envLoadMetadata: EnvLoadMetadata = {
 
 let devOnlyEphemeralSecret: string | null = null;
 
-function getCandidateAppRoots(): string[] {
+export const MIN_SESSION_SECRET_LENGTH = 32;
+export const MIN_SESSION_SECRET_UNIQUE_CHARS = 10;
+
+export function isMgammonAppRootDir(dir: string): boolean {
+  try {
+    const hasSchema = fs.existsSync(path.resolve(dir, 'database/schema.sql'));
+    const hasEntryOrBuild =
+      fs.existsSync(path.resolve(dir, 'app.cjs')) ||
+      fs.existsSync(path.resolve(dir, 'server.ts')) ||
+      fs.existsSync(path.resolve(dir, 'dist/index.html'));
+    return hasSchema && hasEntryOrBuild;
+  } catch {
+    return false;
+  }
+}
+
+function getCandidateAppRoots(customCwd?: string): string[] {
   const dirs: string[] = [];
-  const cwd = process.cwd();
-  dirs.push(cwd);
 
   if (typeof __dirname === 'string' && __dirname) {
     const cleanDir = path.resolve(__dirname);
@@ -276,26 +290,39 @@ function getCandidateAppRoots(): string[] {
     }
   }
 
+  const cwd = path.resolve(customCwd || process.cwd());
+  if (!dirs.includes(cwd)) {
+    dirs.push(cwd);
+  }
+
   return dirs;
 }
 
-export function getAppRootDir(): string {
-  const candidates = getCandidateAppRoots();
+export function getAppRootDir(options?: { cwd?: string; candidates?: string[] }): string {
+  const candidates = options?.candidates || getCandidateAppRoots(options?.cwd);
+
+  // ۱. اولویت قطعی با پوشه‌ای که ساختار واقعی MGAMMON Duo (فایل database/schema.sql به همراه app.cjs یا server.ts یا dist/index.html) را دارد
+  for (const dir of candidates) {
+    if (isMgammonAppRootDir(dir)) {
+      return path.resolve(dir);
+    }
+  }
+
+  // ۲. بررسی وجود هم‌زمان app.cjs و dist/index.html یا database/schema.sql (بدون پذیرش صرفِ package.json متفرقه)
   for (const dir of candidates) {
     try {
       if (
         fs.existsSync(path.resolve(dir, 'database/schema.sql')) ||
-        fs.existsSync(path.resolve(dir, 'dist/index.html')) ||
-        fs.existsSync(path.resolve(dir, 'app.cjs')) ||
-        fs.existsSync(path.resolve(dir, 'package.json'))
+        fs.existsSync(path.resolve(dir, 'app.cjs'))
       ) {
-        return dir;
+        return path.resolve(dir);
       }
     } catch {
       // ignore filesystem read errors
     }
   }
-  return process.cwd();
+
+  return path.resolve(options?.cwd || process.cwd());
 }
 
 function isPublicWebDirectory(filePath: string): boolean {
@@ -361,11 +388,12 @@ export function loadEnvironmentOnce(options?: {
     return envLoadMetadata;
   }
 
-  const searchDirs = options?.searchDirs || getCandidateAppRoots();
+  const appRootDir = getAppRootDir();
+  const searchDirs = options?.searchDirs || [appRootDir];
   const candidateEnvPaths: string[] = [];
 
   if (process.env.MGAMMON_ENV_FILE) {
-    const explicitPath = path.resolve(process.cwd(), process.env.MGAMMON_ENV_FILE);
+    const explicitPath = path.resolve(appRootDir, process.env.MGAMMON_ENV_FILE);
     if (!isPublicWebDirectory(explicitPath)) {
       candidateEnvPaths.push(explicitPath);
     }
@@ -626,24 +654,24 @@ export function validateSessionSecret(
     };
   }
 
-  if (trimmed.length < 32) {
+  if (trimmed.length < MIN_SESSION_SECRET_LENGTH) {
     return {
       valid: false,
       status: 'FAIL',
       code: 'SECRET_TOO_SHORT',
-      reason: `طول SESSION_SECRET برابر ${trimmed.length} کاراکتر است و از حداقل مجاز ۳۲ کاراکتر کمتر است.`,
+      reason: `طول SESSION_SECRET برابر ${trimmed.length} کاراکتر است و از حداقل مجاز ${MIN_SESSION_SECRET_LENGTH} کاراکتر کمتر است.`,
       length: trimmed.length,
       cpanelWarnings: inspection.cpanelUnsafeReasons,
     };
   }
 
   const uniqueCharsCount = new Set(trimmed.split('')).size;
-  if (uniqueCharsCount < 8) {
+  if (uniqueCharsCount < MIN_SESSION_SECRET_UNIQUE_CHARS) {
     return {
       valid: false,
       status: 'FAIL',
       code: 'SECRET_LOW_ENTROPY',
-      reason: `تنوع کاراکترهای SESSION_SECRET بسیار پایین (${uniqueCharsCount} کاراکتر یکتا) است و امنیت کافی ندارد.`,
+      reason: `تنوع کاراکترهای SESSION_SECRET بسیار پایین (${uniqueCharsCount} کاراکتر یکتا؛ حداقل مجاز ${MIN_SESSION_SECRET_UNIQUE_CHARS} کاراکتر یکتا) است و امنیت کافی ندارد.`,
       length: trimmed.length,
       cpanelWarnings: inspection.cpanelUnsafeReasons,
     };
