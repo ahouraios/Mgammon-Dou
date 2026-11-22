@@ -3157,7 +3157,12 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       });
       expect(inactiveUserRes.status).toBe(401);
     } finally {
+      const { hashSessionToken } = await import('../src/server/auth');
       await pool.execute('UPDATE users SET is_active = 1 WHERE id = 2');
+      await pool.execute(
+        'INSERT IGNORE INTO user_sessions (user_id, token_hash, expires_at) VALUES (2, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))',
+        [hashSessionToken(workerToken)]
+      );
       await pool.execute('DELETE FROM historical_work_records WHERE id = ?', [histIns.insertId]);
       await pool.execute('DELETE FROM user_sessions WHERE expires_at <= NOW()');
     }
@@ -3224,7 +3229,125 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       fs.rmSync(tmpLeakDir, { recursive: true, force: true });
     }
   });
+
+  it('آزمون ممیزی مستقل ۵: تشخیص ریشه برنامه (getAppRootDir)، انسداد مسیرهای محرمانه، همخوانی کسر تأخیر سابقه تاریخی در خروجی اکسل و حفاظت از رکوردهای تأییدشده', async () => {
+    const pool = getPool();
+    const { getAppRootDir, analyzeEnvValue } = await import('../src/server/config');
+    const XLSX = await import('xlsx');
+
+    // ۱) بررسی getAppRootDir و انسداد مسیرهای محرمانه (/.env، /.data، /database، /backups)
+    const rootDir = getAppRootDir();
+    expect(fs.existsSync(path.resolve(rootDir, 'database/schema.sql'))).toBe(true);
+
+    for (const forbiddenPath of [
+      '/.env',
+      '/.data/backups/test.json',
+      '/database/schema.sql',
+      '/backups/dump.sql',
+    ]) {
+      const res = await fetch(`${baseUrl}${forbiddenPath}`);
+      expect(res.status).toBe(403);
+    }
+
+    // ۲) بررسی رفتار کاراکترهای خاص در analyzeEnvValue (کوتیشن، فاصله و کاراکترهای حساس پوسته cPanel)
+    const quotedInsp = analyzeEnvValue('"secret_with_quotes"', {
+      isSecret: true,
+      checkCpanelSafety: true,
+    });
+    expect(quotedInsp.hasSurroundingQuotes).toBe(true);
+    expect(quotedInsp.hasCpanelShellUnsafeChars).toBe(true);
+
+    const dollarInsp = analyzeEnvValue('Pass$With#Special', {
+      isSecret: true,
+      checkCpanelSafety: true,
+    });
+    expect(dollarInsp.hasCpanelShellUnsafeChars).toBe(true);
+
+    // ۳) درج رکورد تاریخی تاییدشده با تصمیم CUSTOM و بررسی انعکاس دقیق جریمه در خروجی اکسل مدیریت و حفاظت در برابر ویرایش/حذف توسط پرسنل
+    const targetShamsi = '1405/08/19';
+    const histParsed = JSON.stringify([
+      {
+        row_index: 1,
+        shamsi_date: targetShamsi,
+        check_in: '07:45',
+        check_out: '15:00',
+        net_work_minutes: 435,
+        overtime_minutes: 0,
+        work_days_count: 1,
+        late_status: 'CUSTOM',
+        late_deduction_toman: 0,
+        custom_deduction_toman: 135000,
+      },
+    ]);
+    const [histIns] = await pool.execute<mysql.ResultSetHeader>(
+      `INSERT INTO historical_work_records
+        (user_id, created_by_user_id, work_date, shamsi_date, title, net_work_minutes, overtime_minutes, work_days_count, status, parsed_rows_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?)`,
+      [
+        2,
+        1,
+        shamsiToGregorian(targetShamsi),
+        targetShamsi,
+        'رکورد تست اکسل و حفاظت ممیزی',
+        435,
+        0,
+        1,
+        histParsed,
+      ]
+    );
+
+    try {
+      // الف) تلاش پرسنل برای ویرایش یا حذف رکورد تاریخی تاییدشده باید با 403 مسدود شود
+      const workerEditHistRes = await fetch(
+        `${baseUrl}/api/historical-work/${histIns.insertId}`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${workerToken}`,
+          },
+          body: JSON.stringify({
+            shamsi_date: targetShamsi,
+            title: 'تلاش دستکاری توسط پرسنل',
+            work_days_count: 1,
+            net_work_minutes: 600,
+            overtime_minutes: 120,
+          }),
+        }
+      );
+      expect(workerEditHistRes.status).toBe(403);
+
+      const workerDeleteHistRes = await fetch(
+        `${baseUrl}/api/historical-work/${histIns.insertId}`,
+        {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${workerToken}` },
+        }
+      );
+      expect(workerDeleteHistRes.status).toBe(403);
+
+      // ب) خروجی اکسل مدیریت باید کسر تأخیر 135,000 تومانی رکورد تاریخی CUSTOM را در شیت حضور و غیاب منعکس کند
+      const excelRes = await fetch(
+        `${baseUrl}/api/manager/export/excel?from_shamsi=${targetShamsi}&to_shamsi=${targetShamsi}`,
+        {
+          headers: { Authorization: `Bearer ${managerToken}` },
+        }
+      );
+      expect(excelRes.status).toBe(200);
+      const buf = Buffer.from(await excelRes.arrayBuffer());
+      const wb = XLSX.read(buf, { type: 'buffer' });
+      const attRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(
+        wb.Sheets['ساعات کاری و کارکرد']
+      );
+      const matchingRow = attRows.find((r) => r['تاریخ شمسی'] === targetShamsi);
+      expect(matchingRow).toBeDefined();
+      expect(Number(matchingRow!['کسر تأخیر (تومان)'])).toBe(135000);
+    } finally {
+      await pool.execute('DELETE FROM historical_work_records WHERE id = ?', [histIns.insertId]);
+    }
+  });
 });
+
 
 
 

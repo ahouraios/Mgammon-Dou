@@ -279,6 +279,25 @@ function getCandidateAppRoots(): string[] {
   return dirs;
 }
 
+export function getAppRootDir(): string {
+  const candidates = getCandidateAppRoots();
+  for (const dir of candidates) {
+    try {
+      if (
+        fs.existsSync(path.resolve(dir, 'database/schema.sql')) ||
+        fs.existsSync(path.resolve(dir, 'dist/index.html')) ||
+        fs.existsSync(path.resolve(dir, 'app.cjs')) ||
+        fs.existsSync(path.resolve(dir, 'package.json'))
+      ) {
+        return dir;
+      }
+    } catch {
+      // ignore filesystem read errors
+    }
+  }
+  return process.cwd();
+}
+
 function isPublicWebDirectory(filePath: string): boolean {
   const normalized = path.resolve(filePath).replace(/\\/g, '/').toLowerCase();
   return (
@@ -861,15 +880,18 @@ export function getAppConfig(env: NodeJS.ProcessEnv = process.env) {
     }
   }
 
+  const appRootDir = getAppRootDir();
+
   const privateMediaDir = (env.PRIVATE_MEDIA_DIR || '').trim()
-    ? path.resolve(process.cwd(), (env.PRIVATE_MEDIA_DIR || '').trim())
-    : path.resolve(process.cwd(), '.data/private_media');
+    ? path.resolve(appRootDir, (env.PRIVATE_MEDIA_DIR || '').trim())
+    : path.resolve(appRootDir, '.data/private_media');
 
   const backupDir = (env.BACKUP_DIR || '').trim()
-    ? path.resolve(process.cwd(), (env.BACKUP_DIR || '').trim())
-    : path.resolve(process.cwd(), '.data/backups');
+    ? path.resolve(appRootDir, (env.BACKUP_DIR || '').trim())
+    : path.resolve(appRootDir, '.data/backups');
 
   return {
+    appRootDir,
     nodeEnv: (env.NODE_ENV || '').trim() || 'development',
     isProduction: isProductionMode(env),
     isBundled: isBundledAppCjs(),

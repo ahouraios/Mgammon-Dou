@@ -7,6 +7,7 @@ import {
   ENV_VAR_SPECS,
   FORBIDDEN_DEFAULT_PASSWORDS,
   getAppConfig,
+  getAppRootDir,
   getDbConfig,
   getEnvLoadMetadata,
   isBundledAppCjs,
@@ -99,7 +100,7 @@ function resolveRequiredModuleNames(): { loaded: string[]; failed: string[] } {
     if (typeof require === 'function') {
       localRequire = require;
     } else {
-      localRequire = createRequire(path.resolve(process.cwd(), 'package.json'));
+      localRequire = createRequire(path.resolve(getAppRootDir(), 'package.json'));
     }
   } catch {
     localRequire = null;
@@ -429,8 +430,9 @@ export async function runPreflightDiagnostics(
   // ۱۰. بررسی دسترسی فایل‌سیستم و فایل‌های استاتیک بیلد
   const mediaWrite = checkFilesystemWritable(appCfg.privateMediaDir);
   const backupWrite = checkFilesystemWritable(appCfg.backupDir);
-  const schemaExists = fs.existsSync(path.resolve(process.cwd(), 'database/schema.sql'));
-  const distIndexExists = fs.existsSync(path.resolve(process.cwd(), 'dist/index.html'));
+  const appRootDir = getAppRootDir();
+  const schemaExists = fs.existsSync(path.resolve(appRootDir, 'database/schema.sql'));
+  const distIndexExists = fs.existsSync(path.resolve(appRootDir, 'dist/index.html'));
 
   if (!mediaWrite.ok || !backupWrite.ok || !schemaExists || (isProd && !distIndexExists)) {
     const fsIssues: string[] = [];

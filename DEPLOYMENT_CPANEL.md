@@ -14,7 +14,7 @@
 ---
 
 ### ۲. راه‌اندازی ساختار جداول و مهاجرت خودکار (`database/schema.sql`)
-1. برنامه در اولین اجرا روی دیتابیس کاملاً خالی، به‌صورت خودکار تمام **۱۳ جدول اصلی** (`schema_migrations`, `users`, `user_sessions`, `attendance_logs`, `historical_work_records`, `daily_work_reports`, `financial_transactions`, `system_settings`, `system_settings_snapshots`, `work_correspondences`, `leave_requests`, `work_tasks`, `audit_logs`) را با Encoding استاندارد `utf8mb4_unicode_ci` ایجاد کرده و مهاجرت‌های نسخه‌بندی‌شده (`v1` تا `v6`) را اجرا می‌کند.
+1. برنامه در اولین اجرا روی دیتابیس کاملاً خالی، به‌صورت خودکار تمام **۱۴ جدول اصلی** (`schema_migrations`, `users`, `user_sessions`, `attendance_logs`, `historical_work_records`, `daily_work_reports`, `financial_transactions`, `system_settings`, `system_settings_snapshots`, `work_correspondences`, `leave_requests`, `work_tasks`, `user_reminders`, `audit_logs`) را با Encoding استاندارد `utf8mb4_unicode_ci` ایجاد کرده و مهاجرت‌های نسخه‌بندی‌شده (`v1` تا `v6`) را اجرا می‌کند.
 2. در صورت تمایل به ایمپورت دستی پیش از اجرا، می‌توانید در **phpMyAdmin** دیتابیس ساخته‌شده را انتخاب کرده و از زبانه **Import** فایل `database/schema.sql` را وارد نمایید.
 3. در اولین راه‌اندازی، تنها **دو حساب کاربری اولیه** شامل مدیر (**مجید نورایی** با نقش `manager`) و پرسنل (**امید میثمی** با نقش `worker`) با رمزهای هش‌شده (`bcrypt`) و وضعیت الزام تغییر رمز اولیه (`must_change_password = 1`) به همراه تنظیمات پایه سامانه ایجاد می‌شوند و هیچ داده آزمایشی وارد دیتابیس نمی‌گردد.
 4. تنظیمات وب‌سرویس پیامک (**ملی‌پیامک**) در ابتدای راه‌اندازی الزامی نیست و نبودن آن مانع اجرای هیچ‌یک از بخش‌های سامانه نمی‌شود؛ مدیر می‌تواند پس از ورود، از بخش **«تنظیمات سامانه»** مشخصات خط و حساب ملی‌پیامک را ثبت و آزمایش کند.
@@ -33,7 +33,7 @@
 - **`dist/`**: پوشه کامپایل‌شده فرانت‌اند React، سرویس‌ورکر PWA (`sw.js`, `registerSW.js`)، مانیفست (`manifest.webmanifest`) و فونت محلی `Vazirmatn-VF.woff2`.
 - **`public/`**: فایل‌های استاتیک پایه، آیکون‌های PWA و بنر پیش‌فرض.
 - **`package.json` (و در صورت وجود `package-lock.json`)**: مشخصات وابستگی‌های سازگار با Node.js 22 که در نسخه داخل ZIP فقط شامل دستورات اجرایی Production (`"start": "node app.cjs"` و `"start:prod": "NODE_ENV=production node app.cjs"`) است و فاقد اسکریپت‌های توسعه می‌باشد.
-- **`database/schema.sql`**: اسکریپت کامل ساختار ۱۳ جدول پایگاه داده (مورد استفاده در راه‌اندازی دیتابیس).
+- **`database/schema.sql`**: اسکریپت کامل ساختار ۱۴ جدول پایگاه داده (مورد استفاده در راه‌اندازی دیتابیس).
 - **`.env.example`**: الگوی متغیرهای محیطی (فاقد هرگونه کلید یا رمز محرمانه).
 - **`DEPLOYMENT_CPANEL.md`**: راهنمای جامع استقرار روی هاست.
 - *(پوشه‌های `node_modules/`، `.data/`، `scripts/`، `tests/` و فایل محرمانه `.env` در این بسته قرار ندارند و وابستگی‌ها طبق بخش ۴ مستقیماً روی هاست نصب می‌شوند.)*
@@ -67,14 +67,15 @@
    INITIAL_WORKER_PASSWORD=رمز_اولیه_امن_کارمند
    APP_TIMEZONE=Asia/Tehran
    ```
+   - **نکته مهم درباره `SESSION_SECRET` و `DB_PASSWORD` در cPanel:** برای `SESSION_SECRET` از یک رشته ۶۴ کاراکتری هگزادسیمال (`0-9` و `a-f`) بدون فاصله و بدون علامت نقل‌قول (`"` یا `'`) استفاده کنید. در رابط کاربری `Setup Node.js App` سی‌پنل، مقادیر را بدون کوتیشن وارد کنید؛ اگر رمز دیتابیس (`DB_PASSWORD`) شامل کاراکتر `#` است و از فایل `.env` در ریشه برنامه استفاده می‌کنید، مقدار آن را در فایل `.env` داخل تک‌کوتیشن (`'...'`) قرار دهید تا `#` به‌عنوان کامنت تفسیر نشود.
 5. روی دکمه **Create** کلیک کنید.
 6. **نصب وابستگی‌ها روی هاست:** پس از ساخته شدن اپلیکیشن، در همان صفحه **Setup Node.js App** روی دکمه **Run NPM Install** کلیک کنید تا پکیج‌های موردنیاز از روی `package.json` روی هاست نصب شوند (در صورت استفاده از Terminal سی‌پنل نیز می‌توانید در محیط مجازی برنامه دستور `npm install --omit=dev` را اجرا کنید).
 7. **اجرای برنامه:** روی دکمه **Restart** در Setup Node.js App کلیک کنید تا Passenger فایل اجرایی **`app.cjs`** را اجرا کند (پشتیبانی خودکار از پورت عددی یا UNIX socket تزریق‌شده در متغیر `PORT` توسط Passenger انجام می‌شود؛ همچنین در اجرای دستی از خط فرمان، دستور **`npm start`** مستقیماً `node app.cjs` را اجرا می‌نماید).
 
 ---
 
-### ۵. قرار دادن لوگوی اختصاصی (`/uploads/logo.png`)
-- فایل لوگوی مجموعه در مسیر `public/uploads/logo.png` (و پس از بیلد در `dist/uploads/logo.png`) قرار می‌گیرد.
+### ۵. قرار دادن لوگوی اختصاصی (`/uploads/logo.webp`)
+- فایل لوگوی مجموعه در مسیر `public/uploads/logo.webp` (و پس از بیلد در `dist/uploads/logo.webp`) قرار می‌گیرد.
 - اگر در هر زمان فایل لوگو جایگزین یا حذف شود، برنامه بدون هیچ خطایی نشانگر وکتور سرمه‌ای و طلایی `Mgammon` را نمایش می‌دهد.
 
 ---

@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import mysql from 'mysql2/promise';
 import { getDbConfig, getPool } from './db';
-import { getAppConfig } from './config';
+import { getAppConfig, getAppRootDir } from './config';
 
 export const BACKUP_TABLES_ORDERED = [
   'schema_migrations',
@@ -466,7 +466,7 @@ export async function restoreFromBackupArchive(
   const p = options?.customPool || getPool();
   const targetMediaDir =
     options?.targetMediaDir ||
-    path.resolve(process.cwd(), '.data/private_media');
+    path.resolve(getAppRootDir(), '.data/private_media');
 
   const conn = await p.getConnection();
   try {

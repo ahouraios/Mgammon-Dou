@@ -10,6 +10,7 @@ import {
   FORBIDDEN_DEFAULT_PASSWORDS,
   FORBIDDEN_DEFAULT_SECRETS,
   getAppConfig,
+  getAppRootDir,
   getDbConfig,
   isCpanelOrProductionEnvironment,
   isProductionMode,
@@ -956,7 +957,7 @@ async function createPreMigrationSafetySnapshot(
       return null;
     }
 
-    const backupDir = path.resolve(process.cwd(), '.data/backups');
+    const backupDir = path.resolve(getAppRootDir(), '.data/backups');
     fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
 
     const tablesToSnap = [
@@ -1072,8 +1073,9 @@ export async function runVersionedMigrations(p: mysql.Pool): Promise<{
  */
 export function migrateLegacyPublicMediaToPrivate(): void {
   const folders = ['avatars', 'attachments', 'excel', 'audio', 'receipts', 'reports'];
-  const privateBaseDir = path.resolve(process.cwd(), '.data/private_media');
-  const legacyPublicMediaDir = path.resolve(process.cwd(), 'public/assets/media');
+  const appRootDir = getAppRootDir();
+  const privateBaseDir = path.resolve(appRootDir, '.data/private_media');
+  const legacyPublicMediaDir = path.resolve(appRootDir, 'public/assets/media');
 
   for (const folder of folders) {
     try {
@@ -1141,7 +1143,7 @@ export async function initializeDatabase(): Promise<void> {
       }
 
       const p = getPool();
-      const schemaPath = path.resolve(process.cwd(), 'database/schema.sql');
+      const schemaPath = path.resolve(getAppRootDir(), 'database/schema.sql');
       const schemaSql = fs.readFileSync(schemaPath, 'utf8');
 
       const cleanedSql = schemaSql

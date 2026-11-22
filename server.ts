@@ -13,7 +13,7 @@ import {
   validateProductionSecurityConfig,
   waitForPendingDatabaseInit,
 } from './src/server/db';
-import { getAppConfig } from './src/server/config';
+import { getAppConfig, getAppRootDir } from './src/server/config';
 import { createApiRateLimiter, getSessionUser, requireCsrfProtection } from './src/server/auth';
 import { apiRouter } from './src/server/routes';
 
@@ -75,8 +75,9 @@ export async function createApp() {
   });
 
   // اطمینان از وجود پوشه‌های ذخیره فایل خصوصی خارج از مسیر عمومی وب (.data/private_media)
-  const privateBaseDir = path.resolve(process.cwd(), '.data/private_media');
-  const legacyPublicMediaDir = path.resolve(process.cwd(), 'public/assets/media');
+  const appRootDir = getAppRootDir();
+  const privateBaseDir = path.resolve(appRootDir, '.data/private_media');
+  const legacyPublicMediaDir = path.resolve(appRootDir, 'public/assets/media');
   for (const folder of PRIVATE_MEDIA_FOLDERS) {
     try {
       fs.mkdirSync(path.join(privateBaseDir, folder), { recursive: true, mode: 0o700 });
@@ -229,7 +230,7 @@ export async function createApp() {
       }
 
       const activePrivateBase = process.env.PRIVATE_MEDIA_DIR
-        ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
+        ? path.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR)
         : privateBaseDir;
 
       const privateFolderRoot = path.resolve(activePrivateBase, folder) + path.sep;
@@ -276,7 +277,7 @@ export async function createApp() {
   });
 
   // سرو کردن فایل‌های استاتیک عمومی پوشه public (مانند بنر و آیکون‌های پیش‌فرض)
-  const publicDir = path.resolve(process.cwd(), 'public');
+  const publicDir = path.resolve(appRootDir, 'public');
   app.use(express.static(publicDir));
 
   return app;
@@ -316,7 +317,7 @@ export async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(process.cwd(), 'dist');
+    const distPath = path.resolve(getAppRootDir(), 'dist');
     app.use(express.static(distPath));
     app.use('/api', (_req, res) => {
       res.status(404).json({

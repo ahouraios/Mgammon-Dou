@@ -20,7 +20,7 @@ import {
   listAvailableBackups,
   verifyBackupArchive,
 } from './backup';
-import { getAppConfig } from './config';
+import { getAppConfig, getAppRootDir } from './config';
 import {
   AuthenticatedRequest,
   checkLoginRateLimit,
@@ -303,9 +303,10 @@ function saveBase64MediaFile(
     .replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, '_')
     .slice(0, 40) || 'file';
   const fileName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${safeBase}${ext}`;
+  const appRootDir = getAppRootDir();
   const baseMediaDir = process.env.PRIVATE_MEDIA_DIR
-    ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
-    : path.resolve(process.cwd(), '.data/private_media');
+    ? path.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR)
+    : path.resolve(appRootDir, '.data/private_media');
   const targetDir = path.resolve(baseMediaDir, subFolder);
   fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
   const fullPath = path.join(targetDir, fileName);
@@ -317,9 +318,10 @@ function saveBase64MediaFile(
 }
 
 function getBaseMediaDirPath(): string {
+  const appRootDir = getAppRootDir();
   return process.env.PRIVATE_MEDIA_DIR
-    ? path.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR)
-    : path.resolve(process.cwd(), '.data/private_media');
+    ? path.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR)
+    : path.resolve(appRootDir, '.data/private_media');
 }
 
 function resolveMediaDiskPath(fileUrl: unknown): string | null {
@@ -605,6 +607,18 @@ function mergeApprovedHistoricalIntoDailySummaries(
             ? 0
             : rawLateMins;
 
+        const effectiveRowLateDeduction =
+          savedLateStatus === 'EXCUSED' ||
+          savedLateStatus === 'DEDUCT_LEAVE' ||
+          savedLateStatus === 'ABSENCE'
+            ? 0
+            : savedLateStatus === 'CUSTOM'
+              ? Math.max(
+                  0,
+                  Math.round(Number(row.custom_deduction_toman ?? row.late_deduction_toman ?? 0))
+                )
+              : Math.max(0, Math.round(Number(row.late_deduction_toman ?? 0)));
+
         byShamsi.set(normShamsi, {
           work_date: workDate,
           shamsi_date: normShamsi,
@@ -621,7 +635,7 @@ function mergeApprovedHistoricalIntoDailySummaries(
           late_status: savedLateStatus,
           manager_late_note: row.manager_late_note || null,
           custom_deduction_toman: row.custom_deduction_toman ?? null,
-          late_deduction_toman: row.late_deduction_toman ?? 0,
+          late_deduction_toman: effectiveRowLateDeduction,
           gross_presence_minutes: row.net_work_minutes + row.overtime_minutes,
           mission_minutes: isMission ? 60 : 0,
           break_deducted_minutes: 0,
@@ -4391,6 +4405,21 @@ apiRouter.post(
       const firstInMin = parseTimeToMinutes(targetLog.recorded_time);
       const rawLateMins = Math.max(0, firstInMin - shiftStartMin);
 
+      const graceMins = Math.max(0, Number(effectiveSettings.grace_period_minutes ?? 5));
+      const isLateArrival = firstInMin > shiftStartMin + graceMins;
+      const deductionRates = calculateLateAndAbsenceRates(effectiveSettings);
+      const defaultLateDeductionToman = isLateArrival
+        ? deductionRates.lateUnit === 'HOUR'
+          ? Math.round((rawLateMins / 60) * deductionRates.effectiveLateRatePerUnitToman)
+          : Math.round(rawLateMins * deductionRates.effectiveLateRatePerUnitToman)
+        : 0;
+      const effectiveReviewedLateDeductionToman =
+        decision === 'EXCUSED' || decision === 'DEDUCT_LEAVE' || decision === 'ABSENCE'
+          ? 0
+          : decision === 'CUSTOM'
+            ? Math.max(0, Math.round(Number(customDeductionToman ?? 0)))
+            : defaultLateDeductionToman;
+
       await conn.execute(
         `UPDATE attendance_logs
          SET late_status = ?,
@@ -4435,6 +4464,7 @@ apiRouter.post(
                   late_status: decision,
                   manager_late_note: managerNote,
                   custom_deduction_toman: decision === 'CUSTOM' ? customDeductionToman : null,
+                  late_deduction_toman: effectiveReviewedLateDeductionToman,
                 };
               }
               return r;
@@ -7322,7 +7352,7 @@ apiRouter.get(
   requireRole('manager'),
   (_req: AuthenticatedRequest, res: Response) => {
     try {
-      const zipPath = path.resolve(process.cwd(), 'mgammon-duo-cpanel-deploy.zip');
+      const zipPath = path.resolve(getAppRootDir(), 'mgammon-duo-cpanel-deploy.zip');
       if (!fs.existsSync(zipPath)) {
         res.status(404).json({
           ok: false,
@@ -7406,7 +7436,7 @@ apiRouter.post(
         return;
       }
       const backupDir =
-        process.env.BACKUP_DIR || path.resolve(process.cwd(), '.data/backups');
+        process.env.BACKUP_DIR || path.resolve(getAppRootDir(), '.data/backups');
       const fullPath = path.join(backupDir, fileName);
       const verification = verifyBackupArchive(fullPath);
       if (!verification.valid) {

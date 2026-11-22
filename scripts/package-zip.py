@@ -59,12 +59,28 @@ def create_package():
                 raise FileNotFoundError(f"Required item missing for release package: {item}")
             
             if item == "package.json":
-                # Ensure the packaged package.json has start: node app.cjs and only production run scripts
+                # Ensure the packaged package.json has start: node app.cjs, only production run scripts,
+                # and only the 7 actual server runtime dependencies required by app.cjs with public-npm-compatible ranges
                 with open(full_path, "r", encoding="utf-8") as pf:
                     pkg_data = json.load(pf)
+                pkg_data.pop("type", None)
+                pkg_data.pop("devDependencies", None)
+                pkg_data["main"] = "app.cjs"
+                pkg_data["engines"] = {
+                    "node": ">=20.0.0"
+                }
                 pkg_data["scripts"] = {
                     "start": "node app.cjs",
                     "start:prod": "NODE_ENV=production node app.cjs"
+                }
+                pkg_data["dependencies"] = {
+                    "bcryptjs": ">=2.4.3 <4.0.0",
+                    "cookie-parser": "^1.4.7",
+                    "dotenv": ">=16.4.5 <18.0.0",
+                    "express": "^4.21.2",
+                    "jalaali-js": ">=1.2.8 <3.0.0",
+                    "mysql2": ">=3.11.0 <4.0.0",
+                    "xlsx": "^0.18.5"
                 }
                 pkg_content = json.dumps(pkg_data, indent=2, ensure_ascii=False) + "\n"
                 zf.writestr("package.json", pkg_content)

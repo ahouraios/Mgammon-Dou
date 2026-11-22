@@ -122,6 +122,18 @@ function getCandidateAppRoots() {
   }
   return dirs;
 }
+function getAppRootDir() {
+  const candidates = getCandidateAppRoots();
+  for (const dir of candidates) {
+    try {
+      if (import_fs.default.existsSync(import_path.default.resolve(dir, "database/schema.sql")) || import_fs.default.existsSync(import_path.default.resolve(dir, "dist/index.html")) || import_fs.default.existsSync(import_path.default.resolve(dir, "app.cjs")) || import_fs.default.existsSync(import_path.default.resolve(dir, "package.json"))) {
+        return dir;
+      }
+    } catch {
+    }
+  }
+  return process.cwd();
+}
 function isPublicWebDirectory(filePath) {
   const normalized = import_path.default.resolve(filePath).replace(/\\/g, "/").toLowerCase();
   return normalized.includes("/public/") || normalized.endsWith("/public") || normalized.includes("/dist/") || normalized.endsWith("/dist") || normalized.includes("/public_html/");
@@ -550,9 +562,11 @@ function getAppConfig(env = process.env) {
       isSocketOrPipe = true;
     }
   }
-  const privateMediaDir = (env.PRIVATE_MEDIA_DIR || "").trim() ? import_path.default.resolve(process.cwd(), (env.PRIVATE_MEDIA_DIR || "").trim()) : import_path.default.resolve(process.cwd(), ".data/private_media");
-  const backupDir = (env.BACKUP_DIR || "").trim() ? import_path.default.resolve(process.cwd(), (env.BACKUP_DIR || "").trim()) : import_path.default.resolve(process.cwd(), ".data/backups");
+  const appRootDir = getAppRootDir();
+  const privateMediaDir = (env.PRIVATE_MEDIA_DIR || "").trim() ? import_path.default.resolve(appRootDir, (env.PRIVATE_MEDIA_DIR || "").trim()) : import_path.default.resolve(appRootDir, ".data/private_media");
+  const backupDir = (env.BACKUP_DIR || "").trim() ? import_path.default.resolve(appRootDir, (env.BACKUP_DIR || "").trim()) : import_path.default.resolve(appRootDir, ".data/backups");
   return {
+    appRootDir,
     nodeEnv: (env.NODE_ENV || "").trim() || "development",
     isProduction: isProductionMode(env),
     isBundled: isBundledAppCjs(),
@@ -1375,7 +1389,7 @@ async function createPreMigrationSafetySnapshot(p, targetVersion) {
     if (userCount === 0) {
       return null;
     }
-    const backupDir = import_path2.default.resolve(process.cwd(), ".data/backups");
+    const backupDir = import_path2.default.resolve(getAppRootDir(), ".data/backups");
     import_fs2.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
     const tablesToSnap = [
       "users",
@@ -1468,8 +1482,9 @@ async function runVersionedMigrations(p) {
 }
 function migrateLegacyPublicMediaToPrivate() {
   const folders = ["avatars", "attachments", "excel", "audio", "receipts", "reports"];
-  const privateBaseDir = import_path2.default.resolve(process.cwd(), ".data/private_media");
-  const legacyPublicMediaDir = import_path2.default.resolve(process.cwd(), "public/assets/media");
+  const appRootDir = getAppRootDir();
+  const privateBaseDir = import_path2.default.resolve(appRootDir, ".data/private_media");
+  const legacyPublicMediaDir = import_path2.default.resolve(appRootDir, "public/assets/media");
   for (const folder of folders) {
     try {
       const targetDir = import_path2.default.resolve(privateBaseDir, folder);
@@ -1526,7 +1541,7 @@ async function initializeDatabase() {
         }
       }
       const p = getPool();
-      const schemaPath = import_path2.default.resolve(process.cwd(), "database/schema.sql");
+      const schemaPath = import_path2.default.resolve(getAppRootDir(), "database/schema.sql");
       const schemaSql = import_fs2.default.readFileSync(schemaPath, "utf8");
       const cleanedSql = schemaSql.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n");
       const statements = cleanedSql.split(/;\s*(?:\n|$)/).map((s) => s.trim()).filter((s) => s.length > 0);
@@ -3798,7 +3813,8 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
   }
   const safeBase = import_path4.default.basename(rawName, import_path4.default.extname(rawName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, "_").slice(0, 40) || "file";
   const fileName = `${Date.now()}_${import_crypto5.default.randomBytes(4).toString("hex")}_${safeBase}${ext}`;
-  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(process.cwd(), ".data/private_media");
+  const appRootDir = getAppRootDir();
+  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(appRootDir, ".data/private_media");
   const targetDir = import_path4.default.resolve(baseMediaDir, subFolder);
   import_fs4.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
   const fullPath = import_path4.default.join(targetDir, fileName);
@@ -3809,7 +3825,8 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
   };
 }
 function getBaseMediaDirPath() {
-  return process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(process.cwd(), ".data/private_media");
+  const appRootDir = getAppRootDir();
+  return process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(appRootDir, ".data/private_media");
 }
 function resolveMediaDiskPath(fileUrl) {
   if (typeof fileUrl !== "string") return null;
@@ -4012,6 +4029,10 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
         const savedLateStatus = row.late_status && row.late_status !== "NONE" ? row.late_status : rawLateMins > 0 ? "PENDING" : "NONE";
         const effectiveIsLate = rawLateMins > 0 && savedLateStatus !== "EXCUSED" && savedLateStatus !== "DEDUCT_LEAVE";
         const effectiveLateMins = savedLateStatus === "EXCUSED" || savedLateStatus === "DEDUCT_LEAVE" ? 0 : rawLateMins;
+        const effectiveRowLateDeduction = savedLateStatus === "EXCUSED" || savedLateStatus === "DEDUCT_LEAVE" || savedLateStatus === "ABSENCE" ? 0 : savedLateStatus === "CUSTOM" ? Math.max(
+          0,
+          Math.round(Number(row.custom_deduction_toman ?? row.late_deduction_toman ?? 0))
+        ) : Math.max(0, Math.round(Number(row.late_deduction_toman ?? 0)));
         byShamsi.set(normShamsi, {
           work_date: workDate,
           shamsi_date: normShamsi,
@@ -4028,7 +4049,7 @@ function mergeApprovedHistoricalIntoDailySummaries(dailySummaries, historicalRec
           late_status: savedLateStatus,
           manager_late_note: row.manager_late_note || null,
           custom_deduction_toman: row.custom_deduction_toman ?? null,
-          late_deduction_toman: row.late_deduction_toman ?? 0,
+          late_deduction_toman: effectiveRowLateDeduction,
           gross_presence_minutes: row.net_work_minutes + row.overtime_minutes,
           mission_minutes: isMission ? 60 : 0,
           break_deducted_minutes: 0,
@@ -7090,6 +7111,11 @@ apiRouter.post(
       const { shiftStartHHMM, shiftStartMin } = getDayShiftSchedule(dayOfWeek, effectiveSettings);
       const firstInMin = parseTimeToMinutes(targetLog.recorded_time);
       const rawLateMins = Math.max(0, firstInMin - shiftStartMin);
+      const graceMins = Math.max(0, Number(effectiveSettings.grace_period_minutes ?? 5));
+      const isLateArrival = firstInMin > shiftStartMin + graceMins;
+      const deductionRates = calculateLateAndAbsenceRates(effectiveSettings);
+      const defaultLateDeductionToman = isLateArrival ? deductionRates.lateUnit === "HOUR" ? Math.round(rawLateMins / 60 * deductionRates.effectiveLateRatePerUnitToman) : Math.round(rawLateMins * deductionRates.effectiveLateRatePerUnitToman) : 0;
+      const effectiveReviewedLateDeductionToman = decision === "EXCUSED" || decision === "DEDUCT_LEAVE" || decision === "ABSENCE" ? 0 : decision === "CUSTOM" ? Math.max(0, Math.round(Number(customDeductionToman ?? 0))) : defaultLateDeductionToman;
       await conn.execute(
         `UPDATE attendance_logs
          SET late_status = ?,
@@ -7124,7 +7150,8 @@ apiRouter.post(
                   ...r,
                   late_status: decision,
                   manager_late_note: managerNote,
-                  custom_deduction_toman: decision === "CUSTOM" ? customDeductionToman : null
+                  custom_deduction_toman: decision === "CUSTOM" ? customDeductionToman : null,
+                  late_deduction_toman: effectiveReviewedLateDeductionToman
                 };
               }
               return r;
@@ -9460,7 +9487,7 @@ apiRouter.get(
   requireRole("manager"),
   (_req, res) => {
     try {
-      const zipPath = import_path4.default.resolve(process.cwd(), "mgammon-duo-cpanel-deploy.zip");
+      const zipPath = import_path4.default.resolve(getAppRootDir(), "mgammon-duo-cpanel-deploy.zip");
       if (!import_fs4.default.existsSync(zipPath)) {
         res.status(404).json({
           ok: false,
@@ -9540,7 +9567,7 @@ apiRouter.post(
         res.status(400).json({ ok: false, message: "\u0646\u0627\u0645 \u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
         return;
       }
-      const backupDir = process.env.BACKUP_DIR || import_path4.default.resolve(process.cwd(), ".data/backups");
+      const backupDir = process.env.BACKUP_DIR || import_path4.default.resolve(getAppRootDir(), ".data/backups");
       const fullPath = import_path4.default.join(backupDir, fileName);
       const verification = verifyBackupArchive(fullPath);
       if (!verification.valid) {
@@ -10547,8 +10574,9 @@ async function createApp() {
     }
     next();
   });
-  const privateBaseDir = import_path5.default.resolve(process.cwd(), ".data/private_media");
-  const legacyPublicMediaDir = import_path5.default.resolve(process.cwd(), "public/assets/media");
+  const appRootDir = getAppRootDir();
+  const privateBaseDir = import_path5.default.resolve(appRootDir, ".data/private_media");
+  const legacyPublicMediaDir = import_path5.default.resolve(appRootDir, "public/assets/media");
   for (const folder of PRIVATE_MEDIA_FOLDERS) {
     try {
       import_fs5.default.mkdirSync(import_path5.default.join(privateBaseDir, folder), { recursive: true, mode: 448 });
@@ -10669,7 +10697,7 @@ async function createApp() {
           return;
         }
       }
-      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR ? import_path5.default.resolve(process.cwd(), process.env.PRIVATE_MEDIA_DIR) : privateBaseDir;
+      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR ? import_path5.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : privateBaseDir;
       const privateFolderRoot = import_path5.default.resolve(activePrivateBase, folder) + import_path5.default.sep;
       const legacyFolderRoot = import_path5.default.resolve(legacyPublicMediaDir, folder) + import_path5.default.sep;
       const candidatePrivate = import_path5.default.resolve(activePrivateBase, folder, filename);
@@ -10699,7 +10727,7 @@ async function createApp() {
     }
     next();
   });
-  const publicDir = import_path5.default.resolve(process.cwd(), "public");
+  const publicDir = import_path5.default.resolve(appRootDir, "public");
   app.use(import_express2.default.static(publicDir));
   return app;
 }
@@ -10731,7 +10759,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = import_path5.default.resolve(process.cwd(), "dist");
+    const distPath = import_path5.default.resolve(getAppRootDir(), "dist");
     app.use(import_express2.default.static(distPath));
     app.use("/api", (_req, res) => {
       res.status(404).json({
