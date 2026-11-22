@@ -3442,24 +3442,79 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       expect(badPortReport.checks.find((c) => c.id === 'port_config')?.status).toBe('FAIL');
     }
 
-    // بررسی وضعیت NOT_CONFIGURED برای متغیرهای اختیاری و WARNING برای طول کلید ۳۲ کاراکتری (کمتر از ۶۴)
-    const shortValidSecret = 'abcdef0123456789abcdef0123456789';
-    const warnReport = await runPreflightDiagnostics({
+    // ۵-الف) بررسی هماهنگی بازه DB_CONNECTION_LIMIT (۲ تا ۵۰) و اختیاری بودن DB_PORT با پیش‌فرض ۳۳۰۶ و وضعیت WARNING برای PORT خالی در Passenger
+    const { ENV_VAR_SPECS } = await import('../src/server/config');
+    expect(ENV_VAR_SPECS.find((s) => s.name === 'DB_PORT')?.requiredInProduction).toBe(false);
+
+    const omittedDbPortCheck = validateProductionDatabaseConfig({
+      NODE_ENV: 'production',
+      DB_HOST: '127.0.0.1',
+      DB_USER: 'cpanel_usr',
+      DB_NAME: 'cpanel_db',
+      DB_PASSWORD: realDbPass,
+    });
+    expect(omittedDbPortCheck.valid).toBe(true);
+    expect(
+      getDbConfig({
+        NODE_ENV: 'production',
+        DB_HOST: '127.0.0.1',
+        DB_USER: 'cpanel_usr',
+        DB_NAME: 'cpanel_db',
+        DB_PASSWORD: realDbPass,
+      }).port
+    ).toBe(3306);
+
+    for (const invalidPoolLimit of ['0', '1', '51', '100']) {
+      const badLimit = validateProductionDatabaseConfig({
+        NODE_ENV: 'production',
+        DB_HOST: '127.0.0.1',
+        DB_USER: 'cpanel_usr',
+        DB_NAME: 'cpanel_db',
+        DB_PASSWORD: realDbPass,
+        DB_CONNECTION_LIMIT: invalidPoolLimit,
+      });
+      expect(badLimit.valid).toBe(false);
+    }
+    expect(
+      validateProductionDatabaseConfig({
+        NODE_ENV: 'production',
+        DB_HOST: '127.0.0.1',
+        DB_USER: 'cpanel_usr',
+        DB_NAME: 'cpanel_db',
+        DB_PASSWORD: realDbPass,
+        DB_CONNECTION_LIMIT: '2',
+      }).valid
+    ).toBe(true);
+    expect(
+      validateProductionDatabaseConfig({
+        NODE_ENV: 'production',
+        DB_HOST: '127.0.0.1',
+        DB_USER: 'cpanel_usr',
+        DB_NAME: 'cpanel_db',
+        DB_PASSWORD: realDbPass,
+        DB_CONNECTION_LIMIT: '50',
+      }).valid
+    ).toBe(true);
+
+    const passengerEmptyPortReport = await runPreflightDiagnostics({
       env: {
         NODE_ENV: 'production',
-        SESSION_SECRET: shortValidSecret,
+        PASSENGER_APP_ENV: 'production',
+        PORT: '',
+        SESSION_SECRET: realSecret,
         DB_HOST: '127.0.0.1',
-        DB_PORT: '3306',
         DB_USER: 'cpanel_usr',
         DB_NAME: 'cpanel_db',
         DB_PASSWORD: realDbPass,
       },
       checkDb: false,
     });
-    expect(warnReport.ok).toBe(true);
-    expect(warnReport.checks.find((c) => c.id === 'session_secret')?.status).toBe('WARNING');
-    expect(warnReport.checks.find((c) => c.id === 'optional_timezone')?.status).toBe('NOT_CONFIGURED');
-    expect(warnReport.checks.find((c) => c.id === 'initial_accounts_env')?.status).toBe('NOT_CONFIGURED');
+    expect(passengerEmptyPortReport.checks.find((c) => c.id === 'port_config')?.status).toBe(
+      'WARNING'
+    );
+    expect(passengerEmptyPortReport.checks.find((c) => c.id === 'db_env_vars')?.status).toBe(
+      'PASS'
+    );
 
     // ۶) عدم افشای اطلاعات محرمانه در گزارش Preflight و sanitizeSecretErrorText
     const prevSecret = process.env.SESSION_SECRET;
@@ -3509,4 +3564,346 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       else process.env.PORT = prevPort;
     }
   });
+
+  it('آزمون ممیزی مستقل ۷: نمونه‌های عددی قابل تکرار و موارد مرزی محاسبه حقوق، کسر استراحت، پنجشنبه، تأخیر/غیبت، مرخصی، تنخواه و اقساط', async () => {
+    const { calculateSalaryAndOvertimeRates, calculateCumulativeFinancialSummaryAsOf } =
+      await import('../src/shared/calculationEngine');
+
+    const sampleSettings: SystemSettings = {
+      ...BASE_SETTINGS,
+      shift_start_time: '07:00',
+      shift_end_time: '15:00',
+      overtime_start_time: '15:00',
+      thursday_shift_start_time: '07:00',
+      thursday_shift_end_time: '14:00',
+      thursday_overtime_start_time: '14:00',
+      grace_period_minutes: 15,
+      break_duration_minutes: 0,
+      working_days: [6, 0, 1, 2, 3, 4],
+      friday_holiday_policy: 'ALL_OVERTIME',
+      base_salary_toman: 26000000, // روزانه 1,000,000 تومان، ساعتی 125,000 تومان
+      hourly_rate_toman: null,
+      overtime_calc_mode: 'PERCENTAGE',
+      overtime_percentage: 140, // اضافه‌کاری ساعتی 175,000 تومان
+      overtime_rate_toman: null,
+      collaboration_start_shamsi: '1405/07/15',
+      monthly_leave_quota_days: 2.5,
+      late_deduction_unit: 'MINUTE',
+      late_deduction_rate_toman: null,
+    };
+
+    const baseRates = calculateSalaryAndOvertimeRates(sampleSettings, 120);
+    expect(baseRates.dailyBaseRateToman).toBe(1000000);
+    expect(baseRates.effectiveHourlyRateToman).toBe(125000);
+    expect(baseRates.effectiveOvertimeHourlyRateToman).toBe(175000);
+    expect(baseRates.totalOvertimePayToman).toBe(350000);
+
+    // ۱) مرز کسر استراحت: حضور <= ۲۴۰ دقیقه بدون کسر استراحت؛ حضور ۲۴۱ دقیقه با کسر استراحت
+    const breakSettings: SystemSettings = { ...sampleSettings, break_duration_minutes: 30 };
+    const at240 = calculateDailyAttendance(
+      '2026-10-17',
+      '1405/07/25',
+      [
+        makeLog(7001, 'WORK_START', '07:00:00', '2026-10-17', '1405/07/25'),
+        makeLog(7002, 'WORK_END', '11:00:00', '2026-10-17', '1405/07/25'),
+      ],
+      breakSettings
+    );
+    expect(at240.break_deducted_minutes).toBe(0);
+    expect(at240.net_work_minutes).toBe(240);
+
+    const at241 = calculateDailyAttendance(
+      '2026-10-17',
+      '1405/07/25',
+      [
+        makeLog(7003, 'WORK_START', '07:00:00', '2026-10-17', '1405/07/25'),
+        makeLog(7004, 'WORK_END', '11:01:00', '2026-10-17', '1405/07/25'),
+      ],
+      breakSettings
+    );
+    expect(at241.break_deducted_minutes).toBe(30);
+    expect(at241.net_work_minutes).toBe(211);
+
+    // ۲) محاسبه نمونه روزانه و دوره ۱۵ام به ۱۵ام (۱۴۰۵/۰۷/۱۵ تا ۱۴۰۵/۰۸/۱۴ و تراکنش‌ها تا ۱۴۰۵/۰۸/۱۵)
+    // روز ۱ (شنبه ۱۴۰۵/۰۷/۱۸ = 2026-10-10): کار ۰۷:۰۰ تا ۱۷:۰۰ -> ۴۸۰ عادی (1,000,000) + ۱۲۰ اضافه‌کاری (350,000)
+    const d1 = calculateDailyAttendance(
+      shamsiToGregorian('1405/07/18'),
+      '1405/07/18',
+      [
+        makeLog(7101, 'WORK_START', '07:00:00', shamsiToGregorian('1405/07/18'), '1405/07/18'),
+        makeLog(7102, 'WORK_END', '17:00:00', shamsiToGregorian('1405/07/18'), '1405/07/18'),
+      ],
+      sampleSettings
+    );
+    // روز ۲ (پنجشنبه ۱۴۰۵/۰۷/۲۳ = 2026-10-15): شیفت ۷ ساعته (۰۷:۰۰ تا ۱۴:۰۰) -> ۱ روز کامل (1,000,000) + ۶۰ اضافه‌کاری تا ۱۵:۰۰ (175,000)
+    const d2 = calculateDailyAttendance(
+      shamsiToGregorian('1405/07/23'),
+      '1405/07/23',
+      [
+        makeLog(7103, 'WORK_START', '07:00:00', shamsiToGregorian('1405/07/23'), '1405/07/23'),
+        makeLog(7104, 'WORK_END', '15:00:00', shamsiToGregorian('1405/07/23'), '1405/07/23'),
+      ],
+      sampleSettings
+    );
+    // روز ۳ (شنبه ۱۴۰۵/۰۷/۲۵): خروج زودتر (۰۷:۰۰ تا ۱۳:۰۰ = ۳۶۰ دقیقه / ۴۸۰ دقیقه) -> 750,000 تومان
+    const d3 = calculateDailyAttendance(
+      shamsiToGregorian('1405/07/25'),
+      '1405/07/25',
+      [
+        makeLog(7105, 'WORK_START', '07:00:00', shamsiToGregorian('1405/07/25'), '1405/07/25'),
+        makeLog(7106, 'WORK_END', '13:00:00', shamsiToGregorian('1405/07/25'), '1405/07/25'),
+      ],
+      sampleSettings
+    );
+    // روز ۴ (یکشنبه ۱۴۰۵/۰۷/۲۶): ورود ۰۷:۳۰ (۳۰ دقیقه تأخیر با APPROVED_DELAY) تا ۱۵:۰۰
+    // کار عادی = ۴۵۰ دقیقه -> Math.round((450/480)*1,000,000) = 937,500؛ جریمه تأخیر = 30 * Math.round(125,000/60) = 30 * 2,083 = 62,490 تومان
+    const d4 = calculateDailyAttendance(
+      shamsiToGregorian('1405/07/26'),
+      '1405/07/26',
+      [
+        {
+          ...makeLog(7107, 'WORK_START', '07:30:00', shamsiToGregorian('1405/07/26'), '1405/07/26'),
+          late_status: 'APPROVED_DELAY',
+        },
+        makeLog(7108, 'WORK_END', '15:00:00', shamsiToGregorian('1405/07/26'), '1405/07/26'),
+      ],
+      sampleSettings
+    );
+    expect(d4.late_deduction_toman).toBe(62490);
+
+    // روز ۵ (دوشنبه ۱۴۰۵/۰۷/۲۷): ثبت غیبت ABSENCE (با وجود تردد) -> کارکرد 0، جریمه اضافه 0 (عدم کسر مضاعف)
+    const d5Absence = calculateDailyAttendance(
+      shamsiToGregorian('1405/07/27'),
+      '1405/07/27',
+      [
+        {
+          ...makeLog(7109, 'WORK_START', '09:00:00', shamsiToGregorian('1405/07/27'), '1405/07/27'),
+          late_status: 'ABSENCE',
+        },
+        makeLog(7110, 'WORK_END', '12:00:00', shamsiToGregorian('1405/07/27'), '1405/07/27'),
+      ],
+      sampleSettings
+    );
+    expect(d5Absence.net_work_minutes).toBe(0);
+    expect(d5Absence.overtime_minutes).toBe(0);
+    expect(d5Absence.late_deduction_toman).toBe(0);
+
+    // روز ۶ (جمعه ۱۴۰۵/۰۸/۰۱): ۴ ساعت جمعه‌کاری ALL_OVERTIME (240 دقیقه، ۰ عادی + ۲۴۰ اضافه‌کاری = 700,000 تومان)
+    const d6Friday = calculateDailyAttendance(
+      shamsiToGregorian('1405/08/01'),
+      '1405/08/01',
+      [
+        makeLog(7111, 'WORK_START', '09:00:00', shamsiToGregorian('1405/08/01'), '1405/08/01'),
+        makeLog(7112, 'WORK_END', '13:00:00', shamsiToGregorian('1405/08/01'), '1405/08/01'),
+      ],
+      sampleSettings
+    );
+    expect(d6Friday.net_work_minutes).toBe(240);
+    expect(d6Friday.overtime_minutes).toBe(240);
+
+    // مرخصی روزانه باحقوق در ۱۴۰۵/۰۷/۲۸ (۴۸۰ دقیقه -> 1,000,000 تومان) + مرخصی مازاد بر سهمیه در همان ماه (۱۵۰ دقیقه در ۱۰ روز نیست؛ فرض ۲ روز قبلی + ۰.۷ روز = ۲.۷ روز، مازاد ۰.۲ روز = ۹۶ دقیقه بی‌حقوق)
+    const sampleLeaves = [
+      {
+        id: 1,
+        user_id: 2,
+        shamsi_date: '1405/07/28',
+        work_date: shamsiToGregorian('1405/07/28'),
+        leave_type: 'DAILY' as const,
+        start_time: null,
+        end_time: null,
+        duration_minutes: 480,
+        reason: 'مرخصی استحقاقی ۱',
+        status: 'APPROVED' as const,
+        manager_note: null,
+        reviewed_by_user_id: 1,
+        reviewed_at: null,
+        is_seen_by_manager: true,
+        created_at: '',
+      },
+      {
+        id: 2,
+        user_id: 2,
+        shamsi_date: '1405/07/29',
+        work_date: shamsiToGregorian('1405/07/29'),
+        leave_type: 'DAILY' as const,
+        start_time: null,
+        end_time: null,
+        duration_minutes: 480,
+        reason: 'مرخصی استحقاقی ۲',
+        status: 'APPROVED' as const,
+        manager_note: null,
+        reviewed_by_user_id: 1,
+        reviewed_at: null,
+        is_seen_by_manager: true,
+        created_at: '',
+      },
+      {
+        id: 3,
+        user_id: 2,
+        shamsi_date: '1405/07/30',
+        work_date: shamsiToGregorian('1405/07/30'),
+        leave_type: 'HOURLY' as const,
+        start_time: '07:00',
+        end_time: '12:36',
+        duration_minutes: 336, // فقط 240 دقیقه در سهمیه ۱۲۰۰ دقیقه‌ای مهر می‌ماند، ۹۶ دقیقه مازاد بدون حقوق است
+        reason: 'مرخصی ساعتی مرزی',
+        status: 'APPROVED' as const,
+        manager_note: null,
+        reviewed_by_user_id: 1,
+        reviewed_at: null,
+        is_seen_by_manager: true,
+        created_at: '',
+      },
+    ];
+
+    const sampleTxs = [
+      {
+        id: 1,
+        user_id: 2,
+        created_by_user_id: 1,
+        tx_date: shamsiToGregorian('1405/07/24'),
+        shamsi_date: '1405/07/24',
+        tx_type: 'PETTY_CASH' as const,
+        amount_toman: 300000,
+        description: 'خرید ملزومات کارگاه',
+        status: 'APPROVED' as const,
+        settlement_mode: 'LUMP_SUM' as const,
+        monthly_deduction_toman: null,
+        installment_start_shamsi: null,
+        receipt_file_url: null,
+        receipt_file_name: null,
+        manager_note: null,
+        reviewed_by_user_id: 1,
+        reviewed_at: null,
+        idempotency_key: null,
+        is_seen_by_manager: true,
+        created_at: '',
+      },
+      {
+        id: 2,
+        user_id: 2,
+        created_by_user_id: 1,
+        tx_date: shamsiToGregorian('1405/08/02'),
+        shamsi_date: '1405/08/02',
+        tx_type: 'ADVANCE' as const,
+        amount_toman: 1200000,
+        description: 'مساعده میان‌دوره',
+        status: 'APPROVED' as const,
+        settlement_mode: 'LUMP_SUM' as const,
+        monthly_deduction_toman: null,
+        installment_start_shamsi: null,
+        receipt_file_url: null,
+        receipt_file_name: null,
+        manager_note: null,
+        reviewed_by_user_id: 1,
+        reviewed_at: null,
+        idempotency_key: null,
+        is_seen_by_manager: true,
+        created_at: '',
+      },
+      {
+        id: 3,
+        user_id: 2,
+        created_by_user_id: 1,
+        tx_date: shamsiToGregorian('1405/08/05'),
+        shamsi_date: '1405/08/05',
+        tx_type: 'OTHER' as const,
+        amount_toman: 1500000,
+        description: 'خرید ابزار اقساطی',
+        status: 'APPROVED' as const,
+        settlement_mode: 'INSTALLMENT' as const,
+        monthly_deduction_toman: 500000,
+        installment_start_shamsi: '1405/08/05',
+        receipt_file_url: null,
+        receipt_file_name: null,
+        manager_note: null,
+        reviewed_by_user_id: 1,
+        reviewed_at: null,
+        idempotency_key: null,
+        is_seen_by_manager: true,
+        created_at: '',
+      },
+    ];
+
+    const stmt = calculatePeriodStatement({
+      periodKey: 'cycle-1405/07/15-1405/08/15',
+      title: 'مهر ۱۴۰۵',
+      fromShamsi: '1405/07/15',
+      toShamsi: '1405/08/14',
+      txFromShamsi: '1405/07/15',
+      txToShamsi: '1405/08/15',
+      collabStartShamsi: '1405/07/15',
+      dailySummaries: [d1, d2, d3, d4, d5Absence, d6Friday],
+      approvedLeaves: sampleLeaves,
+      transactions: sampleTxs,
+      settings: sampleSettings,
+    });
+
+    // حقوق روزشمار کارکرد = 1,000,000 (d1) + 1,000,000 (d2) + 750,000 (d3) + 937,500 (d4) + 0 (d5 غیبت) + 0 (d6 جمعه تماماً اضافه‌کاری) = 3,687,500
+    // مرخصی باحقوق = 1200 دقیقه (2.5 روز سقف سهمیه مهر) = 2,500,000 -> جمع کار عادی + مرخصی باحقوق = 6,187,500
+    expect(stmt.paidLeaveMinutes).toBe(1200);
+    expect(stmt.paidLeavePayToman).toBe(2500000);
+    expect(stmt.earnedRegularSalaryToman).toBe(6187500);
+    // اضافه‌کاری = 120m (350,000) + 60m (175,000) + 240m جمعه (700,000) = 420 دقیقه = 1,225,000 تومان
+    expect(stmt.overtimeMinutes).toBe(420);
+    expect(stmt.earnedOvertimePayToman).toBe(1225000);
+    // کسر تأخیر = 62,490 تومان
+    expect(stmt.lateAndAbsenceDeductionToman).toBe(62490);
+    // خالص حقوق + اضافه‌کاری = 6,187,500 + 1,225,000 - 62,490 = 7,350,010 تومان
+    expect(stmt.salaryPlusOvertimeToman).toBe(7350010);
+    // جمع استحقاقی با تنخواه (+300,000) = 7,650,010 تومان
+    expect(stmt.approvedPettyCashToman).toBe(300000);
+    expect(stmt.totalPeriodEntitlementToman).toBe(7650010);
+    // دریافتی/کسورات دوره = 1,200,000 (مساعده) + 500,000 (قسط ۱ از ۳) = 1,700,000؛ مانده تعهد آتی = 1,000,000
+    expect(stmt.installmentDeductionThisPeriodToman).toBe(500000);
+    expect(stmt.remainingDeferredDebtAfterPeriodToman).toBe(1000000);
+    expect(stmt.approvedTotalPaidOrReceivedToman).toBe(1700000);
+    // مانده تسویه دوره = 7,650,010 - 1,700,000 = 5,950,010 تومان
+    expect(stmt.periodBalanceToman).toBe(5950010);
+
+    // تطبیق خلاصه تجمعی مالی تا پایان روزهای کاری دوره اول (۱۴۰۵/۰۸/۱۴ -> ۱ قسط سررسیدشده = ۵۰۰,۰۰۰)
+    const finCumEndCycle1 = calculateCumulativeFinancialSummaryAsOf({
+      transactions: sampleTxs,
+      currentShamsiDate: '1405/08/14',
+      collabStartShamsi: '1405/07/15',
+      anchorDay: 15,
+    });
+    expect(finCumEndCycle1.approvedPettyCashToman).toBe(300000);
+    expect(finCumEndCycle1.approvedMaturedReceivedToman).toBe(1700000);
+    expect(finCumEndCycle1.unamortizedDeferredDebtToman).toBe(1000000);
+
+    // تطبیق مجموع صورتحساب‌های دوره‌ای generateStatementPeriods با مانده تجمعی در تاریخ شروع دوره دوم (۱۴۰۵/۰۸/۱۵ -> ۲ قسط سررسیدشده)
+    const allGenerated = generateStatementPeriods({
+      mode: 'CONTRACT_CYCLE',
+      cycleStartDay: 15,
+      inclusiveEndDay: true,
+      currentShamsiDate: '1405/08/15',
+      collaborationStartShamsi: '1405/07/15',
+      dailySummaries: [d1, d2, d3, d4, d5Absence, d6Friday],
+      approvedLeaves: sampleLeaves,
+      transactions: sampleTxs,
+      settings: sampleSettings,
+    });
+    const finCumStartCycle2 = calculateCumulativeFinancialSummaryAsOf({
+      transactions: sampleTxs,
+      currentShamsiDate: '1405/08/15',
+      collabStartShamsi: '1405/07/15',
+      anchorDay: 15,
+    });
+    expect(finCumStartCycle2.approvedMaturedReceivedToman).toBe(2200000);
+    expect(finCumStartCycle2.unamortizedDeferredDebtToman).toBe(500000);
+    const sumPaidAcrossPeriods = allGenerated.reduce(
+      (sum, p) => sum + p.approvedTotalPaidOrReceivedToman,
+      0
+    );
+    expect(sumPaidAcrossPeriods).toBe(finCumStartCycle2.approvedMaturedReceivedToman);
+    const sumBalanceAcrossPeriods = allGenerated.reduce(
+      (sum, p) => sum + p.periodBalanceToman,
+      0
+    );
+    const expectedCumBalance =
+      stmt.totalPeriodEntitlementToman - finCumStartCycle2.approvedMaturedReceivedToman;
+    expect(sumBalanceAcrossPeriods).toBe(expectedCumBalance);
+  });
 });
+

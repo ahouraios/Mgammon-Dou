@@ -38,10 +38,10 @@ export const ENV_VAR_SPECS: EnvVarSpec[] = [
   },
   {
     name: 'DB_PORT',
-    requiredInProduction: true,
+    requiredInProduction: false,
     secret: false,
     cpanelSensitive: true,
-    description: 'پورت پایگاه داده (پیش‌فرض 3306)',
+    description: 'پورت پایگاه داده (اختیاری؛ پیش‌فرض 3306)',
     defaultValue: '3306',
   },
   {
@@ -768,8 +768,8 @@ export function validateProductionDatabaseConfig(env: NodeJS.ProcessEnv = proces
 
   if (rawConnLimit) {
     const limitNum = Number(rawConnLimit);
-    if (!Number.isInteger(limitNum) || limitNum < 1 || limitNum > 100) {
-      invalidVars.push('DB_CONNECTION_LIMIT (باید عدد صحیح بین ۱ تا ۱۰۰ باشد)');
+    if (!Number.isInteger(limitNum) || limitNum < 2 || limitNum > 50) {
+      invalidVars.push('DB_CONNECTION_LIMIT (باید عدد صحیح بین ۲ تا ۵۰ باشد)');
     }
   }
 

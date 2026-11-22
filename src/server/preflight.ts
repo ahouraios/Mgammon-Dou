@@ -293,6 +293,7 @@ export async function runPreflightDiagnostics(
 
   // ۶. بررسی متغیرهای ضروری و اختیاری پایگاه داده
   const dbCheck = validateProductionDatabaseConfig(env);
+  const rawDbPort = (env.DB_PORT || '').trim();
   const rawConnLimit = (env.DB_CONNECTION_LIMIT || '').trim();
   if (!dbCheck.valid) {
     checks.push({
@@ -302,7 +303,7 @@ export async function runPreflightDiagnostics(
       status: isProd ? 'FAIL' : 'WARNING',
       message: dbCheck.message,
       remediation:
-        'متغیرهای DB_HOST، DB_PORT، DB_NAME، DB_USER و DB_PASSWORD را دقیقاً مطابق MySQL Databases در cPanel ثبت کنید.',
+        'متغیرهای DB_HOST، DB_NAME، DB_USER و DB_PASSWORD (و در صورت نیاز DB_PORT با پیش‌فرض 3306) را دقیقاً مطابق MySQL Databases در cPanel ثبت کنید.',
     });
   } else {
     const dbCfg = getDbConfig(env);
@@ -311,7 +312,7 @@ export async function runPreflightDiagnostics(
       category: 'database',
       label: 'متغیرهای محیطی پایگاه داده (DB_*)',
       status: 'PASS',
-      message: `تنظیمات اتصال دیتابیس معتبر است (host=${dbCfg.host}, port=${dbCfg.port}, db=${dbCfg.database}, poolLimit=${dbCfg.connectionLimit}${rawConnLimit ? '' : ' [پیش‌فرض]'}).`,
+      message: `تنظیمات اتصال دیتابیس معتبر است (host=${dbCfg.host}, port=${dbCfg.port}${rawDbPort ? '' : ' [پیش‌فرض]'}, db=${dbCfg.database}, poolLimit=${dbCfg.connectionLimit}${rawConnLimit ? '' : ' [پیش‌فرض]'}).`,
     });
   }
 
@@ -386,10 +387,13 @@ export async function runPreflightDiagnostics(
       id: 'port_config',
       category: 'network',
       label: 'پورت اجرا (PORT)',
-      status: isPassenger ? 'PASS' : 'NOT_CONFIGURED',
+      status: isPassenger ? 'WARNING' : 'NOT_CONFIGURED',
       message: isPassenger
-        ? 'متغیر PORT خالی است؛ در محیط Passenger در صورت تزریق سوکت از طریق hook داخلی Passenger مدیریت می‌شود (نیازمند بررسی روی هاست واقعی).'
+        ? 'متغیر PORT خالی است؛ برنامه مقدار پیش‌فرض ۳۰۰۰ (0.0.0.0) را به app.listen می‌دهد و آیا لودر Passenger در هاست واقعی آن را به سوکت خود متصل می‌کند یا خیر خارج از هاست قابل اثبات نیست.'
         : `پورت صریح تنظیم نشده؛ برنامه از مقدار پیش‌فرض ${String(appCfg.listenTarget)} استفاده می‌کند.`,
+      remediation: isPassenger
+        ? 'پس از استقرار روی هاست واقعی، اجرای HTTP/HTTPS و لاگ Passenger را بررسی کنید (در اجرای دستی با PORT=3000 کار می‌کند).'
+        : undefined,
     });
   } else if (appCfg.isSocketOrPipe || isValidNumericPort) {
     checks.push({

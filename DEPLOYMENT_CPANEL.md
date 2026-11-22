@@ -121,7 +121,7 @@
 | `NODE_ENV` | الزامی | مقدار `production` (با انتخاب `Application mode: Production` در cPanel نیز اعمال می‌شود) |
 | `SESSION_SECRET` | الزامی | رشته ۶۴ کاراکتری هگزادسیمال (`0-9` و `a-f`) بدون فاصله، کوتیشن یا `$` |
 | `DB_HOST` | الزامی | آدرس MySQL (در cPanel معمولاً `127.0.0.1` یا `localhost`) |
-| `DB_PORT` | الزامی | پورت MySQL (پیش‌فرض `3306`) |
+| `DB_PORT` | اختیاری | پورت MySQL (پیش‌فرض `3306`؛ ثبت صریح در cPanel توصیه می‌شود) |
 | `DB_NAME` | الزامی | نام کامل دیتابیس ساخته‌شده در cPanel (مثلاً `cpaneluser_mgammon_duo`) |
 | `DB_USER` | الزامی | نام کاربری دیتابیس در cPanel (مثلاً `cpaneluser_mgammon`) |
 | `DB_PASSWORD` | الزامی | رمز عبور کاربر دیتابیس |
@@ -155,6 +155,7 @@
 
 #### د) آزمایش تنظیمات پیش از اجرا (Preflight Check بدون نیاز به SSH)
 در صفحه **Setup Node.js App** در cPanel می‌توانید در بخش **Run JS script** عبارت `app.cjs --preflight` را اجرا کنید (یا در Terminal دستور `node app.cjs --preflight` را بزنید). گزارش با وضعیت‌های `PASS` / `WARNING` / `FAIL` / `NOT_CONFIGURED` بدون نمایش هیچ رمز یا Secret چاپ می‌شود.
+- **نکته درباره تست نوشتن در فایل‌سیستم (`filesystem_access`):** دستور `--preflight` برای اطمینان از دسترسی نوشتن پوشه‌های `.data/private_media` و `.data/backups` (یا مسیرهای تعریف‌شده در `PRIVATE_MEDIA_DIR` و `BACKUP_DIR`) در صورت نبود پوشه آن را می‌سازد و یک فایل آزمایشی موقت `.preflight_probe_<pid>_<timestamp>` ایجاد و بلافاصله حذف می‌کند. اتصال به دیتابیس نیز صرفاً با دو کوئری خواندنی (`SELECT VERSION()` و `SHOW TABLES`) انجام می‌شود و هیچ تغییری در داده‌ها نمی‌دهد.
 
 ---
 
@@ -185,6 +186,7 @@
      ```bash
      node -e "console.log({ node: process.version, nodeEnv: process.env.NODE_ENV, passengerEnv: process.env.PASSENGER_APP_ENV, hasPhusionPassenger: typeof PhusionPassenger !== 'undefined', portKind: !process.env.PORT ? 'empty' : /^\d+$/.test(process.env.PORT) ? 'numeric' : process.env.PORT.startsWith('/') ? 'unix_socket' : 'other', secretLen: (process.env.SESSION_SECRET || '').trim().length })"
      ```
+   - توجه: اگر در زمان اجرای Passenger متغیر `PORT` خالی باشد، `--preflight` وضعیت `port_config` را `WARNING` گزارش می‌کند (نه `PASS` قطعی)، زیرا برنامه به‌طور پیش‌فرض `app.listen(3000, '0.0.0.0')` را صدا می‌زند و اینکه Passenger روی هاست واقعی آن را به سوکت داخلی متصل می‌کند یا خیر فقط با تست زنده روی خود هاست قابل اثبات است.
    - اگر `portKind` برابر `'other'` بود و `app.cjs` با خطای `listen` مواجه شد، مقدار واقعی `process.env.PORT` و لاگ `stderr` Passenger باید دقیقاً بررسی شود.
 4. **بررسی دسترسی HTTP/HTTPS و سلامت API روی دامنه واقعی:**
    - پس از `Restart` در Setup Node.js App، آدرس `https://your-domain/api/health` را باز کنید و مطمئن شوید `ok: true` و `dbConnected: true` برمی‌گردد.
