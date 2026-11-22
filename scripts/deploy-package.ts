@@ -13,7 +13,7 @@ interface PackResult {
   files: { name: string; size: number }[];
 }
 
-function runStep(title: string, command: string): void {
+function runStep(title: string, command: string, nodeEnv: 'test' | 'production' = 'test'): void {
   console.log(`\n============================================================`);
   console.log(`[DEPLOY:PACKAGE] ${title}...`);
   console.log(`$ ${command}`);
@@ -22,7 +22,7 @@ function runStep(title: string, command: string): void {
     execSync(command, {
       cwd: ROOT_DIR,
       stdio: 'inherit',
-      env: { ...process.env, NODE_ENV: 'test' },
+      env: { ...process.env, NODE_ENV: nodeEnv },
     });
   } catch (err) {
     console.error(`\n[DEPLOY:PACKAGE ERROR] مرحله "${title}" با خطا مواجه شد.`);
@@ -52,12 +52,6 @@ function validatePrePackageArtifacts(): void {
     if (stat.size === 0) {
       throw new Error(`FILE_EMPTY: فایل "${rel}" خالی (۰ بایت) است.`);
     }
-  }
-
-  if (!fs.existsSync(path.resolve(ROOT_DIR, 'package-lock.json'))) {
-    console.warn(
-      '[DEPLOY:PACKAGE INFO] فایل package-lock.json موجود نیست؛ بسته‌بندی بر اساس package.json انجام می‌شود و cPanel در Run NPM Install وابستگی‌ها را از روی آن نصب خواهد کرد.'
-    );
   }
 
   // بررسی عدم نشت فایل‌های باینری تست یا فایل محرمانه .env
@@ -91,6 +85,22 @@ function buildZipPackage(): PackResult {
     throw new Error('ZIP_CREATION_FAILED: فایل ZIP ساخته نشد.');
   }
 
+  // اعتبارسنجی وجود فایل‌های حیاتی Production (از جمله جفت همخوان package.json و package-lock.json)
+  const packedNames = new Set(result.files.map((item) => item.name));
+  for (const mustHave of [
+    'app.cjs',
+    'package.json',
+    'package-lock.json',
+    '.env.example',
+    'DEPLOYMENT_CPANEL.md',
+    'database/schema.sql',
+    'dist/index.html',
+  ]) {
+    if (!packedNames.has(mustHave)) {
+      throw new Error(`REQUIRED_ZIP_ENTRY_MISSING: فایل ضروری "${mustHave}" در بسته ZIP وجود ندارد.`);
+    }
+  }
+
   // اعتبارسنجی ایمنی: اطمینان ۱۰۰٪ از عدم وجود فایل‌های ممنوعه
   for (const item of result.files) {
     const lower = item.name.toLowerCase();
@@ -116,7 +126,7 @@ export function main(): void {
     runStep('اجرای آزمون‌های خودکار پروژه (test)', 'npm test');
 
     // ۳. ساخت بیلد نهایی فرانت‌اند و سرور cPanel
-    runStep('ساخت بیلد Production (build)', 'npm run build');
+    runStep('ساخت بیلد Production (build)', 'npm run build', 'production');
   } else {
     console.warn('[DEPLOY:PACKAGE] هشدار: بررسی‌های پیش‌از بیلد به دلیل پرچم --skip-checks نادیده گرفته شد.');
   }

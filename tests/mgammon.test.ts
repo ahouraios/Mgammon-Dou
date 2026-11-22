@@ -3905,5 +3905,122 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       stmt.totalPeriodEntitlementToman - finCumStartCycle2.approvedMaturedReceivedToman;
     expect(sumBalanceAcrossPeriods).toBe(expectedCumBalance);
   });
+
+  it('آزمون ممیزی مستقل ۸: سیاست یکپارچه آنتروپی SESSION_SECRET (حداقل ۳۲ طول و ۱۰ کاراکتر یکتا، سازگار با ۶۴ کاراکتر هگز) و تشخیص ریشه برنامه (getAppRootDir) در صورت وجود package.json نامرتبط در cwd', async () => {
+    const os = await import('os');
+    const {
+      MIN_SESSION_SECRET_LENGTH,
+      MIN_SESSION_SECRET_UNIQUE_CHARS,
+      getAppRootDir,
+      isMgammonAppRootDir,
+      validateSessionSecret,
+    } = await import('../src/server/config');
+
+    // ۱) بررسی ثابت‌های سیاست یکپارچه SESSION_SECRET
+    expect(MIN_SESSION_SECRET_LENGTH).toBe(32);
+    expect(MIN_SESSION_SECRET_UNIQUE_CHARS).toBe(10);
+
+    // الف) کلید ۶۴ کاراکتری هگز استاندارد (۱۶ کاراکتر یکتا) -> PASS
+    const validHex64 = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const hex64Res = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: validHex64,
+    });
+    expect(hex64Res.valid).toBe(true);
+    expect(hex64Res.status).toBe('PASS');
+    expect(hex64Res.code).toBe('VALID');
+
+    // ب) کلید ۳۲ کاراکتری با دقیقاً ۱۰ کاراکتر یکتا -> معتبر (با هشدار طول کمتر از ۶۴)
+    const valid10Unique = '01234567890123456789012345678901';
+    expect(valid10Unique.length).toBe(32);
+    expect(new Set(valid10Unique.split('')).size).toBe(10);
+    const unique10Res = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: valid10Unique,
+    });
+    expect(unique10Res.valid).toBe(true);
+    expect(unique10Res.status).toBe('WARNING');
+    expect(unique10Res.code).toBe('VALID_WITH_WARNINGS');
+
+    // ج) کلید ۶۴ کاراکتری با فقط ۸ کاراکتر یکتا -> FAIL (SECRET_LOW_ENTROPY)
+    const weak8Unique = '01234567'.repeat(8);
+    expect(new Set(weak8Unique.split('')).size).toBe(8);
+    const unique8Res = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: weak8Unique,
+    });
+    expect(unique8Res.valid).toBe(false);
+    expect(unique8Res.status).toBe('FAIL');
+    expect(unique8Res.code).toBe('SECRET_LOW_ENTROPY');
+
+    // د) کلید ۶۴ کاراکتری با فقط ۹ کاراکتر یکتا -> FAIL (SECRET_LOW_ENTROPY)
+    const weak9Unique = '012345678'.repeat(8).slice(0, 64);
+    expect(new Set(weak9Unique.split('')).size).toBe(9);
+    const unique9Res = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: weak9Unique,
+    });
+    expect(unique9Res.valid).toBe(false);
+    expect(unique9Res.status).toBe('FAIL');
+    expect(unique9Res.code).toBe('SECRET_LOW_ENTROPY');
+
+    // هـ) کلید کوتاه‌تر از ۳۲ کاراکتر با بیش از ۱۰ کاراکتر یکتا -> FAIL (SECRET_TOO_SHORT)
+    const short31 = '0123456789abcdef0123456789abcde';
+    expect(short31.length).toBe(31);
+    const shortRes = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: short31,
+    });
+    expect(shortRes.valid).toBe(false);
+    expect(shortRes.code).toBe('SECRET_TOO_SHORT');
+
+    // و) کلید پیش‌فرض ممنوعه -> FAIL (SECRET_DEFAULT_FORBIDDEN)
+    const defaultRes = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: 'mgammon-duo-enterprise-secret-2026',
+    });
+    expect(defaultRes.valid).toBe(false);
+    expect(defaultRes.code).toBe('SECRET_DEFAULT_FORBIDDEN');
+
+    // ز) کلید دارای کوتیشن اطراف مقدار -> FAIL (SECRET_INVALID_CHARACTERS)
+    const quotedRes = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: `"${validHex64}"`,
+    });
+    expect(quotedRes.valid).toBe(false);
+    expect(quotedRes.code).toBe('SECRET_INVALID_CHARACTERS');
+
+    // ۲) بررسی getAppRootDir() هنگامی که پوشه کاری (cwd) نامرتبط است و package.json و .env خودش را دارد
+    const unrelatedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mgammon-unrelated-cwd-'));
+    try {
+      fs.writeFileSync(
+        path.join(unrelatedDir, 'package.json'),
+        JSON.stringify({ name: 'unrelated-host-app', version: '1.0.0' }, null, 2),
+        'utf8'
+      );
+      fs.writeFileSync(
+        path.join(unrelatedDir, '.env'),
+        'SESSION_SECRET=poison_short_value\nDB_NAME=wrong_unrelated_db\n',
+        'utf8'
+      );
+
+      expect(isMgammonAppRootDir(unrelatedDir)).toBe(false);
+
+      const resolvedRoot = getAppRootDir({ cwd: unrelatedDir });
+      expect(resolvedRoot).not.toBe(path.resolve(unrelatedDir));
+      expect(isMgammonAppRootDir(resolvedRoot)).toBe(true);
+      expect(fs.existsSync(path.join(resolvedRoot, 'database/schema.sql'))).toBe(true);
+
+      // حتی اگر پوشه نامرتبط اولین کاندید در لیست candidates باشد، باید نادیده گرفته شود
+      const resolvedFromCandidates = getAppRootDir({
+        cwd: unrelatedDir,
+        candidates: [unrelatedDir, resolvedRoot],
+      });
+      expect(resolvedFromCandidates).toBe(resolvedRoot);
+    } finally {
+      fs.rmSync(unrelatedDir, { recursive: true, force: true });
+    }
+  });
 });
+
 

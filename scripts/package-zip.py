@@ -50,11 +50,12 @@ def build_production_manifest_and_lockfile(source_pkg_path):
         pkg_data = json.load(pf)
 
     source_deps = pkg_data.get("dependencies", {})
-    prod_deps = {
-        name: source_deps[name]
-        for name in RUNTIME_DEP_NAMES
-        if name in source_deps
-    }
+    missing_runtime_deps = [name for name in RUNTIME_DEP_NAMES if name not in source_deps]
+    if missing_runtime_deps:
+        raise RuntimeError(
+            f"Missing required runtime dependencies in source package.json: {', '.join(missing_runtime_deps)}"
+        )
+    prod_deps = {name: source_deps[name] for name in RUNTIME_DEP_NAMES}
 
     prod_pkg = {
         "name": pkg_data.get("name", "mgammon-duo"),
