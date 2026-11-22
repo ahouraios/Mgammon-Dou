@@ -3,17 +3,25 @@ import cookieParser from 'cookie-parser';
 import path from 'path';
 import fs from 'fs';
 import mysql from 'mysql2/promise';
+import type { Server } from 'http';
 import {
   getPool,
   initializeDatabase,
   isDatabaseInitialized,
   migrateLegacyPublicMediaToPrivate,
+  resetPool,
   sanitizeDbErrorMessage,
   validateProductionSecurityConfig,
   waitForPendingDatabaseInit,
 } from './src/server/db';
-import { getAppConfig, getAppRootDir, loadEnvironmentOnce } from './src/server/config';
+import {
+  getAppConfig,
+  getAppRootDir,
+  loadEnvironmentOnce,
+  sanitizeSecretErrorText,
+} from './src/server/config';
 import { createApiRateLimiter, getSessionUser, requireCsrfProtection } from './src/server/auth';
+import { formatPreflightReportText, runPreflightDiagnostics } from './src/server/preflight';
 import { apiRouter } from './src/server/routes';
 
 loadEnvironmentOnce();
@@ -284,67 +292,178 @@ export async function createApp() {
   return app;
 }
 
-export async function startServer() {
-  validateProductionSecurityConfig(process.env);
+let activeHttpServer: Server | null = null;
+let activeServerStartPromise: Promise<Server> | null = null;
+let signalHandlersRegistered = false;
+let isShuttingDown = false;
 
-  // ۱. شروع فوری آماده‌سازی دیتابیس به صورت همزمان تا پورت 3000 بلافاصله باز شود و درخواست‌های API منتظر اتمام آن بمانند
-  initializeDatabase()
-    .then(() => {
-      console.log(
-        '[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests.'
-      );
-    })
-    .catch((err) => {
-      console.error(
-        '[MGAMMON Duo] Database initialization failed during startup:',
-        sanitizeDbErrorMessage(err)
-      );
-    });
+export async function stopServer(options?: { closeDbPool?: boolean }): Promise<void> {
+  const serverToClose = activeHttpServer;
+  activeHttpServer = null;
+  activeServerStartPromise = null;
 
-  const app = await createApp();
-  const appCfg = getAppConfig();
-  const isProductionMode = appCfg.isProduction || appCfg.isBundled;
-
-  if (!isProductionMode) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        allowedHosts: true,
-        hmr: false,
-        ws: false,
-        watch: null,
-      },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(getAppRootDir(), 'dist');
-    app.use(express.static(distPath));
-    app.use('/api', (_req, res) => {
-      res.status(404).json({
-        ok: false,
-        code: 'NOT_FOUND',
-        message: 'مسیر وب‌سرویس مورد نظر یافت نشد.',
-      });
-    });
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+  if (serverToClose) {
+    await new Promise<void>((resolve) => {
+      try {
+        serverToClose.close(() => resolve());
+      } catch {
+        resolve();
+      }
     });
   }
 
-  const server = appCfg.isSocketOrPipe
-    ? app.listen(appCfg.listenTarget, () => {
-        console.log(`[MGAMMON Duo] Server running on socket/pipe ${appCfg.listenTarget}`);
+  if (options?.closeDbPool !== false) {
+    await resetPool().catch(() => {});
+  }
+}
+
+function registerGracefulShutdownHandlers(): void {
+  if (signalHandlersRegistered || process.env.VITEST === 'true') {
+    return;
+  }
+  signalHandlersRegistered = true;
+
+  const handleShutdownSignal = (signal: string) => {
+    if (isShuttingDown) {
+      return;
+    }
+    isShuttingDown = true;
+    console.log(`[MGAMMON Duo] Received ${signal}, shutting down HTTP server and database pool...`);
+
+    const forceTimer = setTimeout(() => {
+      console.error('[MGAMMON Duo] Forced exit after shutdown timeout.');
+      process.exit(1);
+    }, 5000);
+    forceTimer.unref();
+
+    stopServer()
+      .then(() => {
+        clearTimeout(forceTimer);
+        process.exit(0);
       })
-    : app.listen(Number(appCfg.listenTarget), '0.0.0.0', () => {
-        console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${appCfg.listenTarget}`);
+      .catch((err) => {
+        clearTimeout(forceTimer);
+        console.error('[MGAMMON Duo] Error during shutdown:', sanitizeSecretErrorText(err));
+        process.exit(1);
+      });
+  };
+
+  process.on('SIGTERM', () => handleShutdownSignal('SIGTERM'));
+  process.on('SIGINT', () => handleShutdownSignal('SIGINT'));
+}
+
+export async function startServer(): Promise<Server> {
+  if (activeHttpServer && activeHttpServer.listening) {
+    return activeHttpServer;
+  }
+  if (activeServerStartPromise) {
+    return activeServerStartPromise;
+  }
+
+  activeServerStartPromise = (async () => {
+    validateProductionSecurityConfig(process.env);
+
+    // ۱. شروع فوری آماده‌سازی دیتابیس به صورت همزمان تا پورت 3000 بلافاصله باز شود و درخواست‌های API منتظر اتمام آن بمانند
+    initializeDatabase()
+      .then(() => {
+        console.log(
+          '[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests.'
+        );
+      })
+      .catch((err) => {
+        console.error(
+          '[MGAMMON Duo] Database initialization failed during startup:',
+          sanitizeDbErrorMessage(err)
+        );
       });
 
-  return server;
+    const app = await createApp();
+    const appCfg = getAppConfig();
+    const isProductionMode = appCfg.isProduction || appCfg.isBundled;
+
+    if (!isProductionMode) {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: {
+          middlewareMode: true,
+          allowedHosts: true,
+          hmr: false,
+          ws: false,
+          watch: null,
+        },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.resolve(getAppRootDir(), 'dist');
+      app.use(express.static(distPath));
+      app.use('/api', (_req, res) => {
+        res.status(404).json({
+          ok: false,
+          code: 'NOT_FOUND',
+          message: 'مسیر وب‌سرویس مورد نظر یافت نشد.',
+        });
+      });
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
+
+    const server = await new Promise<Server>((resolve, reject) => {
+      const onError = (err: Error) => {
+        console.error('[MGAMMON Duo] HTTP server listen error:', sanitizeSecretErrorText(err));
+        reject(err);
+      };
+
+      const srv = appCfg.isSocketOrPipe
+        ? app.listen(appCfg.listenTarget, () => {
+            srv.off('error', onError);
+            console.log(`[MGAMMON Duo] Server running on socket/pipe ${appCfg.listenTarget}`);
+            resolve(srv);
+          })
+        : app.listen(Number(appCfg.listenTarget), '0.0.0.0', () => {
+            srv.off('error', onError);
+            console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${appCfg.listenTarget}`);
+            resolve(srv);
+          });
+
+      srv.once('error', onError);
+    });
+
+    activeHttpServer = server;
+    server.on('close', () => {
+      if (activeHttpServer === server) {
+        activeHttpServer = null;
+      }
+      activeServerStartPromise = null;
+    });
+
+    registerGracefulShutdownHandlers();
+    return server;
+  })().catch((err) => {
+    activeServerStartPromise = null;
+    throw err;
+  });
+
+  return activeServerStartPromise;
 }
 
 // اجرا در صورتی که مستقیماً فراخوانی شده باشد (و نه در حین ایمپورت تست‌ها)
 if (process.env.VITEST !== 'true') {
-  startServer();
+  if (process.argv.includes('--preflight')) {
+    runPreflightDiagnostics({ checkDb: true })
+      .then((report) => {
+        console.log(formatPreflightReportText(report));
+        process.exit(report.ok ? 0 : 1);
+      })
+      .catch((err) => {
+        console.error('[MGAMMON Duo Preflight Error]', sanitizeSecretErrorText(err));
+        process.exit(1);
+      });
+  } else {
+    startServer().catch((err) => {
+      console.error('[MGAMMON Duo Startup Error]', sanitizeSecretErrorText(err));
+      process.exit(1);
+    });
+  }
 }

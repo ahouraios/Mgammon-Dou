@@ -110,3 +110,59 @@
   ```bash
   mysql -u cpaneluser_mgammon -p'YOUR_DB_PASSWORD' cpaneluser_mgammon_duo < backup_mgammon_YYYY-MM-DD.sql
   ```
+
+---
+
+### ۹. فهرست دقیق متغیرهای محیطی، ساخت `SESSION_SECRET` و رفع خطای `set_env_vars.py`
+
+#### الف) جدول کامل Environment Variables
+| نام متغیر | وضعیت در Production | توضیح و مقدار مجاز |
+|---|---|---|
+| `NODE_ENV` | الزامی | مقدار `production` (با انتخاب `Application mode: Production` در cPanel نیز اعمال می‌شود) |
+| `SESSION_SECRET` | الزامی | رشته ۶۴ کاراکتری هگزادسیمال (`0-9` و `a-f`) بدون فاصله، کوتیشن یا `$` |
+| `DB_HOST` | الزامی | آدرس MySQL (در cPanel معمولاً `127.0.0.1` یا `localhost`) |
+| `DB_PORT` | الزامی | پورت MySQL (پیش‌فرض `3306`) |
+| `DB_NAME` | الزامی | نام کامل دیتابیس ساخته‌شده در cPanel (مثلاً `cpaneluser_mgammon_duo`) |
+| `DB_USER` | الزامی | نام کاربری دیتابیس در cPanel (مثلاً `cpaneluser_mgammon`) |
+| `DB_PASSWORD` | الزامی | رمز عبور کاربر دیتابیس |
+| `DB_CONNECTION_LIMIT` | اختیاری | عدد بین `2` تا `50` (پیش‌فرض `10`) |
+| `APP_TIMEZONE` | اختیاری | پیش‌فرض `Asia/Tehran` |
+| `APP_URL` | اختیاری | نشانی کامل دامنه با HTTPS (مثلاً `https://mgammon.example.ir`) |
+| `INITIAL_MANAGER_USERNAME` | اختیاری | فقط برای ساخت کاربر مدیر روی دیتابیس کاملاً خالی (پیش‌فرض `manager`) |
+| `INITIAL_MANAGER_PASSWORD` | اختیاری | فقط برای ساخت کاربر مدیر روی دیتابیس کاملاً خالی (روی دیتابیس موجود تأثیری ندارد) |
+| `INITIAL_WORKER_USERNAME` | اختیاری | فقط برای ساخت کاربر پرسنل روی دیتابیس کاملاً خالی (پیش‌فرض `worker`) |
+| `INITIAL_WORKER_PASSWORD` | اختیاری | فقط برای ساخت کاربر پرسنل روی دیتابیس کاملاً خالی |
+| `PORT` | خودکار | توسط Passenger تزریق می‌شود (عدد یا سوکت یونیکس)؛ نیاز به ثبت دستی نیست |
+
+#### ب) چرا `set_env_vars.py` برخی متغیرها را رد (`skipped`) می‌کند؟
+در cPanel هنگام انتقال متغیرهای رابط کاربری به Passenger، اسکریپت `set_env_vars.py` متغیرهایی را که شامل کاراکترهای حساس پوسته (`"`، `'`، `$`، `\`, `;`، `#`)، فاصله یا تب، خط جدید (Copy/Paste ناقص)، یا کاراکترهای غیرانگلیسی هستند رد می‌کند. در نتیجه `SESSION_SECRET` یا `DB_PASSWORD` خالی به Node.js می‌رسد.
+- **راه‌حل اول:** در فیلدهای cPanel مقادیر را بدون کوتیشن، بدون فاصله ابتدا/انتها و برای `SESSION_SECRET` فقط از حروف `a-f` و ارقام `0-9` استفاده کنید.
+- **راه‌حل دوم (پشتیبان امن):** اگر رمز دیتابیس کاراکتر خاص دارد یا `set_env_vars.py` آن را رد می‌کند، یک فایل `.env` در **ریشه خصوصی برنامه** (کنار `app.cjs` و هرگز داخل `public/` یا `dist/`) بسازید. برنامه ابتدا مقادیر معتبر هاست/cPanel را نگه می‌دارد و تنها متغیرهای خالی یا ردشده را به‌صورت خودکار از `.env` تکمیل می‌کند.
+
+#### ج) روش ساخت `SESSION_SECRET` امن (با SSH و بدون SSH)
+- **در کامپیوتر شخصی یا ترمینال (Node.js):**
+  ```bash
+  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  ```
+- **با OpenSSL:**
+  ```bash
+  openssl rand -hex 32
+  ```
+- **بدون نیاز به SSH:** از مرورگر (Console تب Developer Tools روی یک صفحه خالی) دستور زیر را اجرا کرده و خروجی ۶۴ کاراکتری را کپی کنید:
+  ```js
+  Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('')
+  ```
+
+#### د) آزمایش تنظیمات پیش از اجرا (Preflight Check بدون نیاز به SSH)
+در صفحه **Setup Node.js App** در cPanel می‌توانید در بخش **Run JS script** عبارت `app.cjs --preflight` را اجرا کنید (یا در Terminal دستور `node app.cjs --preflight` را بزنید). گزارش با وضعیت‌های `PASS` / `WARNING` / `FAIL` / `NOT_CONFIGURED` بدون نمایش هیچ رمز یا Secret چاپ می‌شود.
+
+---
+
+### ۱۰. روش بازگشت به نسخه قبلی (Rollback) بدون آسیب به دیتابیس
+1. پیش از آپلود بسته جدید، از پوشه فعلی برنامه در **File Manager** یک کپی فشرده (یا رونوشت با نام `backup-before-update.zip` در خارج از `public_html`) تهیه کنید تا نسخه قبلی `app.cjs`، `dist/` و `.env` محفوظ بماند.
+2. برنامه هرگز هنگام راه‌اندازی جداول یا داده‌های موجود دیتابیس را حذف یا بازنشانی نمی‌کند؛ با این حال پیش از هر بروزرسانی، یک نسخه پشتیبان SQL نیز مطابق بخش ۸ تهیه کنید.
+3. در صورت بروز هرگونه خطا پس از دیپلوی جدید:
+   - در **Setup Node.js App** برنامه را **Stop** کنید.
+   - فایل‌های `app.cjs` و `dist/` جدید را پاک کرده و نسخه قبلی را از آرشیو پشتیبان جایگزین کنید (فایل `.env` و پوشه `.data/` را دست‌نخورده نگه دارید).
+   - روی **Start** (یا **Restart**) کلیک کنید تا سامانه فوراً به نسخه قبلی بازگردد.
+

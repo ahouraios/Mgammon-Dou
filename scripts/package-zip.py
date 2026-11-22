@@ -20,15 +20,15 @@ INCLUDE_ITEMS = [
     "database/schema.sql",
 ]
 
-PRODUCTION_DEPENDENCIES = {
-    "bcryptjs": "^3.0.2",
-    "cookie-parser": "^1.4.7",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "jalaali-js": "^1.2.8",
-    "mysql2": "^3.11.5",
-    "xlsx": "^0.18.5",
-}
+RUNTIME_DEP_NAMES = [
+    "bcryptjs",
+    "cookie-parser",
+    "dotenv",
+    "express",
+    "jalaali-js",
+    "mysql2",
+    "xlsx",
+]
 
 def is_forbidden(rel_path):
     # Normalize separators
@@ -49,6 +49,13 @@ def build_production_manifest_and_lockfile(source_pkg_path):
     with open(source_pkg_path, "r", encoding="utf-8") as pf:
         pkg_data = json.load(pf)
 
+    source_deps = pkg_data.get("dependencies", {})
+    prod_deps = {
+        name: source_deps[name]
+        for name in RUNTIME_DEP_NAMES
+        if name in source_deps
+    }
+
     prod_pkg = {
         "name": pkg_data.get("name", "mgammon-duo"),
         "private": True,
@@ -59,9 +66,10 @@ def build_production_manifest_and_lockfile(source_pkg_path):
         },
         "scripts": {
             "start": "node app.cjs",
-            "start:prod": "NODE_ENV=production node app.cjs"
+            "start:prod": "NODE_ENV=production node app.cjs",
+            "preflight": "node app.cjs --preflight"
         },
-        "dependencies": dict(PRODUCTION_DEPENDENCIES),
+        "dependencies": prod_deps,
     }
     pkg_content = json.dumps(prod_pkg, indent=2, ensure_ascii=False) + "\n"
 

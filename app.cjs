@@ -30,14 +30,14 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 var server_exports = {};
 __export(server_exports, {
   createApp: () => createApp,
-  startServer: () => startServer
+  startServer: () => startServer,
+  stopServer: () => stopServer
 });
 module.exports = __toCommonJS(server_exports);
-var import_config5 = require("dotenv/config");
 var import_express2 = __toESM(require("express"), 1);
 var import_cookie_parser = __toESM(require("cookie-parser"), 1);
-var import_path5 = __toESM(require("path"), 1);
-var import_fs5 = __toESM(require("fs"), 1);
+var import_path6 = __toESM(require("path"), 1);
+var import_fs6 = __toESM(require("fs"), 1);
 
 // src/server/db.ts
 var import_promise = __toESM(require("mysql2/promise"), 1);
@@ -53,6 +53,151 @@ var import_dotenv = __toESM(require("dotenv"), 1);
 var import_crypto = __toESM(require("crypto"), 1);
 var import_fs = __toESM(require("fs"), 1);
 var import_path = __toESM(require("path"), 1);
+var ENV_VAR_SPECS = [
+  {
+    name: "NODE_ENV",
+    requiredInProduction: true,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u062D\u0627\u0644\u062A \u0627\u062C\u0631\u0627\u06CC \u0628\u0631\u0646\u0627\u0645\u0647 (production \u06CC\u0627 development)",
+    defaultValue: "development"
+  },
+  {
+    name: "SESSION_SECRET",
+    requiredInProduction: true,
+    secret: true,
+    cpanelSensitive: true,
+    description: "\u06A9\u0644\u06CC\u062F \u0627\u0645\u0636\u0627\u06CC \u0646\u0634\u0633\u062A\u200C\u0647\u0627 \u0648 \u062A\u0648\u06A9\u0646\u200C\u0647\u0627\u06CC \u0627\u0645\u0646\u06CC\u062A\u06CC (\u062D\u062F\u0627\u0642\u0644 \u06F3\u06F2 \u0648 \u062A\u0631\u062C\u06CC\u062D\u0627\u064B \u06F6\u06F4 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0647\u06AF\u0632 ASCII)"
+  },
+  {
+    name: "DB_HOST",
+    requiredInProduction: true,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0622\u062F\u0631\u0633 \u0633\u0631\u0648\u0631 \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 MySQL/MariaDB (\u062F\u0631 cPanel \u0645\u0639\u0645\u0648\u0644\u0627\u064B 127.0.0.1 \u06CC\u0627 localhost)",
+    defaultValue: "127.0.0.1"
+  },
+  {
+    name: "DB_PORT",
+    requiredInProduction: true,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u067E\u0648\u0631\u062A \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 (\u067E\u06CC\u0634\u200C\u0641\u0631\u0636 3306)",
+    defaultValue: "3306"
+  },
+  {
+    name: "DB_NAME",
+    requiredInProduction: true,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0646\u0627\u0645 \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 \u0633\u0627\u062E\u062A\u0647 \u0634\u062F\u0647 \u062F\u0631 cPanel"
+  },
+  {
+    name: "DB_USER",
+    requiredInProduction: true,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 MySQL \u062F\u0631 cPanel"
+  },
+  {
+    name: "DB_PASSWORD",
+    requiredInProduction: true,
+    secret: true,
+    cpanelSensitive: true,
+    description: "\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u06A9\u0627\u0631\u0628\u0631 \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647"
+  },
+  {
+    name: "DB_CONNECTION_LIMIT",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u062D\u062F\u0627\u06A9\u062B\u0631 \u062A\u0639\u062F\u0627\u062F \u0627\u062A\u0635\u0627\u0644 \u0647\u0645\u200C\u0632\u0645\u0627\u0646 \u0627\u0633\u062A\u062E\u0631 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 (\u0639\u062F\u062F \u0628\u06CC\u0646 \u06F2 \u062A\u0627 \u06F5\u06F0\u060C \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u06F1\u06F0)",
+    defaultValue: "10"
+  },
+  {
+    name: "APP_TIMEZONE",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0645\u0646\u0637\u0642\u0647 \u0632\u0645\u0627\u0646\u06CC \u0633\u0631\u0648\u0631 (\u067E\u06CC\u0634\u200C\u0641\u0631\u0636 Asia/Tehran)",
+    defaultValue: "Asia/Tehran"
+  },
+  {
+    name: "PORT",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u067E\u0648\u0631\u062A \u06CC\u0627 \u0633\u0648\u06A9\u062A \u0627\u062E\u062A\u0635\u0627\u0635\u200C\u06CC\u0627\u0641\u062A\u0647 \u062A\u0648\u0633\u0637 \u0647\u0627\u0633\u062A/Passenger (\u062F\u0631 \u062A\u0648\u0633\u0639\u0647 3000)",
+    defaultValue: "3000"
+  },
+  {
+    name: "APP_URL",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0646\u0634\u0627\u0646\u06CC \u062F\u0627\u0645\u0646\u0647 \u0627\u0635\u0644\u06CC \u0628\u0631\u0646\u0627\u0645\u0647 (\u0645\u062B\u0644\u0627\u064B https://mgammon.example.ir)"
+  },
+  {
+    name: "INITIAL_MANAGER_USERNAME",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0627\u0648\u0644\u06CC\u0647 \u0645\u062F\u06CC\u0631 (\u0641\u0642\u0637 \u062F\u0631 \u0627\u0648\u0644\u06CC\u0646 \u0633\u0627\u062E\u062A \u06A9\u0627\u0631\u0628\u0631 \u062F\u0631 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u062E\u0627\u0644\u06CC)",
+    defaultValue: "manager"
+  },
+  {
+    name: "INITIAL_MANAGER_PASSWORD",
+    requiredInProduction: false,
+    secret: true,
+    cpanelSensitive: true,
+    description: "\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0648\u0644\u06CC\u0647 \u0645\u062F\u06CC\u0631 (\u0641\u0642\u0637 \u062F\u0631 \u0627\u0648\u0644\u06CC\u0646 \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC \u0631\u0648\u06CC \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u062E\u0627\u0644\u06CC)"
+  },
+  {
+    name: "INITIAL_WORKER_USERNAME",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0627\u0648\u0644\u06CC\u0647 \u067E\u0631\u0633\u0646\u0644 (\u0641\u0642\u0637 \u062F\u0631 \u0627\u0648\u0644\u06CC\u0646 \u0633\u0627\u062E\u062A \u06A9\u0627\u0631\u0628\u0631 \u062F\u0631 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u062E\u0627\u0644\u06CC)",
+    defaultValue: "worker"
+  },
+  {
+    name: "INITIAL_WORKER_PASSWORD",
+    requiredInProduction: false,
+    secret: true,
+    cpanelSensitive: true,
+    description: "\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0648\u0644\u06CC\u0647 \u067E\u0631\u0633\u0646\u0644 (\u0641\u0642\u0637 \u062F\u0631 \u0627\u0648\u0644\u06CC\u0646 \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC \u0631\u0648\u06CC \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u062E\u0627\u0644\u06CC)"
+  },
+  {
+    name: "PRIVATE_MEDIA_DIR",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0645\u0633\u06CC\u0631 \u0630\u062E\u06CC\u0631\u0647 \u0641\u0627\u06CC\u0644\u200C\u0647\u0627 \u0648 \u067E\u06CC\u0648\u0633\u062A\u200C\u0647\u0627\u06CC \u062E\u0635\u0648\u0635\u06CC \u062E\u0627\u0631\u062C \u0627\u0632 \u0645\u0633\u06CC\u0631 \u0648\u0628",
+    defaultValue: ".data/private_media"
+  },
+  {
+    name: "BACKUP_DIR",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0645\u0633\u06CC\u0631 \u0630\u062E\u06CC\u0631\u0647 \u0641\u0627\u06CC\u0644\u200C\u0647\u0627\u06CC \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u062E\u0627\u0631\u062C \u0627\u0632 \u0645\u0633\u06CC\u0631 \u0648\u0628",
+    defaultValue: ".data/backups"
+  },
+  {
+    name: "CPANEL_ENV",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u067E\u0631\u0686\u0645 \u0627\u062E\u062A\u06CC\u0627\u0631\u06CC \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC \u0635\u0631\u06CC\u062D \u0645\u062D\u06CC\u0637 cPanel (true)"
+  },
+  {
+    name: "ENFORCE_PASSWORD_CHANGE",
+    requiredInProduction: false,
+    secret: false,
+    cpanelSensitive: true,
+    description: "\u0627\u0644\u0632\u0627\u0645 \u062A\u063A\u06CC\u06CC\u0631 \u0631\u0645\u0632 \u0627\u0648\u0644\u06CC\u0647 \u062F\u0631 \u0627\u0648\u0644\u06CC\u0646 \u0648\u0631\u0648\u062F (true \u062F\u0631 \u0645\u062D\u06CC\u0637 \u0639\u0645\u0644\u06CC\u0627\u062A\u06CC)"
+  }
+];
 var FORBIDDEN_DEFAULT_SECRETS = /* @__PURE__ */ new Set([
   "",
   "undefined",
@@ -100,10 +245,19 @@ var envLoadMetadata = {
   dotenvParseError: null
 };
 var devOnlyEphemeralSecret = null;
-function getCandidateAppRoots() {
+var MIN_SESSION_SECRET_LENGTH = 32;
+var MIN_SESSION_SECRET_UNIQUE_CHARS = 10;
+function isMgammonAppRootDir(dir) {
+  try {
+    const hasSchema = import_fs.default.existsSync(import_path.default.resolve(dir, "database/schema.sql"));
+    const hasEntryOrBuild = import_fs.default.existsSync(import_path.default.resolve(dir, "app.cjs")) || import_fs.default.existsSync(import_path.default.resolve(dir, "server.ts")) || import_fs.default.existsSync(import_path.default.resolve(dir, "dist/index.html"));
+    return hasSchema && hasEntryOrBuild;
+  } catch {
+    return false;
+  }
+}
+function getCandidateAppRoots(customCwd) {
   const dirs = [];
-  const cwd = process.cwd();
-  dirs.push(cwd);
   if (typeof __dirname === "string" && __dirname) {
     const cleanDir = import_path.default.resolve(__dirname);
     if (!dirs.includes(cleanDir)) {
@@ -120,19 +274,28 @@ function getCandidateAppRoots() {
       dirs.push(argvDir);
     }
   }
+  const cwd = import_path.default.resolve(customCwd || process.cwd());
+  if (!dirs.includes(cwd)) {
+    dirs.push(cwd);
+  }
   return dirs;
 }
-function getAppRootDir() {
-  const candidates = getCandidateAppRoots();
+function getAppRootDir(options) {
+  const candidates = options?.candidates || getCandidateAppRoots(options?.cwd);
+  for (const dir of candidates) {
+    if (isMgammonAppRootDir(dir)) {
+      return import_path.default.resolve(dir);
+    }
+  }
   for (const dir of candidates) {
     try {
-      if (import_fs.default.existsSync(import_path.default.resolve(dir, "database/schema.sql")) || import_fs.default.existsSync(import_path.default.resolve(dir, "dist/index.html")) || import_fs.default.existsSync(import_path.default.resolve(dir, "app.cjs")) || import_fs.default.existsSync(import_path.default.resolve(dir, "package.json"))) {
-        return dir;
+      if (import_fs.default.existsSync(import_path.default.resolve(dir, "database/schema.sql")) || import_fs.default.existsSync(import_path.default.resolve(dir, "app.cjs"))) {
+        return import_path.default.resolve(dir);
       }
     } catch {
     }
   }
-  return process.cwd();
+  return import_path.default.resolve(options?.cwd || process.cwd());
 }
 function isPublicWebDirectory(filePath) {
   const normalized = import_path.default.resolve(filePath).replace(/\\/g, "/").toLowerCase();
@@ -175,10 +338,11 @@ function loadEnvironmentOnce(options) {
     };
     return envLoadMetadata;
   }
-  const searchDirs = options?.searchDirs || getCandidateAppRoots();
+  const appRootDir = getAppRootDir();
+  const searchDirs = options?.searchDirs || [appRootDir];
   const candidateEnvPaths = [];
   if (process.env.MGAMMON_ENV_FILE) {
-    const explicitPath = import_path.default.resolve(process.cwd(), process.env.MGAMMON_ENV_FILE);
+    const explicitPath = import_path.default.resolve(appRootDir, process.env.MGAMMON_ENV_FILE);
     if (!isPublicWebDirectory(explicitPath)) {
       candidateEnvPaths.push(explicitPath);
     }
@@ -229,6 +393,12 @@ function loadEnvironmentOnce(options) {
     publicEnvLeakPaths,
     dotenvParseError
   };
+  return envLoadMetadata;
+}
+function getEnvLoadMetadata() {
+  if (!envLoadMetadata.loaded) {
+    loadEnvironmentOnce();
+  }
   return envLoadMetadata;
 }
 function isValidEnvVarName(name) {
@@ -371,23 +541,23 @@ function validateSessionSecret(env = process.env) {
       cpanelWarnings: inspection.cpanelUnsafeReasons
     };
   }
-  if (trimmed.length < 32) {
+  if (trimmed.length < MIN_SESSION_SECRET_LENGTH) {
     return {
       valid: false,
       status: "FAIL",
       code: "SECRET_TOO_SHORT",
-      reason: `\u0637\u0648\u0644 SESSION_SECRET \u0628\u0631\u0627\u0628\u0631 ${trimmed.length} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0627\u0633\u062A \u0648 \u0627\u0632 \u062D\u062F\u0627\u0642\u0644 \u0645\u062C\u0627\u0632 \u06F3\u06F2 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0645\u062A\u0631 \u0627\u0633\u062A.`,
+      reason: `\u0637\u0648\u0644 SESSION_SECRET \u0628\u0631\u0627\u0628\u0631 ${trimmed.length} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u0627\u0633\u062A \u0648 \u0627\u0632 \u062D\u062F\u0627\u0642\u0644 \u0645\u062C\u0627\u0632 ${MIN_SESSION_SECRET_LENGTH} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06A9\u0645\u062A\u0631 \u0627\u0633\u062A.`,
       length: trimmed.length,
       cpanelWarnings: inspection.cpanelUnsafeReasons
     };
   }
   const uniqueCharsCount = new Set(trimmed.split("")).size;
-  if (uniqueCharsCount < 8) {
+  if (uniqueCharsCount < MIN_SESSION_SECRET_UNIQUE_CHARS) {
     return {
       valid: false,
       status: "FAIL",
       code: "SECRET_LOW_ENTROPY",
-      reason: `\u062A\u0646\u0648\u0639 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC SESSION_SECRET \u0628\u0633\u06CC\u0627\u0631 \u067E\u0627\u06CC\u06CC\u0646 (${uniqueCharsCount} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06CC\u06A9\u062A\u0627) \u0627\u0633\u062A \u0648 \u0627\u0645\u0646\u06CC\u062A \u06A9\u0627\u0641\u06CC \u0646\u062F\u0627\u0631\u062F.`,
+      reason: `\u062A\u0646\u0648\u0639 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC SESSION_SECRET \u0628\u0633\u06CC\u0627\u0631 \u067E\u0627\u06CC\u06CC\u0646 (${uniqueCharsCount} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06CC\u06A9\u062A\u0627\u061B \u062D\u062F\u0627\u0642\u0644 \u0645\u062C\u0627\u0632 ${MIN_SESSION_SECRET_UNIQUE_CHARS} \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631 \u06CC\u06A9\u062A\u0627) \u0627\u0633\u062A \u0648 \u0627\u0645\u0646\u06CC\u062A \u06A9\u0627\u0641\u06CC \u0646\u062F\u0627\u0631\u062F.`,
       length: trimmed.length,
       cpanelWarnings: inspection.cpanelUnsafeReasons
     };
@@ -557,8 +727,8 @@ function getAppConfig(env = process.env) {
       if (n >= 1 && n <= 65535) {
         listenTarget = n;
       }
-    } else if (rawPort.startsWith("/") || rawPort.startsWith("\\\\.\\pipe\\")) {
-      listenTarget = rawPort;
+    } else if (rawPort.toLowerCase() === "passenger" || rawPort.startsWith("/") || rawPort.startsWith("\\\\.\\pipe\\")) {
+      listenTarget = rawPort.toLowerCase() === "passenger" ? "passenger" : rawPort;
       isSocketOrPipe = true;
     }
   }
@@ -802,6 +972,18 @@ async function waitForPendingDatabaseInit() {
     } catch {
     }
   }
+}
+async function resetPool() {
+  dbInitialized = false;
+  dbInitializingPromise = null;
+  if (pool) {
+    try {
+      await pool.end();
+    } catch {
+    }
+    pool = null;
+  }
+  currentPoolDbName = "";
 }
 function getPool() {
   if (simulatedDisconnect) {
@@ -2184,18 +2366,455 @@ function handleServerError(res, err) {
   });
 }
 
+// src/server/preflight.ts
+var import_fs3 = __toESM(require("fs"), 1);
+var import_path3 = __toESM(require("path"), 1);
+var import_promise2 = __toESM(require("mysql2/promise"), 1);
+var import_module = require("module");
+function checkFilesystemWritable(dirPath) {
+  try {
+    import_fs3.default.mkdirSync(dirPath, { recursive: true, mode: 448 });
+    const probeFile = import_path3.default.join(dirPath, `.preflight_probe_${process.pid}_${Date.now()}`);
+    import_fs3.default.writeFileSync(probeFile, "ok", { mode: 384 });
+    import_fs3.default.unlinkSync(probeFile);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: sanitizeSecretErrorText(err) };
+  }
+}
+function resolveRequiredModuleNames() {
+  const requiredModules = [
+    "express",
+    "mysql2/promise",
+    "bcryptjs",
+    "cookie-parser",
+    "dotenv",
+    "jalaali-js",
+    "xlsx"
+  ];
+  const loaded = [];
+  const failed = [];
+  let localRequire = null;
+  try {
+    if (typeof require === "function") {
+      localRequire = require;
+    } else {
+      localRequire = (0, import_module.createRequire)(import_path3.default.resolve(getAppRootDir(), "package.json"));
+    }
+  } catch {
+    localRequire = null;
+  }
+  for (const modName of requiredModules) {
+    try {
+      if (localRequire) {
+        localRequire.resolve(modName);
+      }
+      loaded.push(modName);
+    } catch {
+      failed.push(modName);
+    }
+  }
+  return { loaded, failed };
+}
+async function runPreflightDiagnostics(options) {
+  const env = options?.env || process.env;
+  if (env === process.env) {
+    loadEnvironmentOnce({ searchDirs: options?.searchDirs });
+  }
+  const meta = getEnvLoadMetadata();
+  const isProd = isProductionMode(env);
+  const isBundled = isBundledAppCjs();
+  const isPassenger = isPassengerEnvironment(env);
+  const appCfg = getAppConfig(env);
+  const checks = [];
+  const nodeVersion = process.versions.node || "0.0.0";
+  const majorVersion = Number(nodeVersion.split(".")[0] || 0);
+  if (majorVersion >= 20) {
+    checks.push({
+      id: "node_version",
+      category: "runtime",
+      label: "\u0646\u0633\u062E\u0647 Node.js",
+      status: "PASS",
+      message: `\u0646\u0633\u062E\u0647 \u0641\u0639\u0627\u0644 Node.js v${nodeVersion} \u0628\u0627 \u0628\u0631\u0646\u0627\u0645\u0647 \u0648 cPanel/Passenger \u0633\u0627\u0632\u06AF\u0627\u0631 \u0627\u0633\u062A.`
+    });
+  } else if (majorVersion >= 18) {
+    checks.push({
+      id: "node_version",
+      category: "runtime",
+      label: "\u0646\u0633\u062E\u0647 Node.js",
+      status: "WARNING",
+      message: `\u0646\u0633\u062E\u0647 Node.js v${nodeVersion} \u0642\u0627\u0628\u0644 \u0627\u062C\u0631\u0627 \u0627\u0633\u062A\u060C \u0627\u0645\u0627 \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0627\u0632 Node.js 20 LTS \u06CC\u0627 22 \u062A\u0648\u0635\u06CC\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F.`
+    });
+  } else {
+    checks.push({
+      id: "node_version",
+      category: "runtime",
+      label: "\u0646\u0633\u062E\u0647 Node.js",
+      status: "FAIL",
+      message: `\u0646\u0633\u062E\u0647 Node.js v${nodeVersion} \u0642\u062F\u06CC\u0645\u06CC \u0627\u0633\u062A \u0648 \u062D\u062F\u0627\u0642\u0644 \u0628\u0647 \u0646\u0633\u062E\u0647 \u06F1\u06F8 \u06CC\u0627 \u0628\u0627\u0644\u0627\u062A\u0631 \u0646\u06CC\u0627\u0632 \u0627\u0633\u062A.`,
+      remediation: "\u062F\u0631 Setup Node.js App \u0633\u06CC\u200C\u067E\u0646\u0644\u060C \u0646\u0633\u062E\u0647 Node.js \u0631\u0627 \u0631\u0648\u06CC 22 \u06CC\u0627 20 \u062A\u0646\u0638\u06CC\u0645 \u06A9\u0646\u06CC\u062F."
+    });
+  }
+  const rawNodeEnv = (env.NODE_ENV || "").trim();
+  if (!rawNodeEnv && (isBundled || isPassenger)) {
+    checks.push({
+      id: "runtime_mode",
+      category: "runtime",
+      label: "\u062D\u0627\u0644\u062A \u0627\u062C\u0631\u0627 (NODE_ENV \u0648 Passenger)",
+      status: "WARNING",
+      message: "\u0628\u0631\u0646\u0627\u0645\u0647 \u062F\u0631 \u0645\u062D\u06CC\u0637 \u0628\u0633\u062A\u0647\u200C\u0628\u0646\u062F\u06CC\u200C\u0634\u062F\u0647/Passenger \u0628\u062F\u0648\u0646 \u0645\u0642\u062F\u0627\u0631 \u0635\u0631\u06CC\u062D NODE_ENV \u0627\u062C\u0631\u0627 \u0634\u062F\u0647 \u0627\u0633\u062A.",
+      remediation: "\u062F\u0631 cPanel\u060C Application mode \u0631\u0627 \u0631\u0648\u06CC Production \u0642\u0631\u0627\u0631 \u062F\u0647\u06CC\u062F \u06CC\u0627 NODE_ENV=production \u062A\u0646\u0638\u06CC\u0645 \u06A9\u0646\u06CC\u062F."
+    });
+  } else {
+    checks.push({
+      id: "runtime_mode",
+      category: "runtime",
+      label: "\u062D\u0627\u0644\u062A \u0627\u062C\u0631\u0627 (NODE_ENV \u0648 Passenger)",
+      status: "PASS",
+      message: `\u062D\u0627\u0644\u062A \u0627\u062C\u0631\u0627: ${rawNodeEnv || "development"} | Passenger: ${isPassenger ? "\u0641\u0639\u0627\u0644" : "\u062E\u06CC\u0631"} | \u0641\u0627\u06CC\u0644 \u0627\u062C\u0631\u0627\u06CC\u06CC: ${isBundled ? "app.cjs" : "server.ts"}`
+    });
+  }
+  const publicLeaks = options?.searchDirs ? scanForPublicEnvFiles(options.searchDirs) : meta.publicEnvLeakPaths;
+  if (publicLeaks.length > 0) {
+    checks.push({
+      id: "env_public_exposure",
+      category: "security",
+      label: "\u062D\u0641\u0627\u0638\u062A \u0641\u0627\u06CC\u0644\u200C\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u0627\u0632 \u0645\u0633\u06CC\u0631 \u0639\u0645\u0648\u0645\u06CC \u0648\u0628",
+      status: "FAIL",
+      message: `\u0641\u0627\u06CC\u0644 \u062D\u0633\u0627\u0633 \u0645\u062D\u06CC\u0637\u06CC \u062F\u0631 \u0645\u0633\u06CC\u0631 \u0639\u0645\u0648\u0645\u06CC \u0648\u0628 \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC \u0634\u062F (${publicLeaks.length} \u0645\u0648\u0631\u062F).`,
+      remediation: "\u0641\u0627\u06CC\u0644 .env \u0631\u0627 \u0641\u0648\u0631\u0627\u064B \u0627\u0632 \u067E\u0648\u0634\u0647 public \u06CC\u0627 dist \u062D\u0630\u0641 \u06A9\u0631\u062F\u0647 \u0648 \u0641\u0642\u0637 \u062F\u0631 \u0631\u06CC\u0634\u0647 \u062E\u0635\u0648\u0635\u06CC \u0628\u0631\u0646\u0627\u0645\u0647 \u0646\u06AF\u0647 \u062F\u0627\u0631\u06CC\u062F."
+    });
+  } else if (meta.dotenvParseError) {
+    checks.push({
+      id: "env_public_exposure",
+      category: "environment",
+      label: "\u067E\u0627\u0631\u0633 \u0641\u0627\u06CC\u0644 \u0627\u062E\u062A\u06CC\u0627\u0631\u06CC .env",
+      status: "WARNING",
+      message: `\u062E\u0648\u0627\u0646\u062F\u0646 \u0641\u0627\u06CC\u0644 .env \u0628\u0627 \u062E\u0637\u0627 \u0645\u0648\u0627\u062C\u0647 \u0634\u062F: ${meta.dotenvParseError}`
+    });
+  } else {
+    checks.push({
+      id: "env_public_exposure",
+      category: "security",
+      label: "\u062D\u0641\u0627\u0638\u062A \u0641\u0627\u06CC\u0644\u200C\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u0627\u0632 \u0645\u0633\u06CC\u0631 \u0639\u0645\u0648\u0645\u06CC \u0648\u0628",
+      status: "PASS",
+      message: meta.dotenvPathLoaded ? `\u0641\u0627\u06CC\u0644 .env \u0635\u0631\u0641\u0627\u064B \u062F\u0631 \u0645\u0633\u06CC\u0631 \u062E\u0635\u0648\u0635\u06CC \u0631\u06CC\u0634\u0647 \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC \u0634\u062F \u0648 \u0628\u0631\u0627\u06CC \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u062E\u0627\u0644\u06CC \u0647\u0627\u0633\u062A \u0627\u0639\u0645\u0627\u0644 \u06AF\u0631\u062F\u06CC\u062F (\u0645\u0646\u0628\u0639: ${meta.sourceMode}).` : `\u0641\u0627\u06CC\u0644\u06CC \u062F\u0631 \u0645\u0633\u06CC\u0631 \u0639\u0645\u0648\u0645\u06CC \u0648\u0628 \u0642\u0631\u0627\u0631 \u0646\u062F\u0627\u0631\u062F (\u0645\u0646\u0628\u0639 \u062A\u0646\u0638\u06CC\u0645\u0627\u062A: ${meta.sourceMode}).`
+    });
+  }
+  const invalidNames = [];
+  const cpanelUnsafeVars = [];
+  const whitespaceTrimmedVars = [];
+  for (const spec of ENV_VAR_SPECS) {
+    if (!isValidEnvVarName(spec.name)) {
+      invalidNames.push(spec.name);
+      continue;
+    }
+    const rawVal = env[spec.name];
+    const insp = analyzeEnvValue(rawVal, { isSecret: spec.secret, checkCpanelSafety: true });
+    if (!insp.present) continue;
+    if (insp.hasLeadingOrTrailingWhitespace) {
+      whitespaceTrimmedVars.push(spec.name);
+    }
+    if (insp.hasCpanelShellUnsafeChars) {
+      cpanelUnsafeVars.push(`${spec.name} (${insp.cpanelUnsafeReasons.join("\u060C ")})`);
+    }
+  }
+  if (invalidNames.length > 0) {
+    checks.push({
+      id: "env_names_and_cpanel_safety",
+      category: "environment",
+      label: "\u0633\u0627\u062E\u062A\u0627\u0631 \u0646\u0627\u0645 \u0648 \u0645\u0642\u0627\u062F\u06CC\u0631 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u0628\u0631\u0627\u06CC cPanel",
+      status: "FAIL",
+      message: `\u0646\u0627\u0645 \u0645\u062A\u063A\u06CC\u0631(\u0647\u0627\u06CC) \u0646\u0627\u0645\u0639\u062A\u0628\u0631: ${invalidNames.join("\u060C ")}`
+    });
+  } else if (cpanelUnsafeVars.length > 0) {
+    checks.push({
+      id: "env_names_and_cpanel_safety",
+      category: "environment",
+      label: "\u0633\u0627\u062E\u062A\u0627\u0631 \u0646\u0627\u0645 \u0648 \u0645\u0642\u0627\u062F\u06CC\u0631 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u0628\u0631\u0627\u06CC cPanel",
+      status: "WARNING",
+      message: `\u0645\u0642\u0627\u062F\u06CC\u0631 \u0628\u0631\u062E\u06CC \u0645\u062A\u063A\u06CC\u0631\u0647\u0627 \u0645\u0645\u06A9\u0646 \u0627\u0633\u062A \u062A\u0648\u0633\u0637 set_env_vars.py \u062F\u0631 cPanel \u0631\u062F \u0634\u0648\u0646\u062F: ${cpanelUnsafeVars.join(" | ")}`,
+      remediation: `\u0628\u0631\u0627\u06CC \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC cPanel \u0627\u0632 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u0647\u0627\u06CC \u0633\u0627\u062F\u0647 ASCII \u0628\u062F\u0648\u0646 \u0641\u0627\u0635\u0644\u0647\u060C \u06A9\u0648\u062A\u06CC\u0634\u0646 (" \u06CC\u0627 ')\u060C \u062E\u0637 \u062C\u062F\u06CC\u062F \u0648 $ \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u06A9\u0646\u06CC\u062F\u060C \u06CC\u0627 \u0627\u0632 \u0641\u0627\u06CC\u0644 .env \u062E\u0635\u0648\u0635\u06CC \u062F\u0631 \u0631\u06CC\u0634\u0647 \u0628\u0631\u0646\u0627\u0645\u0647 \u0628\u0647\u0631\u0647 \u0628\u0628\u0631\u06CC\u062F.`
+    });
+  } else if (whitespaceTrimmedVars.length > 0) {
+    checks.push({
+      id: "env_names_and_cpanel_safety",
+      category: "environment",
+      label: "\u0633\u0627\u062E\u062A\u0627\u0631 \u0646\u0627\u0645 \u0648 \u0645\u0642\u0627\u062F\u06CC\u0631 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u0628\u0631\u0627\u06CC cPanel",
+      status: "WARNING",
+      message: `\u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0632\u06CC\u0631 \u062F\u0627\u0631\u0627\u06CC \u0641\u0627\u0635\u0644\u0647 \u0627\u0636\u0627\u0641\u06CC \u062F\u0631 \u0627\u0628\u062A\u062F\u0627/\u0627\u0646\u062A\u0647\u0627 \u0628\u0648\u062F\u0646\u062F \u06A9\u0647 \u0647\u0646\u06AF\u0627\u0645 \u067E\u0631\u062F\u0627\u0632\u0634 \u0646\u0627\u062F\u06CC\u062F\u0647 \u06AF\u0631\u0641\u062A\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F: ${whitespaceTrimmedVars.join("\u060C ")}`
+    });
+  } else {
+    checks.push({
+      id: "env_names_and_cpanel_safety",
+      category: "environment",
+      label: "\u0633\u0627\u062E\u062A\u0627\u0631 \u0646\u0627\u0645 \u0648 \u0645\u0642\u0627\u062F\u06CC\u0631 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u0628\u0631\u0627\u06CC cPanel",
+      status: "PASS",
+      message: "\u0646\u0627\u0645 \u0648 \u0642\u0627\u0644\u0628 \u062A\u0645\u0627\u0645 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u062A\u0646\u0638\u06CC\u0645\u200C\u0634\u062F\u0647 \u0628\u0627 \u0627\u0633\u062A\u0627\u0646\u062F\u0627\u0631\u062F Node.js \u0648 cPanel/Passenger \u0633\u0627\u0632\u06AF\u0627\u0631 \u0627\u0633\u062A."
+    });
+  }
+  const secretCheck = validateSessionSecret(env);
+  checks.push({
+    id: "session_secret",
+    category: "security",
+    label: "\u0627\u0639\u062A\u0628\u0627\u0631 \u0648 \u0627\u0645\u0646\u06CC\u062A SESSION_SECRET",
+    status: secretCheck.status,
+    message: secretCheck.reason,
+    remediation: secretCheck.status === "FAIL" || secretCheck.status === "WARNING" ? "\u06CC\u06A9 \u0631\u0634\u062A\u0647 \u06F6\u06F4 \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u06CC \u0647\u06AF\u0632 (\u0634\u0627\u0645\u0644 \u062D\u0631\u0648\u0641 a-f \u0648 \u0627\u0639\u062F\u0627\u062F 0-9\u060C \u0628\u062F\u0648\u0646 \u0641\u0627\u0635\u0644\u0647\u060C \u06A9\u0648\u062A\u06CC\u0634\u0646 \u06CC\u0627 \u0646\u0645\u0627\u062F\u0647\u0627\u06CC \u062E\u0627\u0635) \u0628\u0633\u0627\u0632\u06CC\u062F \u0648 \u062F\u0631 cPanel \u06CC\u0627 \u0641\u0627\u06CC\u0644 .env \u0631\u06CC\u0634\u0647 \u062B\u0628\u062A \u06A9\u0646\u06CC\u062F." : void 0
+  });
+  const dbCheck = validateProductionDatabaseConfig(env);
+  const rawConnLimit = (env.DB_CONNECTION_LIMIT || "").trim();
+  if (!dbCheck.valid) {
+    checks.push({
+      id: "db_env_vars",
+      category: "database",
+      label: "\u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 (DB_*)",
+      status: isProd ? "FAIL" : "WARNING",
+      message: dbCheck.message,
+      remediation: "\u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC DB_HOST\u060C DB_PORT\u060C DB_NAME\u060C DB_USER \u0648 DB_PASSWORD \u0631\u0627 \u062F\u0642\u06CC\u0642\u0627\u064B \u0645\u0637\u0627\u0628\u0642 MySQL Databases \u062F\u0631 cPanel \u062B\u0628\u062A \u06A9\u0646\u06CC\u062F."
+    });
+  } else {
+    const dbCfg = getDbConfig(env);
+    checks.push({
+      id: "db_env_vars",
+      category: "database",
+      label: "\u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0645\u062D\u06CC\u0637\u06CC \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 (DB_*)",
+      status: "PASS",
+      message: `\u062A\u0646\u0638\u06CC\u0645\u0627\u062A \u0627\u062A\u0635\u0627\u0644 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A (host=${dbCfg.host}, port=${dbCfg.port}, db=${dbCfg.database}, poolLimit=${dbCfg.connectionLimit}${rawConnLimit ? "" : " [\u067E\u06CC\u0634\u200C\u0641\u0631\u0636]"}).`
+    });
+  }
+  const tz = (env.APP_TIMEZONE || "").trim();
+  if (!tz) {
+    checks.push({
+      id: "optional_timezone",
+      category: "environment",
+      label: "\u0645\u0646\u0637\u0642\u0647 \u0632\u0645\u0627\u0646\u06CC (APP_TIMEZONE)",
+      status: "NOT_CONFIGURED",
+      message: "\u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647 \u0627\u0633\u062A\u061B \u0628\u0647\u200C\u0635\u0648\u0631\u062A \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u0631\u0648\u06CC Asia/Tehran \u0642\u0631\u0627\u0631 \u062F\u0627\u0631\u062F."
+    });
+  } else {
+    let validTz = true;
+    try {
+      Intl.DateTimeFormat("en-US", { timeZone: tz });
+    } catch {
+      validTz = false;
+    }
+    checks.push({
+      id: "optional_timezone",
+      category: "environment",
+      label: "\u0645\u0646\u0637\u0642\u0647 \u0632\u0645\u0627\u0646\u06CC (APP_TIMEZONE)",
+      status: validTz ? "PASS" : "WARNING",
+      message: validTz ? `\u0645\u0646\u0637\u0642\u0647 \u0632\u0645\u0627\u0646\u06CC \u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A (${tz}).` : `\u0645\u0642\u062F\u0627\u0631 APP_TIMEZONE (${tz}) \u062A\u0648\u0633\u0637 \u0645\u0648\u062A\u0648\u0631 \u062A\u0627\u0631\u06CC\u062E Node.js \u0634\u0646\u0627\u0633\u0627\u06CC\u06CC \u0646\u0634\u062F.`
+    });
+  }
+  const mgrPass = (env.INITIAL_MANAGER_PASSWORD || "").trim();
+  const wrkPass = (env.INITIAL_WORKER_PASSWORD || "").trim();
+  if (!mgrPass && !wrkPass) {
+    checks.push({
+      id: "initial_accounts_env",
+      category: "security",
+      label: "\u0631\u0645\u0632\u0647\u0627\u06CC \u0627\u0648\u0644\u06CC\u0647 \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC (INITIAL_*_PASSWORD)",
+      status: "NOT_CONFIGURED",
+      message: "\u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC \u0631\u0645\u0632 \u0627\u0648\u0644\u06CC\u0647 \u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647\u200C\u0627\u0646\u062F\u061B \u0628\u0631\u0627\u06CC \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633\u200C\u0647\u0627\u06CC \u0645\u0648\u062C\u0648\u062F \u0628\u062F\u0648\u0646 \u0645\u0634\u06A9\u0644 \u0648 \u0636\u0631\u0648\u0631\u06CC \u0646\u06CC\u0633\u062A\u0646\u062F (\u0641\u0642\u0637 \u062F\u0631 \u0627\u0648\u0644\u06CC\u0646 \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u062E\u0627\u0644\u06CC \u06A9\u0627\u0631\u0628\u0631\u062F \u062F\u0627\u0631\u0646\u062F)."
+    });
+  } else if (isProd && (mgrPass && (mgrPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(mgrPass)) || wrkPass && (wrkPass.length < 8 || FORBIDDEN_DEFAULT_PASSWORDS.has(wrkPass)))) {
+    checks.push({
+      id: "initial_accounts_env",
+      category: "security",
+      label: "\u0631\u0645\u0632\u0647\u0627\u06CC \u0627\u0648\u0644\u06CC\u0647 \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC (INITIAL_*_PASSWORD)",
+      status: "FAIL",
+      message: "\u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0648\u0644\u06CC\u0647 \u062A\u0639\u0631\u06CC\u0641\u200C\u0634\u062F\u0647 \u062F\u0631 \u0645\u062D\u06CC\u0637 Production \u0636\u0639\u06CC\u0641 \u06CC\u0627 \u062C\u0632\u0648 \u0645\u0642\u0627\u062F\u06CC\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u0645\u0645\u0646\u0648\u0639\u0647 \u0627\u0633\u062A.",
+      remediation: "\u0627\u06AF\u0631 \u062D\u0633\u0627\u0628\u200C\u0647\u0627 \u0627\u0632 \u0642\u0628\u0644 \u062F\u0631 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u0633\u0627\u062E\u062A\u0647 \u0634\u062F\u0647\u200C\u0627\u0646\u062F \u0627\u06CC\u0646 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627 \u0631\u0627 \u062D\u0630\u0641 \u06A9\u0646\u06CC\u062F\u060C \u06CC\u0627 \u0631\u0645\u0632 \u0642\u0648\u06CC \u06F8+ \u06A9\u0627\u0631\u0627\u06A9\u062A\u0631\u06CC \u0642\u0631\u0627\u0631 \u062F\u0647\u06CC\u062F."
+    });
+  } else {
+    checks.push({
+      id: "initial_accounts_env",
+      category: "security",
+      label: "\u0631\u0645\u0632\u0647\u0627\u06CC \u0627\u0648\u0644\u06CC\u0647 \u0631\u0627\u0647\u200C\u0627\u0646\u062F\u0627\u0632\u06CC (INITIAL_*_PASSWORD)",
+      status: "PASS",
+      message: "\u062A\u0646\u0638\u06CC\u0645\u0627\u062A \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0627\u0648\u0644\u06CC\u0647 \u062D\u0633\u0627\u0628\u200C\u0647\u0627 (\u0628\u062F\u0648\u0646 \u062A\u063A\u06CC\u06CC\u0631 \u0627\u0637\u0644\u0627\u0639\u0627\u062A \u06A9\u0627\u0631\u0628\u0631\u0627\u0646 \u0641\u0639\u0644\u06CC) \u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A."
+    });
+  }
+  const rawPort = (env.PORT || "").trim();
+  if (!rawPort) {
+    checks.push({
+      id: "port_config",
+      category: "network",
+      label: "\u067E\u0648\u0631\u062A \u0627\u062C\u0631\u0627 (PORT)",
+      status: isPassenger ? "PASS" : "NOT_CONFIGURED",
+      message: isPassenger ? "\u062F\u0631 \u0645\u062D\u06CC\u0637 Passenger \u0633\u0648\u06A9\u062A \u062A\u0648\u0633\u0637 \u0648\u0628\u200C\u0633\u0631\u0648\u0631 \u0645\u062F\u06CC\u0631\u06CC\u062A \u0645\u06CC\u200C\u0634\u0648\u062F." : `\u067E\u0648\u0631\u062A \u0635\u0631\u06CC\u062D \u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647\u061B \u0628\u0631\u0646\u0627\u0645\u0647 \u0627\u0632 \u0645\u0642\u062F\u0627\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 ${String(appCfg.listenTarget)} \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0645\u06CC\u200C\u06A9\u0646\u062F.`
+    });
+  } else if (appCfg.isSocketOrPipe || /^\d+$/.test(rawPort)) {
+    checks.push({
+      id: "port_config",
+      category: "network",
+      label: "\u067E\u0648\u0631\u062A \u0627\u062C\u0631\u0627 (PORT)",
+      status: "PASS",
+      message: appCfg.isSocketOrPipe ? `\u0628\u0631\u0646\u0627\u0645\u0647 \u0628\u0647 \u0633\u0648\u06A9\u062A/\u067E\u0627\u06CC\u067E Passenger \u0645\u062A\u0635\u0644 \u0645\u06CC\u200C\u0634\u0648\u062F.` : `\u067E\u0648\u0631\u062A \u0634\u0628\u06A9\u0647 \u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A (${String(appCfg.listenTarget)}).`
+    });
+  } else {
+    checks.push({
+      id: "port_config",
+      category: "network",
+      label: "\u067E\u0648\u0631\u062A \u0627\u062C\u0631\u0627 (PORT)",
+      status: "FAIL",
+      message: `\u0645\u0642\u062F\u0627\u0631 PORT \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A.`,
+      remediation: "\u0645\u0642\u062F\u0627\u0631 PORT \u0631\u0627 \u0639\u062F\u062F \u0628\u06CC\u0646 \u06F1 \u062A\u0627 \u06F6\u06F5\u06F5\u06F3\u06F5 \u06CC\u0627 \u0633\u0648\u06A9\u062A \u0645\u0639\u062A\u0628\u0631 Passenger \u0628\u06AF\u0630\u0627\u0631\u06CC\u062F."
+    });
+  }
+  const modResult = resolveRequiredModuleNames();
+  checks.push({
+    id: "required_modules",
+    category: "modules",
+    label: "\u0645\u0627\u0698\u0648\u0644\u200C\u0647\u0627\u06CC \u062D\u06CC\u0627\u062A\u06CC Node.js (node_modules)",
+    status: modResult.failed.length === 0 ? "PASS" : "FAIL",
+    message: modResult.failed.length === 0 ? `\u062A\u0645\u0627\u0645 ${modResult.loaded.length} \u0645\u0627\u0698\u0648\u0644 \u0636\u0631\u0648\u0631\u06CC \u0628\u0647\u200C\u062F\u0631\u0633\u062A\u06CC \u062F\u0631 \u062F\u0633\u062A\u0631\u0633 \u0647\u0633\u062A\u0646\u062F.` : `\u0645\u0627\u0698\u0648\u0644(\u0647\u0627\u06CC) \u0632\u06CC\u0631 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F\u0646\u062F: ${modResult.failed.join("\u060C ")}`,
+    remediation: modResult.failed.length > 0 ? "\u062F\u0631 \u0628\u062E\u0634 Setup Node.js App \u062F\u0631 cPanel \u062F\u06A9\u0645\u0647 Run NPM Install \u0631\u0627 \u0627\u062C\u0631\u0627 \u06A9\u0646\u06CC\u062F." : void 0
+  });
+  const mediaWrite = checkFilesystemWritable(appCfg.privateMediaDir);
+  const backupWrite = checkFilesystemWritable(appCfg.backupDir);
+  const appRootDir = getAppRootDir();
+  const schemaExists = import_fs3.default.existsSync(import_path3.default.resolve(appRootDir, "database/schema.sql"));
+  const distIndexExists = import_fs3.default.existsSync(import_path3.default.resolve(appRootDir, "dist/index.html"));
+  if (!mediaWrite.ok || !backupWrite.ok || !schemaExists || isProd && !distIndexExists) {
+    const fsIssues = [];
+    if (!mediaWrite.ok) fsIssues.push(`\u0639\u062F\u0645 \u062F\u0633\u062A\u0631\u0633\u06CC \u0646\u0648\u0634\u062A\u0646 \u062F\u0631 \u067E\u0648\u0634\u0647 \u0631\u0633\u0627\u0646\u0647 (${mediaWrite.error})`);
+    if (!backupWrite.ok) fsIssues.push(`\u0639\u062F\u0645 \u062F\u0633\u062A\u0631\u0633\u06CC \u0646\u0648\u0634\u062A\u0646 \u062F\u0631 \u067E\u0648\u0634\u0647 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 (${backupWrite.error})`);
+    if (!schemaExists) fsIssues.push("\u0641\u0627\u06CC\u0644 database/schema.sql \u06CC\u0627\u0641\u062A \u0646\u0634\u062F");
+    if (isProd && !distIndexExists) fsIssues.push("\u0641\u0627\u06CC\u0644 \u0628\u06CC\u0644\u062F \u0641\u0631\u0627\u0646\u062A\u200C\u0627\u0646\u062F dist/index.html \u06CC\u0627\u0641\u062A \u0646\u0634\u062F");
+    checks.push({
+      id: "filesystem_access",
+      category: "filesystem",
+      label: "\u062F\u0633\u062A\u0631\u0633\u06CC \u0641\u0627\u06CC\u0644\u200C\u0633\u06CC\u0633\u062A\u0645 \u0648 \u0641\u0627\u06CC\u0644\u200C\u0647\u0627\u06CC \u0628\u06CC\u0644\u062F",
+      status: "FAIL",
+      message: fsIssues.join(" | "),
+      remediation: "\u0627\u0637\u0645\u06CC\u0646\u0627\u0646 \u062D\u0627\u0635\u0644 \u06A9\u0646\u06CC\u062F \u0628\u0633\u062A\u0647 \u06A9\u0627\u0645\u0644 Production \u062F\u0631 \u0631\u06CC\u0634\u0647 \u0628\u0631\u0646\u0627\u0645\u0647 Extract \u0634\u062F\u0647 \u0648 \u062F\u0633\u062A\u0631\u0633\u06CC \u0646\u0648\u0634\u062A\u0646 \u0628\u0631\u0642\u0631\u0627\u0631 \u0627\u0633\u062A."
+    });
+  } else {
+    checks.push({
+      id: "filesystem_access",
+      category: "filesystem",
+      label: "\u062F\u0633\u062A\u0631\u0633\u06CC \u0641\u0627\u06CC\u0644\u200C\u0633\u06CC\u0633\u062A\u0645 \u0648 \u0641\u0627\u06CC\u0644\u200C\u0647\u0627\u06CC \u0628\u06CC\u0644\u062F",
+      status: !distIndexExists ? "WARNING" : "PASS",
+      message: !distIndexExists ? "\u067E\u0648\u0634\u0647\u200C\u0647\u0627\u06CC \u062E\u0635\u0648\u0635\u06CC \u0648 schema.sql \u0622\u0645\u0627\u062F\u0647 \u0647\u0633\u062A\u0646\u062F (\u062F\u0631 \u062D\u0627\u0644\u062A \u062A\u0648\u0633\u0639\u0647 \u0641\u0627\u06CC\u0644 dist/index.html \u0627\u062E\u062A\u06CC\u0627\u0631\u06CC \u0627\u0633\u062A)." : "\u062F\u0633\u062A\u0631\u0633\u06CC \u062E\u0648\u0627\u0646\u062F\u0646/\u0646\u0648\u0634\u062A\u0646 \u067E\u0648\u0634\u0647\u200C\u0647\u0627\u06CC \u062E\u0635\u0648\u0635\u06CC\u060C schema.sql \u0648 \u0628\u06CC\u0644\u062F dist/index.html \u0628\u0631\u0642\u0631\u0627\u0631 \u0627\u0633\u062A."
+    });
+  }
+  if (options?.checkDb) {
+    if (!dbCheck.valid && isProd && env.VITEST !== "true") {
+      checks.push({
+        id: "db_connectivity",
+        category: "database",
+        label: "\u0628\u0631\u0631\u0633\u06CC \u0627\u062A\u0635\u0627\u0644 \u0632\u0646\u062F\u0647 \u0628\u0647 MySQL/MariaDB",
+        status: "FAIL",
+        message: "\u0628\u0647 \u062F\u0644\u06CC\u0644 \u0646\u0642\u0635 \u0645\u062A\u063A\u06CC\u0631\u0647\u0627\u06CC DB_* \u0627\u0645\u06A9\u0627\u0646 \u0628\u0631\u0642\u0631\u0627\u0631\u06CC \u0627\u062A\u0635\u0627\u0644 \u062A\u0633\u062A \u0648\u062C\u0648\u062F \u0646\u062F\u0627\u0631\u062F."
+      });
+    } else {
+      const cfg = getDbConfig(env);
+      let conn = null;
+      try {
+        conn = await import_promise2.default.createConnection({
+          host: cfg.host,
+          port: cfg.port,
+          user: cfg.user,
+          password: cfg.password,
+          database: cfg.database,
+          connectTimeout: options.dbTimeoutMs || 3500
+        });
+        const [verRows] = await conn.query(
+          "SELECT VERSION() AS db_version"
+        );
+        const [tblRows] = await conn.query("SHOW TABLES");
+        const dbVersion = String(verRows[0]?.db_version || "unknown");
+        checks.push({
+          id: "db_connectivity",
+          category: "database",
+          label: "\u0628\u0631\u0631\u0633\u06CC \u0627\u062A\u0635\u0627\u0644 \u0632\u0646\u062F\u0647 \u0628\u0647 MySQL/MariaDB",
+          status: "PASS",
+          message: `\u0627\u062A\u0635\u0627\u0644 \u062E\u0648\u0627\u0646\u062F\u0646\u06CC \u0648 \u063A\u06CC\u0631\u0645\u062E\u0631\u0628 \u0628\u0647 \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647 \u0628\u0631\u0642\u0631\u0627\u0631 \u0634\u062F (\u0646\u0633\u062E\u0647: ${dbVersion} | \u062A\u0639\u062F\u0627\u062F \u062C\u062F\u0627\u0648\u0644 \u0641\u0639\u0644\u06CC: ${tblRows.length}).`
+        });
+      } catch (err) {
+        checks.push({
+          id: "db_connectivity",
+          category: "database",
+          label: "\u0628\u0631\u0631\u0633\u06CC \u0627\u062A\u0635\u0627\u0644 \u0632\u0646\u062F\u0647 \u0628\u0647 MySQL/MariaDB",
+          status: "FAIL",
+          message: `\u0639\u062F\u0645 \u062F\u0633\u062A\u0631\u0633\u06CC \u0628\u0647 \u067E\u0627\u06CC\u06AF\u0627\u0647 \u062F\u0627\u062F\u0647: ${sanitizeSecretErrorText(err)}`,
+          remediation: "\u0646\u0627\u0645 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633\u060C \u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC\u060C \u0631\u0645\u0632 \u0639\u0628\u0648\u0631 \u0648 \u062F\u0633\u062A\u0631\u0633\u06CC ALL PRIVILEGES \u06A9\u0627\u0631\u0628\u0631 \u062F\u06CC\u062A\u0627\u0628\u06CC\u0633 \u062F\u0631 MySQL Databases \u0633\u06CC\u200C\u067E\u0646\u0644 \u0631\u0627 \u0628\u0631\u0631\u0633\u06CC \u06A9\u0646\u06CC\u062F."
+        });
+      } finally {
+        if (conn) {
+          await conn.end().catch(() => {
+          });
+        }
+      }
+    }
+  } else {
+    checks.push({
+      id: "db_connectivity",
+      category: "database",
+      label: "\u0628\u0631\u0631\u0633\u06CC \u0627\u062A\u0635\u0627\u0644 \u0632\u0646\u062F\u0647 \u0628\u0647 MySQL/MariaDB",
+      status: "NOT_CONFIGURED",
+      message: "\u0628\u0631\u0631\u0633\u06CC \u0627\u062A\u0635\u0627\u0644 \u0632\u0646\u062F\u0647 \u062F\u0631 \u0627\u06CC\u0646 \u0627\u062C\u0631\u0627 \u062F\u0631\u062E\u0648\u0627\u0633\u062A \u0646\u0634\u062F\u0647 \u0628\u0648\u062F."
+    });
+  }
+  let pass = 0;
+  let fail = 0;
+  let warning = 0;
+  let notConfigured = 0;
+  for (const item of checks) {
+    if (item.status === "PASS") pass++;
+    else if (item.status === "FAIL") fail++;
+    else if (item.status === "WARNING") warning++;
+    else notConfigured++;
+  }
+  return {
+    ok: fail === 0,
+    summary: { pass, fail, warning, notConfigured },
+    runtime: {
+      nodeVersion: `v${nodeVersion}`,
+      nodeEnv: rawNodeEnv || "development",
+      isProduction: isProd,
+      isBundled,
+      isPassenger,
+      platform: process.platform,
+      cwd: process.cwd(),
+      envSource: meta.sourceMode,
+      dotenvLoaded: Boolean(meta.dotenvPathLoaded),
+      dotenvKeysAppliedCount: meta.dotenvKeysApplied.length
+    },
+    checks,
+    generatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function formatPreflightReportText(report) {
+  const lines = [
+    "============================================================",
+    `[MGAMMON Duo Preflight] Status: ${report.ok ? "READY" : "FAILED"} | PASS=${report.summary.pass} WARNING=${report.summary.warning} FAIL=${report.summary.fail} NOT_CONFIGURED=${report.summary.notConfigured}`,
+    `[MGAMMON Duo Preflight] Runtime: ${report.runtime.nodeVersion} | NODE_ENV=${report.runtime.nodeEnv} | bundled=${report.runtime.isBundled} | passenger=${report.runtime.isPassenger} | envSource=${report.runtime.envSource}`,
+    "------------------------------------------------------------"
+  ];
+  for (const c of report.checks) {
+    lines.push(`[${c.status}] (${c.id}) ${c.label}: ${c.message}`);
+    if (c.remediation && (c.status === "FAIL" || c.status === "WARNING")) {
+      lines.push(`   -> Action: ${c.remediation}`);
+    }
+  }
+  lines.push("============================================================");
+  return lines.join("\n");
+}
+
 // src/server/routes.ts
 var import_express = require("express");
 var import_bcryptjs2 = __toESM(require("bcryptjs"), 1);
 var import_crypto5 = __toESM(require("crypto"), 1);
-var import_fs4 = __toESM(require("fs"), 1);
-var import_path4 = __toESM(require("path"), 1);
+var import_fs5 = __toESM(require("fs"), 1);
+var import_path5 = __toESM(require("path"), 1);
 var XLSX = __toESM(require("xlsx"), 1);
 
 // src/server/backup.ts
 var import_crypto4 = __toESM(require("crypto"), 1);
-var import_fs3 = __toESM(require("fs"), 1);
-var import_path3 = __toESM(require("path"), 1);
+var import_fs4 = __toESM(require("fs"), 1);
+var import_path4 = __toESM(require("path"), 1);
 var BACKUP_TABLES_ORDERED = [
   "schema_migrations",
   "users",
@@ -2289,7 +2908,7 @@ async function createFullBackup(options) {
   const appCfg = getAppConfig();
   const backupDir = options?.backupDir || appCfg.backupDir;
   const privateMediaDir = options?.privateMediaDir || appCfg.privateMediaDir;
-  import_fs3.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
+  import_fs4.default.mkdirSync(backupDir, { recursive: true, mode: 448 });
   const metrics = await collectDatabaseMetrics(p);
   if ((metrics.tableCounts.users || 0) === 0 || (metrics.tableCounts.system_settings || 0) === 0) {
     throw new Error(
@@ -2327,15 +2946,15 @@ async function createFullBackup(options) {
   const sqlDump = sqlLines.join("\n");
   const mediaFiles = [];
   let mediaTotalBytes = 0;
-  if (import_fs3.default.existsSync(privateMediaDir)) {
+  if (import_fs4.default.existsSync(privateMediaDir)) {
     for (const folder of PRIVATE_MEDIA_SUBFOLDERS) {
-      const folderPath = import_path3.default.join(privateMediaDir, folder);
-      if (!import_fs3.default.existsSync(folderPath)) continue;
-      const entries = import_fs3.default.readdirSync(folderPath, { withFileTypes: true });
+      const folderPath = import_path4.default.join(privateMediaDir, folder);
+      if (!import_fs4.default.existsSync(folderPath)) continue;
+      const entries = import_fs4.default.readdirSync(folderPath, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isFile()) continue;
-        const fullPath = import_path3.default.join(folderPath, entry.name);
-        const buf = import_fs3.default.readFileSync(fullPath);
+        const fullPath = import_path4.default.join(folderPath, entry.name);
+        const buf = import_fs4.default.readFileSync(fullPath);
         if (buf.length === 0) continue;
         const sha256 = computeSha256(buf);
         mediaFiles.push({
@@ -2372,28 +2991,28 @@ async function createFullBackup(options) {
     mediaFiles,
     sqlDump
   };
-  const backupFilePath = import_path3.default.join(backupDir, `${backupId}.mgbackup.json`);
+  const backupFilePath = import_path4.default.join(backupDir, `${backupId}.mgbackup.json`);
   const tmpFilePath = `${backupFilePath}.tmp`;
-  const sqlDumpFilePath = import_path3.default.join(backupDir, `${backupId}.sql`);
+  const sqlDumpFilePath = import_path4.default.join(backupDir, `${backupId}.sql`);
   const serializedArchive = JSON.stringify(archiveBundle, null, 2);
-  import_fs3.default.writeFileSync(tmpFilePath, serializedArchive, { mode: 384 });
+  import_fs4.default.writeFileSync(tmpFilePath, serializedArchive, { mode: 384 });
   const verification = verifyBackupArchive(tmpFilePath);
   if (!verification.valid) {
     try {
-      import_fs3.default.unlinkSync(tmpFilePath);
+      import_fs4.default.unlinkSync(tmpFilePath);
     } catch {
     }
     throw new Error(
       `BACKUP_VERIFICATION_FAILED: \u067E\u0634\u062A\u06CC\u0628\u0627\u0646\u200C\u06AF\u06CC\u0631\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062F (${verification.reason})`
     );
   }
-  import_fs3.default.renameSync(tmpFilePath, backupFilePath);
-  import_fs3.default.writeFileSync(sqlDumpFilePath, sqlDump, { mode: 384 });
+  import_fs4.default.renameSync(tmpFilePath, backupFilePath);
+  import_fs4.default.writeFileSync(sqlDumpFilePath, sqlDump, { mode: 384 });
   const maxRetained = options?.maxRetainedBackups ?? 30;
   if (maxRetained > 0) {
     pruneOldBackups(backupDir, maxRetained);
   }
-  const stat = import_fs3.default.statSync(backupFilePath);
+  const stat = import_fs4.default.statSync(backupFilePath);
   return {
     backupFilePath,
     sqlDumpFilePath,
@@ -2403,14 +3022,14 @@ async function createFullBackup(options) {
 }
 function verifyBackupArchive(backupFilePath) {
   try {
-    if (!import_fs3.default.existsSync(backupFilePath)) {
+    if (!import_fs4.default.existsSync(backupFilePath)) {
       return { valid: false, reason: "\u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." };
     }
-    const stat = import_fs3.default.statSync(backupFilePath);
+    const stat = import_fs4.default.statSync(backupFilePath);
     if (!stat.isFile() || stat.size < 128) {
       return { valid: false, reason: "\u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u062E\u0627\u0644\u06CC \u06CC\u0627 \u0646\u0627\u0642\u0635 \u0627\u0633\u062A." };
     }
-    const rawText = import_fs3.default.readFileSync(backupFilePath, "utf8");
+    const rawText = import_fs4.default.readFileSync(backupFilePath, "utf8");
     if (!rawText || !rawText.trim().startsWith("{") || !rawText.trim().endsWith("}")) {
       return { valid: false, reason: "\u0645\u062D\u062A\u0648\u0627\u06CC \u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u0646\u0627\u0642\u0635 \u06CC\u0627 \u0628\u0631\u06CC\u062F\u0647\u200C\u0634\u062F\u0647 (Truncated) \u0627\u0633\u062A." };
     }
@@ -2484,13 +3103,13 @@ function verifyBackupArchive(backupFilePath) {
 }
 function listAvailableBackups(customBackupDir) {
   const backupDir = customBackupDir || getAppConfig().backupDir;
-  if (!import_fs3.default.existsSync(backupDir)) {
+  if (!import_fs4.default.existsSync(backupDir)) {
     return [];
   }
-  const entries = import_fs3.default.readdirSync(backupDir, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith(".mgbackup.json")).sort((a, b) => b.name.localeCompare(a.name));
+  const entries = import_fs4.default.readdirSync(backupDir, { withFileTypes: true }).filter((e) => e.isFile() && e.name.endsWith(".mgbackup.json")).sort((a, b) => b.name.localeCompare(a.name));
   return entries.map((e) => {
-    const fullPath = import_path3.default.join(backupDir, e.name);
-    const stat = import_fs3.default.statSync(fullPath);
+    const fullPath = import_path4.default.join(backupDir, e.name);
+    const stat = import_fs4.default.statSync(fullPath);
     const check = verifyBackupArchive(fullPath);
     return {
       fileName: e.name,
@@ -2504,15 +3123,15 @@ function listAvailableBackups(customBackupDir) {
 }
 function pruneOldBackups(backupDir, maxRetained) {
   try {
-    const files = import_fs3.default.readdirSync(backupDir).filter((f) => f.endsWith(".mgbackup.json")).sort((a, b) => b.localeCompare(a));
+    const files = import_fs4.default.readdirSync(backupDir).filter((f) => f.endsWith(".mgbackup.json")).sort((a, b) => b.localeCompare(a));
     if (files.length <= maxRetained) return;
     const toRemove = files.slice(maxRetained);
     for (const f of toRemove) {
-      const fullJson = import_path3.default.join(backupDir, f);
+      const fullJson = import_path4.default.join(backupDir, f);
       const fullSql = fullJson.replace(/\.mgbackup\.json$/, ".sql");
       try {
-        if (import_fs3.default.existsSync(fullJson)) import_fs3.default.unlinkSync(fullJson);
-        if (import_fs3.default.existsSync(fullSql)) import_fs3.default.unlinkSync(fullSql);
+        if (import_fs4.default.existsSync(fullJson)) import_fs4.default.unlinkSync(fullJson);
+        if (import_fs4.default.existsSync(fullSql)) import_fs4.default.unlinkSync(fullSql);
       } catch {
       }
     }
@@ -3791,7 +4410,7 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
     xls: ".xls",
     audio: ".webm"
   };
-  let ext = import_path4.default.extname(rawName).toLowerCase();
+  let ext = import_path5.default.extname(rawName).toLowerCase();
   if (!ext || !sigToExts[detectedSig]?.includes(ext)) {
     if (defaultExtForSig[detectedSig]) {
       ext = defaultExtForSig[detectedSig];
@@ -3811,14 +4430,14 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
   if (!sigToExts[detectedSig]?.includes(ext)) {
     throw new ValidationError(400, "\u0645\u062D\u062A\u0648\u0627\u06CC \u0628\u0627\u06CC\u0646\u0631\u06CC \u0648\u0627\u0642\u0639\u06CC \u0641\u0627\u06CC\u0644 \u0628\u0627 \u067E\u0633\u0648\u0646\u062F \u0627\u0639\u0644\u0627\u0645\u200C\u0634\u062F\u0647 \u0645\u0637\u0627\u0628\u0642\u062A \u0646\u062F\u0627\u0631\u062F.");
   }
-  const safeBase = import_path4.default.basename(rawName, import_path4.default.extname(rawName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, "_").slice(0, 40) || "file";
+  const safeBase = import_path5.default.basename(rawName, import_path5.default.extname(rawName)).replace(/[^a-zA-Z0-9_\u0600-\u06FF-]/g, "_").slice(0, 40) || "file";
   const fileName = `${Date.now()}_${import_crypto5.default.randomBytes(4).toString("hex")}_${safeBase}${ext}`;
   const appRootDir = getAppRootDir();
-  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(appRootDir, ".data/private_media");
-  const targetDir = import_path4.default.resolve(baseMediaDir, subFolder);
-  import_fs4.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
-  const fullPath = import_path4.default.join(targetDir, fileName);
-  import_fs4.default.writeFileSync(fullPath, buffer, { mode: 384 });
+  const baseMediaDir = process.env.PRIVATE_MEDIA_DIR ? import_path5.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : import_path5.default.resolve(appRootDir, ".data/private_media");
+  const targetDir = import_path5.default.resolve(baseMediaDir, subFolder);
+  import_fs5.default.mkdirSync(targetDir, { recursive: true, mode: 448 });
+  const fullPath = import_path5.default.join(targetDir, fileName);
+  import_fs5.default.writeFileSync(fullPath, buffer, { mode: 384 });
   return {
     publicUrl: `/assets/media/${subFolder}/${fileName}`,
     sizeBytes: buffer.length
@@ -3826,7 +4445,7 @@ function saveBase64MediaFile(subFolder, originalName, base64Data) {
 }
 function getBaseMediaDirPath() {
   const appRootDir = getAppRootDir();
-  return process.env.PRIVATE_MEDIA_DIR ? import_path4.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : import_path4.default.resolve(appRootDir, ".data/private_media");
+  return process.env.PRIVATE_MEDIA_DIR ? import_path5.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : import_path5.default.resolve(appRootDir, ".data/private_media");
 }
 function resolveMediaDiskPath(fileUrl) {
   if (typeof fileUrl !== "string") return null;
@@ -3838,19 +4457,19 @@ function resolveMediaDiskPath(fileUrl) {
   const [subFolder, fileName] = parts;
   const allowedFolders = ["avatars", "attachments", "excel", "audio", "receipts", "reports"];
   if (!allowedFolders.includes(subFolder)) return null;
-  const safeFileName = import_path4.default.basename(fileName);
+  const safeFileName = import_path5.default.basename(fileName);
   if (!safeFileName || safeFileName !== fileName || safeFileName.includes("..")) return null;
   const baseDir = getBaseMediaDirPath();
-  const fullPath = import_path4.default.resolve(baseDir, subFolder, safeFileName);
-  if (!fullPath.startsWith(baseDir + import_path4.default.sep)) return null;
+  const fullPath = import_path5.default.resolve(baseDir, subFolder, safeFileName);
+  if (!fullPath.startsWith(baseDir + import_path5.default.sep)) return null;
   return fullPath;
 }
 function getMediaFileInfoOnDisk(fileUrl) {
   const fullPath = resolveMediaDiskPath(fileUrl);
   if (!fullPath) return { exists: false, sizeBytes: 0, mtimeIso: null };
   try {
-    if (!import_fs4.default.existsSync(fullPath)) return { exists: false, sizeBytes: 0, mtimeIso: null };
-    const stat = import_fs4.default.statSync(fullPath);
+    if (!import_fs5.default.existsSync(fullPath)) return { exists: false, sizeBytes: 0, mtimeIso: null };
+    const stat = import_fs5.default.statSync(fullPath);
     if (!stat.isFile()) return { exists: false, sizeBytes: 0, mtimeIso: null };
     return {
       exists: true,
@@ -3865,11 +4484,11 @@ function unlinkMediaUrlFromDisk(fileUrl) {
   const fullPath = resolveMediaDiskPath(fileUrl);
   if (!fullPath) return 0;
   try {
-    if (!import_fs4.default.existsSync(fullPath)) return 0;
-    const stat = import_fs4.default.statSync(fullPath);
+    if (!import_fs5.default.existsSync(fullPath)) return 0;
+    const stat = import_fs5.default.statSync(fullPath);
     if (!stat.isFile()) return 0;
     const size = stat.size;
-    import_fs4.default.unlinkSync(fullPath);
+    import_fs5.default.unlinkSync(fullPath);
     return size;
   } catch {
     return 0;
@@ -9487,8 +10106,8 @@ apiRouter.get(
   requireRole("manager"),
   (_req, res) => {
     try {
-      const zipPath = import_path4.default.resolve(getAppRootDir(), "mgammon-duo-cpanel-deploy.zip");
-      if (!import_fs4.default.existsSync(zipPath)) {
+      const zipPath = import_path5.default.resolve(getAppRootDir(), "mgammon-duo-cpanel-deploy.zip");
+      if (!import_fs5.default.existsSync(zipPath)) {
         res.status(404).json({
           ok: false,
           message: "\u0641\u0627\u06CC\u0644 \u0628\u0633\u062A\u0647 \u0646\u0635\u0628\u06CC cPanel \u06CC\u0627\u0641\u062A \u0646\u0634\u062F."
@@ -9562,13 +10181,13 @@ apiRouter.post(
   requireRole("manager"),
   async (req, res) => {
     try {
-      const fileName = import_path4.default.basename(String(req.body?.fileName || "").trim());
+      const fileName = import_path5.default.basename(String(req.body?.fileName || "").trim());
       if (!fileName || !fileName.endsWith(".mgbackup.json")) {
         res.status(400).json({ ok: false, message: "\u0646\u0627\u0645 \u0641\u0627\u06CC\u0644 \u067E\u0634\u062A\u06CC\u0628\u0627\u0646 \u0645\u0639\u062A\u0628\u0631 \u0646\u06CC\u0633\u062A." });
         return;
       }
-      const backupDir = process.env.BACKUP_DIR || import_path4.default.resolve(getAppRootDir(), ".data/backups");
-      const fullPath = import_path4.default.join(backupDir, fileName);
+      const backupDir = process.env.BACKUP_DIR || import_path5.default.resolve(getAppRootDir(), ".data/backups");
+      const fullPath = import_path5.default.join(backupDir, fileName);
       const verification = verifyBackupArchive(fullPath);
       if (!verification.valid) {
         res.status(422).json({
@@ -10016,7 +10635,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
           category: "AUDIO",
           record_id: recordId,
           file_url: audioUrl,
-          file_name: import_path4.default.basename(audioUrl),
+          file_name: import_path5.default.basename(audioUrl),
           size_bytes: info.sizeBytes,
           shamsi_date: shamsiDate,
           recorded_time: recordedTime,
@@ -10039,7 +10658,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
             const fileUrl = String(att.file_url).trim();
             referencedUrls.add(fileUrl);
             const info = getMediaFileInfoOnDisk(fileUrl);
-            const ext = import_path4.default.extname(fileUrl).toLowerCase();
+            const ext = import_path5.default.extname(fileUrl).toLowerCase();
             const isImg = [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
             const isAud = [".webm", ".ogg", ".mp3", ".m4a", ".wav"].includes(ext);
             items.push({
@@ -10048,7 +10667,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
               category: isAud ? "AUDIO" : isImg ? "IMAGE" : "DOCUMENT",
               record_id: recordId,
               file_url: fileUrl,
-              file_name: att.file_name || import_path4.default.basename(fileUrl),
+              file_name: att.file_name || import_path5.default.basename(fileUrl),
               size_bytes: info.exists ? info.sizeBytes : Number(att.file_size || 0),
               shamsi_date: shamsiDate,
               recorded_time: recordedTime,
@@ -10083,7 +10702,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
         category: "IMAGE",
         record_id: recordId,
         file_url: fileUrl,
-        file_name: r.photo_name ? String(r.photo_name) : import_path4.default.basename(fileUrl),
+        file_name: r.photo_name ? String(r.photo_name) : import_path5.default.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ""),
         recorded_time: String(r.recorded_time || "").slice(0, 5),
@@ -10111,7 +10730,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
       const fileUrl = String(r.receipt_file_url).trim();
       referencedUrls.add(fileUrl);
       const info = getMediaFileInfoOnDisk(fileUrl);
-      const ext = import_path4.default.extname(fileUrl).toLowerCase();
+      const ext = import_path5.default.extname(fileUrl).toLowerCase();
       const createdAtIso = r.created_at ? new Date(r.created_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
       items.push({
         id: `FIN_RECEIPT_${recordId}`,
@@ -10119,7 +10738,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
         category: ext === ".pdf" ? "DOCUMENT" : "IMAGE",
         record_id: recordId,
         file_url: fileUrl,
-        file_name: r.receipt_file_name ? String(r.receipt_file_name) : import_path4.default.basename(fileUrl),
+        file_name: r.receipt_file_name ? String(r.receipt_file_name) : import_path5.default.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ""),
         recorded_time: "",
@@ -10151,7 +10770,7 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
         category: "DOCUMENT",
         record_id: recordId,
         file_url: fileUrl,
-        file_name: r.excel_file_name ? String(r.excel_file_name) : import_path4.default.basename(fileUrl),
+        file_name: r.excel_file_name ? String(r.excel_file_name) : import_path5.default.basename(fileUrl),
         size_bytes: info.sizeBytes,
         shamsi_date: String(r.shamsi_date || ""),
         title_or_context: `\u0641\u0627\u06CC\u0644 \u0627\u06A9\u0633\u0644 \u0633\u0648\u0627\u0628\u0642: ${String(r.title || "").slice(0, 60)}`,
@@ -10170,11 +10789,11 @@ apiRouter.get("/media/storage", requireAuth, async (req, res) => {
         { folder: "excel", cat: "DOCUMENT" }
       ];
       for (const { folder, cat } of scanFolders) {
-        const dirPath = import_path4.default.join(baseDir, folder);
-        if (!import_fs4.default.existsSync(dirPath)) continue;
+        const dirPath = import_path5.default.join(baseDir, folder);
+        if (!import_fs5.default.existsSync(dirPath)) continue;
         let fileNames = [];
         try {
-          fileNames = import_fs4.default.readdirSync(dirPath);
+          fileNames = import_fs5.default.readdirSync(dirPath);
         } catch {
           fileNames = [];
         }
@@ -10279,7 +10898,7 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
           if (Array.isArray(parsedAtts)) {
             for (const att of parsedAtts) {
               if (!att?.file_url) continue;
-              const ext = import_path4.default.extname(att.file_url).toLowerCase();
+              const ext = import_path5.default.extname(att.file_url).toLowerCase();
               const isImg = [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
               const isAud = [".webm", ".ogg", ".mp3", ".m4a", ".wav"].includes(ext);
               const cat = isAud ? "AUDIO" : isImg ? "IMAGE" : "DOCUMENT";
@@ -10529,6 +11148,7 @@ apiRouter.post("/media/cleanup", requireAuth, async (req, res) => {
 });
 
 // server.ts
+loadEnvironmentOnce();
 var PRIVATE_MEDIA_FOLDERS = /* @__PURE__ */ new Set([
   "avatars",
   "attachments",
@@ -10575,11 +11195,11 @@ async function createApp() {
     next();
   });
   const appRootDir = getAppRootDir();
-  const privateBaseDir = import_path5.default.resolve(appRootDir, ".data/private_media");
-  const legacyPublicMediaDir = import_path5.default.resolve(appRootDir, "public/assets/media");
+  const privateBaseDir = import_path6.default.resolve(appRootDir, ".data/private_media");
+  const legacyPublicMediaDir = import_path6.default.resolve(appRootDir, "public/assets/media");
   for (const folder of PRIVATE_MEDIA_FOLDERS) {
     try {
-      import_fs5.default.mkdirSync(import_path5.default.join(privateBaseDir, folder), { recursive: true, mode: 448 });
+      import_fs6.default.mkdirSync(import_path6.default.join(privateBaseDir, folder), { recursive: true, mode: 448 });
     } catch {
     }
   }
@@ -10697,16 +11317,16 @@ async function createApp() {
           return;
         }
       }
-      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR ? import_path5.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : privateBaseDir;
-      const privateFolderRoot = import_path5.default.resolve(activePrivateBase, folder) + import_path5.default.sep;
-      const legacyFolderRoot = import_path5.default.resolve(legacyPublicMediaDir, folder) + import_path5.default.sep;
-      const candidatePrivate = import_path5.default.resolve(activePrivateBase, folder, filename);
-      const candidateLegacy = import_path5.default.resolve(legacyPublicMediaDir, folder, filename);
+      const activePrivateBase = process.env.PRIVATE_MEDIA_DIR ? import_path6.default.resolve(appRootDir, process.env.PRIVATE_MEDIA_DIR) : privateBaseDir;
+      const privateFolderRoot = import_path6.default.resolve(activePrivateBase, folder) + import_path6.default.sep;
+      const legacyFolderRoot = import_path6.default.resolve(legacyPublicMediaDir, folder) + import_path6.default.sep;
+      const candidatePrivate = import_path6.default.resolve(activePrivateBase, folder, filename);
+      const candidateLegacy = import_path6.default.resolve(legacyPublicMediaDir, folder, filename);
       if (!candidatePrivate.startsWith(privateFolderRoot) || !candidateLegacy.startsWith(legacyFolderRoot)) {
         res.status(400).json({ ok: false, message: "\u0645\u0633\u06CC\u0631 \u0641\u0627\u06CC\u0644 \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A." });
         return;
       }
-      const targetPath = import_fs5.default.existsSync(candidatePrivate) ? candidatePrivate : import_fs5.default.existsSync(candidateLegacy) ? candidateLegacy : null;
+      const targetPath = import_fs6.default.existsSync(candidatePrivate) ? candidatePrivate : import_fs6.default.existsSync(candidateLegacy) ? candidateLegacy : null;
       if (!targetPath) {
         res.status(404).json({ ok: false, message: "\u0641\u0627\u06CC\u0644 \u0645\u0648\u0631\u062F \u0646\u0638\u0631 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F." });
         return;
@@ -10727,63 +11347,159 @@ async function createApp() {
     }
     next();
   });
-  const publicDir = import_path5.default.resolve(appRootDir, "public");
+  const publicDir = import_path6.default.resolve(appRootDir, "public");
   app.use(import_express2.default.static(publicDir));
   return app;
 }
-async function startServer() {
-  validateProductionSecurityConfig(process.env);
-  initializeDatabase().then(() => {
-    console.log(
-      "[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests."
-    );
-  }).catch((err) => {
-    console.error(
-      "[MGAMMON Duo] Database initialization failed during startup:",
-      sanitizeDbErrorMessage(err)
-    );
-  });
-  const app = await createApp();
-  const appCfg = getAppConfig();
-  const isProductionMode2 = appCfg.isProduction || appCfg.isBundled;
-  if (!isProductionMode2) {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-        ws: false,
-        watch: null
-      },
-      appType: "spa"
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = import_path5.default.resolve(getAppRootDir(), "dist");
-    app.use(import_express2.default.static(distPath));
-    app.use("/api", (_req, res) => {
-      res.status(404).json({
-        ok: false,
-        code: "NOT_FOUND",
-        message: "\u0645\u0633\u06CC\u0631 \u0648\u0628\u200C\u0633\u0631\u0648\u06CC\u0633 \u0645\u0648\u0631\u062F \u0646\u0638\u0631 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F."
-      });
-    });
-    app.get("*", (_req, res) => {
-      res.sendFile(import_path5.default.join(distPath, "index.html"));
+var activeHttpServer = null;
+var activeServerStartPromise = null;
+var signalHandlersRegistered = false;
+var isShuttingDown = false;
+async function stopServer(options) {
+  const serverToClose = activeHttpServer;
+  activeHttpServer = null;
+  activeServerStartPromise = null;
+  if (serverToClose) {
+    await new Promise((resolve) => {
+      try {
+        serverToClose.close(() => resolve());
+      } catch {
+        resolve();
+      }
     });
   }
-  const server = appCfg.isSocketOrPipe ? app.listen(appCfg.listenTarget, () => {
-    console.log(`[MGAMMON Duo] Server running on socket/pipe ${appCfg.listenTarget}`);
-  }) : app.listen(Number(appCfg.listenTarget), "0.0.0.0", () => {
-    console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${appCfg.listenTarget}`);
+  if (options?.closeDbPool !== false) {
+    await resetPool().catch(() => {
+    });
+  }
+}
+function registerGracefulShutdownHandlers() {
+  if (signalHandlersRegistered || process.env.VITEST === "true") {
+    return;
+  }
+  signalHandlersRegistered = true;
+  const handleShutdownSignal = (signal) => {
+    if (isShuttingDown) {
+      return;
+    }
+    isShuttingDown = true;
+    console.log(`[MGAMMON Duo] Received ${signal}, shutting down HTTP server and database pool...`);
+    const forceTimer = setTimeout(() => {
+      console.error("[MGAMMON Duo] Forced exit after shutdown timeout.");
+      process.exit(1);
+    }, 5e3);
+    forceTimer.unref();
+    stopServer().then(() => {
+      clearTimeout(forceTimer);
+      process.exit(0);
+    }).catch((err) => {
+      clearTimeout(forceTimer);
+      console.error("[MGAMMON Duo] Error during shutdown:", sanitizeSecretErrorText(err));
+      process.exit(1);
+    });
+  };
+  process.on("SIGTERM", () => handleShutdownSignal("SIGTERM"));
+  process.on("SIGINT", () => handleShutdownSignal("SIGINT"));
+}
+async function startServer() {
+  if (activeHttpServer && activeHttpServer.listening) {
+    return activeHttpServer;
+  }
+  if (activeServerStartPromise) {
+    return activeServerStartPromise;
+  }
+  activeServerStartPromise = (async () => {
+    validateProductionSecurityConfig(process.env);
+    initializeDatabase().then(() => {
+      console.log(
+        "[MGAMMON Duo] MySQL/MariaDB database initialized and verified prior to accepting requests."
+      );
+    }).catch((err) => {
+      console.error(
+        "[MGAMMON Duo] Database initialization failed during startup:",
+        sanitizeDbErrorMessage(err)
+      );
+    });
+    const app = await createApp();
+    const appCfg = getAppConfig();
+    const isProductionMode2 = appCfg.isProduction || appCfg.isBundled;
+    if (!isProductionMode2) {
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: {
+          middlewareMode: true,
+          allowedHosts: true,
+          hmr: false,
+          ws: false,
+          watch: null
+        },
+        appType: "spa"
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = import_path6.default.resolve(getAppRootDir(), "dist");
+      app.use(import_express2.default.static(distPath));
+      app.use("/api", (_req, res) => {
+        res.status(404).json({
+          ok: false,
+          code: "NOT_FOUND",
+          message: "\u0645\u0633\u06CC\u0631 \u0648\u0628\u200C\u0633\u0631\u0648\u06CC\u0633 \u0645\u0648\u0631\u062F \u0646\u0638\u0631 \u06CC\u0627\u0641\u062A \u0646\u0634\u062F."
+        });
+      });
+      app.get("*", (_req, res) => {
+        res.sendFile(import_path6.default.join(distPath, "index.html"));
+      });
+    }
+    const server = await new Promise((resolve, reject) => {
+      const onError = (err) => {
+        console.error("[MGAMMON Duo] HTTP server listen error:", sanitizeSecretErrorText(err));
+        reject(err);
+      };
+      const srv = appCfg.isSocketOrPipe ? app.listen(appCfg.listenTarget, () => {
+        srv.off("error", onError);
+        console.log(`[MGAMMON Duo] Server running on socket/pipe ${appCfg.listenTarget}`);
+        resolve(srv);
+      }) : app.listen(Number(appCfg.listenTarget), "0.0.0.0", () => {
+        srv.off("error", onError);
+        console.log(`[MGAMMON Duo] Server running on http://0.0.0.0:${appCfg.listenTarget}`);
+        resolve(srv);
+      });
+      srv.once("error", onError);
+    });
+    activeHttpServer = server;
+    server.on("close", () => {
+      if (activeHttpServer === server) {
+        activeHttpServer = null;
+      }
+      activeServerStartPromise = null;
+    });
+    registerGracefulShutdownHandlers();
+    return server;
+  })().catch((err) => {
+    activeServerStartPromise = null;
+    throw err;
   });
-  return server;
+  return activeServerStartPromise;
 }
 if (process.env.VITEST !== "true") {
-  startServer();
+  if (process.argv.includes("--preflight")) {
+    runPreflightDiagnostics({ checkDb: true }).then((report) => {
+      console.log(formatPreflightReportText(report));
+      process.exit(report.ok ? 0 : 1);
+    }).catch((err) => {
+      console.error("[MGAMMON Duo Preflight Error]", sanitizeSecretErrorText(err));
+      process.exit(1);
+    });
+  } else {
+    startServer().catch((err) => {
+      console.error("[MGAMMON Duo Startup Error]", sanitizeSecretErrorText(err));
+      process.exit(1);
+    });
+  }
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   createApp,
-  startServer
+  startServer,
+  stopServer
 });

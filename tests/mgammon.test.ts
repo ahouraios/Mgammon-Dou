@@ -3346,10 +3346,131 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
       await pool.execute('DELETE FROM historical_work_records WHERE id = ?', [histIns.insertId]);
     }
   });
+
+  it('آزمون ممیزی مستقل ۶: پوشش کامل سناریوهای محیطی (SESSION_SECRET خالی/فاصله/خط جدید، DB_* مفقود، حالت Development، PORT=passenger، جلوگیری از اجرای چندباره و عدم افشای Secret)', async () => {
+    const {
+      validateSessionSecret,
+      validateProductionDatabaseConfig,
+      sanitizeSecretErrorText,
+      getAppConfig,
+    } = await import('../src/server/config');
+    const { formatPreflightReportText } = await import('../src/server/preflight');
+    const { startServer, stopServer } = await import('../server');
+
+    const realSecret = '9f8e7d6c5b4a392817263544536271809f8e7d6c5b4a39281726354453627180';
+    const realDbPass = 'SuperSecretDbPass_2026!';
+
+    // ۱) SESSION_SECRET خالی در Production -> FAIL
+    const emptyCheck = validateSessionSecret({ NODE_ENV: 'production', SESSION_SECRET: '' });
+    expect(emptyCheck.valid).toBe(false);
+    expect(emptyCheck.status).toBe('FAIL');
+    expect(emptyCheck.code).toBe('SECRET_EMPTY');
+
+    // ۲) SESSION_SECRET با فاصله میانی، خط جدید یا کوتیشن -> FAIL
+    const newlineCheck = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: `${realSecret}\n`,
+    });
+    expect(newlineCheck.valid).toBe(false);
+    expect(newlineCheck.code).toBe('SECRET_INVALID_CHARACTERS');
+
+    const spaceCheck = validateSessionSecret({
+      NODE_ENV: 'production',
+      SESSION_SECRET: 'a1b2c3d4 e5f60718 293a4b5c 6d7e8f90 a1b2c3d4',
+    });
+    expect(spaceCheck.valid).toBe(false);
+    expect(spaceCheck.code).toBe('SECRET_INVALID_CHARACTERS');
+
+    // ۳) حالت Development با SESSION_SECRET خالی مجاز است (NOT_CONFIGURED_DEV)
+    const devCheck = validateSessionSecret({ NODE_ENV: 'development', SESSION_SECRET: '' });
+    expect(devCheck.valid).toBe(true);
+    expect(devCheck.status).toBe('NOT_CONFIGURED');
+    expect(() => validateProductionSecurityConfig({ NODE_ENV: 'development' })).not.toThrow();
+
+    // ۴) متغیر دیتابیس مفقود در Production -> FAIL در config و preflight
+    const missingDb = validateProductionDatabaseConfig({
+      NODE_ENV: 'production',
+      DB_HOST: '127.0.0.1',
+      DB_PORT: '3306',
+      DB_USER: 'cpanel_usr',
+      DB_NAME: '',
+      DB_PASSWORD: '',
+    });
+    expect(missingDb.valid).toBe(false);
+    expect(missingDb.missingVars).toContain('DB_NAME');
+    expect(missingDb.missingVars).toContain('DB_PASSWORD');
+
+    const missingDbReport = await runPreflightDiagnostics({
+      env: {
+        NODE_ENV: 'production',
+        SESSION_SECRET: realSecret,
+        DB_HOST: '127.0.0.1',
+        DB_PORT: '3306',
+        DB_USER: 'cpanel_usr',
+        DB_NAME: '',
+        DB_PASSWORD: '',
+      },
+      checkDb: false,
+    });
+    expect(missingDbReport.ok).toBe(false);
+    expect(missingDbReport.checks.find((c) => c.id === 'db_env_vars')?.status).toBe('FAIL');
+
+    // ۵) پشتیبانی از PORT=passenger در محیط Passenger
+    const passengerNamedCfg = getAppConfig({
+      NODE_ENV: 'production',
+      PASSENGER_APP_ENV: 'production',
+      PORT: 'passenger',
+    });
+    expect(passengerNamedCfg.isPassenger).toBe(true);
+    expect(passengerNamedCfg.isSocketOrPipe).toBe(true);
+    expect(passengerNamedCfg.listenTarget).toBe('passenger');
+
+    // ۶) عدم افشای اطلاعات محرمانه در گزارش Preflight و sanitizeSecretErrorText
+    const prevSecret = process.env.SESSION_SECRET;
+    const prevDbPass = process.env.DB_PASSWORD;
+    process.env.SESSION_SECRET = realSecret;
+    process.env.DB_PASSWORD = realDbPass;
+    try {
+      const cleanReport = await runPreflightDiagnostics({
+        env: {
+          NODE_ENV: 'production',
+          SESSION_SECRET: realSecret,
+          DB_HOST: '127.0.0.1',
+          DB_PORT: '3306',
+          DB_USER: 'cpanel_usr',
+          DB_NAME: 'cpanel_db',
+          DB_PASSWORD: realDbPass,
+        },
+        checkDb: false,
+      });
+      const reportText = formatPreflightReportText(cleanReport);
+      expect(reportText).not.toContain(realSecret);
+      expect(reportText).not.toContain(realDbPass);
+
+      const sanitizedErr = sanitizeSecretErrorText(
+        new Error(`Auth failed password=${realDbPass} token=${realSecret}`)
+      );
+      expect(sanitizedErr).not.toContain(realSecret);
+      expect(sanitizedErr).not.toContain(realDbPass);
+    } finally {
+      if (prevSecret === undefined) delete process.env.SESSION_SECRET;
+      else process.env.SESSION_SECRET = prevSecret;
+      if (prevDbPass === undefined) delete process.env.DB_PASSWORD;
+      else process.env.DB_PASSWORD = prevDbPass;
+    }
+
+    // ۷) جلوگیری از اجرای چندباره startServer و پاکسازی کامل در stopServer
+    const prevPort = process.env.PORT;
+    process.env.PORT = '45199';
+    try {
+      const s1 = await startServer();
+      const s2 = await startServer();
+      expect(s1).toBe(s2);
+      expect(s1.listening).toBe(true);
+    } finally {
+      await stopServer({ closeDbPool: false });
+      if (prevPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort;
+    }
+  });
 });
-
-
-
-
-
-

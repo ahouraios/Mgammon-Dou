@@ -12,6 +12,7 @@
     "test": "vitest run",
     "clean": "rm -rf dist app.cjs",
     "lint": "tsc --noEmit",
+    "preflight": "tsx scripts/preflight.ts",
     "backup:create": "tsx scripts/backup-cli.ts create",
     "backup:list": "tsx scripts/backup-cli.ts list",
     "backup:verify": "tsx scripts/backup-cli.ts verify",
