@@ -166,3 +166,28 @@
    - فایل‌های `app.cjs` و `dist/` جدید را پاک کرده و نسخه قبلی را از آرشیو پشتیبان جایگزین کنید (فایل `.env` و پوشه `.data/` را دست‌نخورده نگه دارید).
    - روی **Start** (یا **Restart**) کلیک کنید تا سامانه فوراً به نسخه قبلی بازگردد.
 
+---
+
+### ۱۱. دستورالعمل تست واقعی روی هاست cPanel (تفکیک کامل از تست‌های محیط توسعه)
+موارد زیر به‌طور مستقیم به پیکربندی واقعی هاست، سیستم `CloudLinux / Passenger` و دیتابیس cPanel وابسته هستند و **صرفاً پس از آپلود روی هاست واقعی قابل تأییدند** (در محیط توسعه قابل سنجش قطعی نیستند):
+
+1. **بررسی انتقال متغیرها توسط `set_env_vars.py`:**
+   - پس از ذخیره متغیرها در رابط کاربری `Setup Node.js App` و زدن `Save`، بررسی کنید که خطای `skipped ... environment variable(s)` در لاگ Passenger ظاهر نشود.
+   - در صورت مشاهده `skipped`، یا مقادیر دارای کاراکتر غیرمجاز را اصلاح کنید یا فایل `.env` را در ریشه خصوصی برنامه (کنار `app.cjs`) قرار دهید.
+2. **اجرای Preflight Diagnostics روی هاست واقعی (بدون افشای Secret):**
+   - از `Run JS script` یا ترمینال محیط مجازی Node.js دستور زیر را اجرا کنید:
+     ```bash
+     node app.cjs --preflight
+     ```
+   - اطمینان حاصل کنید خروجی برای `session_secret`، `db_env_vars`، `db_connectivity`، `required_modules` و `filesystem_access` برابر `PASS` باشد و هیچ موردی `FAIL` نباشد.
+3. **بررسی رفتار واقعی Passenger و `PORT` روی هاست:**
+   - برای تشخیص اینکه Passenger در هاست شما چه مقداری در `PORT` می‌گذارد و آیا `PhusionPassenger` فعال است، از دستور خواندنی زیر (بدون چاپ هیچ رمز یا Secret) در محیط مجازی cPanel استفاده کنید:
+     ```bash
+     node -e "console.log({ node: process.version, nodeEnv: process.env.NODE_ENV, passengerEnv: process.env.PASSENGER_APP_ENV, hasPhusionPassenger: typeof PhusionPassenger !== 'undefined', portKind: !process.env.PORT ? 'empty' : /^\d+$/.test(process.env.PORT) ? 'numeric' : process.env.PORT.startsWith('/') ? 'unix_socket' : 'other', secretLen: (process.env.SESSION_SECRET || '').trim().length })"
+     ```
+   - اگر `portKind` برابر `'other'` بود و `app.cjs` با خطای `listen` مواجه شد، مقدار واقعی `process.env.PORT` و لاگ `stderr` Passenger باید دقیقاً بررسی شود.
+4. **بررسی دسترسی HTTP/HTTPS و سلامت API روی دامنه واقعی:**
+   - پس از `Restart` در Setup Node.js App، آدرس `https://your-domain/api/health` را باز کنید و مطمئن شوید `ok: true` و `dbConnected: true` برمی‌گردد.
+   - ورود مدیر و کارمند را آزمایش کنید و مطمئن شوید داده‌ها و سوابق قبلی بدون تغییر باقی مانده‌اند.
+
+

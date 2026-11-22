@@ -3415,15 +3415,51 @@ describe('MGAMMON Duo — آزمون‌های خودکار ۱۵ سناریوی �
     expect(missingDbReport.ok).toBe(false);
     expect(missingDbReport.checks.find((c) => c.id === 'db_env_vars')?.status).toBe('FAIL');
 
-    // ۵) پشتیبانی از PORT=passenger در محیط Passenger
-    const passengerNamedCfg = getAppConfig({
-      NODE_ENV: 'production',
-      PASSENGER_APP_ENV: 'production',
-      PORT: 'passenger',
+    // ۵) رد مقادیر نامعتبر PORT (مانند متن غیرسوکت 'passenger' یا پورت خارج از بازه) و تفکیک FAIL / WARNING / NOT_CONFIGURED در Preflight
+    for (const badPort of ['passenger', '0', '99999']) {
+      const badPortCfg = getAppConfig({
+        NODE_ENV: 'production',
+        PASSENGER_APP_ENV: 'production',
+        PORT: badPort,
+      });
+      expect(badPortCfg.isSocketOrPipe).toBe(false);
+      expect(badPortCfg.listenTarget).toBe(3000);
+
+      const badPortReport = await runPreflightDiagnostics({
+        env: {
+          NODE_ENV: 'production',
+          SESSION_SECRET: realSecret,
+          DB_HOST: '127.0.0.1',
+          DB_PORT: '3306',
+          DB_USER: 'cpanel_usr',
+          DB_NAME: 'cpanel_db',
+          DB_PASSWORD: realDbPass,
+          PORT: badPort,
+        },
+        checkDb: false,
+      });
+      expect(badPortReport.ok).toBe(false);
+      expect(badPortReport.checks.find((c) => c.id === 'port_config')?.status).toBe('FAIL');
+    }
+
+    // بررسی وضعیت NOT_CONFIGURED برای متغیرهای اختیاری و WARNING برای طول کلید ۳۲ کاراکتری (کمتر از ۶۴)
+    const shortValidSecret = 'abcdef0123456789abcdef0123456789';
+    const warnReport = await runPreflightDiagnostics({
+      env: {
+        NODE_ENV: 'production',
+        SESSION_SECRET: shortValidSecret,
+        DB_HOST: '127.0.0.1',
+        DB_PORT: '3306',
+        DB_USER: 'cpanel_usr',
+        DB_NAME: 'cpanel_db',
+        DB_PASSWORD: realDbPass,
+      },
+      checkDb: false,
     });
-    expect(passengerNamedCfg.isPassenger).toBe(true);
-    expect(passengerNamedCfg.isSocketOrPipe).toBe(true);
-    expect(passengerNamedCfg.listenTarget).toBe('passenger');
+    expect(warnReport.ok).toBe(true);
+    expect(warnReport.checks.find((c) => c.id === 'session_secret')?.status).toBe('WARNING');
+    expect(warnReport.checks.find((c) => c.id === 'optional_timezone')?.status).toBe('NOT_CONFIGURED');
+    expect(warnReport.checks.find((c) => c.id === 'initial_accounts_env')?.status).toBe('NOT_CONFIGURED');
 
     // ۶) عدم افشای اطلاعات محرمانه در گزارش Preflight و sanitizeSecretErrorText
     const prevSecret = process.env.SESSION_SECRET;

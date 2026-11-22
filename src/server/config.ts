@@ -902,12 +902,8 @@ export function getAppConfig(env: NodeJS.ProcessEnv = process.env) {
       if (n >= 1 && n <= 65535) {
         listenTarget = n;
       }
-    } else if (
-      rawPort.toLowerCase() === 'passenger' ||
-      rawPort.startsWith('/') ||
-      rawPort.startsWith('\\\\.\\pipe\\')
-    ) {
-      listenTarget = rawPort.toLowerCase() === 'passenger' ? 'passenger' : rawPort;
+    } else if (rawPort.startsWith('/') || rawPort.startsWith('\\\\.\\pipe\\')) {
+      listenTarget = rawPort;
       isSocketOrPipe = true;
     }
   }

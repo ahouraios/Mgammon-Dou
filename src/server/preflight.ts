@@ -379,6 +379,8 @@ export async function runPreflightDiagnostics(
 
   // ۸. بررسی وضعیت پورت و Listener
   const rawPort = (env.PORT || '').trim();
+  const isValidNumericPort =
+    /^\d+$/.test(rawPort) && Number(rawPort) >= 1 && Number(rawPort) <= 65535;
   if (!rawPort) {
     checks.push({
       id: 'port_config',
@@ -386,10 +388,10 @@ export async function runPreflightDiagnostics(
       label: 'پورت اجرا (PORT)',
       status: isPassenger ? 'PASS' : 'NOT_CONFIGURED',
       message: isPassenger
-        ? 'در محیط Passenger سوکت توسط وب‌سرور مدیریت می‌شود.'
+        ? 'متغیر PORT خالی است؛ در محیط Passenger در صورت تزریق سوکت از طریق hook داخلی Passenger مدیریت می‌شود (نیازمند بررسی روی هاست واقعی).'
         : `پورت صریح تنظیم نشده؛ برنامه از مقدار پیش‌فرض ${String(appCfg.listenTarget)} استفاده می‌کند.`,
     });
-  } else if (appCfg.isSocketOrPipe || /^\d+$/.test(rawPort)) {
+  } else if (appCfg.isSocketOrPipe || isValidNumericPort) {
     checks.push({
       id: 'port_config',
       category: 'network',
@@ -405,8 +407,8 @@ export async function runPreflightDiagnostics(
       category: 'network',
       label: 'پورت اجرا (PORT)',
       status: 'FAIL',
-      message: `مقدار PORT نامعتبر است.`,
-      remediation: 'مقدار PORT را عدد بین ۱ تا ۶۵۵۳۵ یا سوکت معتبر Passenger بگذارید.',
+      message: `مقدار PORT نامعتبر است (عدد ۱ تا ۶۵۵۳۵ یا مسیر سوکت معتبر با شروع / نیست).`,
+      remediation: 'مقدار PORT را عدد بین ۱ تا ۶۵۵۳۵ یا مسیر کامل سوکت یونیکس (/...) بگذارید.',
     });
   }
 
@@ -537,7 +539,7 @@ export async function runPreflightDiagnostics(
     summary: { pass, fail, warning, notConfigured },
     runtime: {
       nodeVersion: `v${nodeVersion}`,
-      nodeEnv: rawNodeEnv || 'development',
+      nodeEnv: rawNodeEnv || (isProd ? 'production (implicit)' : 'development'),
       isProduction: isProd,
       isBundled,
       isPassenger,

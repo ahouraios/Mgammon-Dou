@@ -727,8 +727,8 @@ function getAppConfig(env = process.env) {
       if (n >= 1 && n <= 65535) {
         listenTarget = n;
       }
-    } else if (rawPort.toLowerCase() === "passenger" || rawPort.startsWith("/") || rawPort.startsWith("\\\\.\\pipe\\")) {
-      listenTarget = rawPort.toLowerCase() === "passenger" ? "passenger" : rawPort;
+    } else if (rawPort.startsWith("/") || rawPort.startsWith("\\\\.\\pipe\\")) {
+      listenTarget = rawPort;
       isSocketOrPipe = true;
     }
   }
@@ -2636,15 +2636,16 @@ async function runPreflightDiagnostics(options) {
     });
   }
   const rawPort = (env.PORT || "").trim();
+  const isValidNumericPort = /^\d+$/.test(rawPort) && Number(rawPort) >= 1 && Number(rawPort) <= 65535;
   if (!rawPort) {
     checks.push({
       id: "port_config",
       category: "network",
       label: "\u067E\u0648\u0631\u062A \u0627\u062C\u0631\u0627 (PORT)",
       status: isPassenger ? "PASS" : "NOT_CONFIGURED",
-      message: isPassenger ? "\u062F\u0631 \u0645\u062D\u06CC\u0637 Passenger \u0633\u0648\u06A9\u062A \u062A\u0648\u0633\u0637 \u0648\u0628\u200C\u0633\u0631\u0648\u0631 \u0645\u062F\u06CC\u0631\u06CC\u062A \u0645\u06CC\u200C\u0634\u0648\u062F." : `\u067E\u0648\u0631\u062A \u0635\u0631\u06CC\u062D \u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647\u061B \u0628\u0631\u0646\u0627\u0645\u0647 \u0627\u0632 \u0645\u0642\u062F\u0627\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 ${String(appCfg.listenTarget)} \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0645\u06CC\u200C\u06A9\u0646\u062F.`
+      message: isPassenger ? "\u0645\u062A\u063A\u06CC\u0631 PORT \u062E\u0627\u0644\u06CC \u0627\u0633\u062A\u061B \u062F\u0631 \u0645\u062D\u06CC\u0637 Passenger \u062F\u0631 \u0635\u0648\u0631\u062A \u062A\u0632\u0631\u06CC\u0642 \u0633\u0648\u06A9\u062A \u0627\u0632 \u0637\u0631\u06CC\u0642 hook \u062F\u0627\u062E\u0644\u06CC Passenger \u0645\u062F\u06CC\u0631\u06CC\u062A \u0645\u06CC\u200C\u0634\u0648\u062F (\u0646\u06CC\u0627\u0632\u0645\u0646\u062F \u0628\u0631\u0631\u0633\u06CC \u0631\u0648\u06CC \u0647\u0627\u0633\u062A \u0648\u0627\u0642\u0639\u06CC)." : `\u067E\u0648\u0631\u062A \u0635\u0631\u06CC\u062D \u062A\u0646\u0638\u06CC\u0645 \u0646\u0634\u062F\u0647\u061B \u0628\u0631\u0646\u0627\u0645\u0647 \u0627\u0632 \u0645\u0642\u062F\u0627\u0631 \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 ${String(appCfg.listenTarget)} \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0645\u06CC\u200C\u06A9\u0646\u062F.`
     });
-  } else if (appCfg.isSocketOrPipe || /^\d+$/.test(rawPort)) {
+  } else if (appCfg.isSocketOrPipe || isValidNumericPort) {
     checks.push({
       id: "port_config",
       category: "network",
@@ -2658,8 +2659,8 @@ async function runPreflightDiagnostics(options) {
       category: "network",
       label: "\u067E\u0648\u0631\u062A \u0627\u062C\u0631\u0627 (PORT)",
       status: "FAIL",
-      message: `\u0645\u0642\u062F\u0627\u0631 PORT \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A.`,
-      remediation: "\u0645\u0642\u062F\u0627\u0631 PORT \u0631\u0627 \u0639\u062F\u062F \u0628\u06CC\u0646 \u06F1 \u062A\u0627 \u06F6\u06F5\u06F5\u06F3\u06F5 \u06CC\u0627 \u0633\u0648\u06A9\u062A \u0645\u0639\u062A\u0628\u0631 Passenger \u0628\u06AF\u0630\u0627\u0631\u06CC\u062F."
+      message: `\u0645\u0642\u062F\u0627\u0631 PORT \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A (\u0639\u062F\u062F \u06F1 \u062A\u0627 \u06F6\u06F5\u06F5\u06F3\u06F5 \u06CC\u0627 \u0645\u0633\u06CC\u0631 \u0633\u0648\u06A9\u062A \u0645\u0639\u062A\u0628\u0631 \u0628\u0627 \u0634\u0631\u0648\u0639 / \u0646\u06CC\u0633\u062A).`,
+      remediation: "\u0645\u0642\u062F\u0627\u0631 PORT \u0631\u0627 \u0639\u062F\u062F \u0628\u06CC\u0646 \u06F1 \u062A\u0627 \u06F6\u06F5\u06F5\u06F3\u06F5 \u06CC\u0627 \u0645\u0633\u06CC\u0631 \u06A9\u0627\u0645\u0644 \u0633\u0648\u06A9\u062A \u06CC\u0648\u0646\u06CC\u06A9\u0633 (/...) \u0628\u06AF\u0630\u0627\u0631\u06CC\u062F."
     });
   }
   const modResult = resolveRequiredModuleNames();
@@ -2772,7 +2773,7 @@ async function runPreflightDiagnostics(options) {
     summary: { pass, fail, warning, notConfigured },
     runtime: {
       nodeVersion: `v${nodeVersion}`,
-      nodeEnv: rawNodeEnv || "development",
+      nodeEnv: rawNodeEnv || (isProd ? "production (implicit)" : "development"),
       isProduction: isProd,
       isBundled,
       isPassenger,
